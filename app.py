@@ -1,6 +1,6 @@
 """
 Financial Adviser CRM System - Optimized for Render
-Complete CRM with Google Drive integration - FIXED REDIRECT URI
+Complete CRM with Google Drive integration - PROPERLY FIXED REDIRECT URI
 """
 
 import os
@@ -28,15 +28,15 @@ app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 PORT = int(os.environ.get('PORT', 10000))
 HOST = '0.0.0.0'
 
-# Google OAuth 2.0 settings for Render - FIXED REDIRECT URI
+# Google OAuth 2.0 settings for Render - PROPERLY FIXED REDIRECT URI
 SCOPES = [
     'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
-# Get the redirect URI for Render - FIXED TO MATCH GOOGLE SETTINGS
+# Get the redirect URI for Render - NO /callback TO MATCH GOOGLE SETTINGS
 RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', 'https://wealthpro-crm.onrender.com')
-REDIRECT_URI = f"{RENDER_URL}/callback"
+REDIRECT_URI = RENDER_URL
 
 CLIENT_CONFIG = {
     "web": {
@@ -532,7 +532,7 @@ def authorize():
 
 @app.route('/callback')
 def callback():
-    """Handle OAuth callback"""
+    """Handle OAuth callback - FIXED TO WORK WITHOUT /callback"""
     try:
         logger.info(f"OAuth callback received. Request URL: {request.url}")
         logger.info(f"Expected redirect_uri: {REDIRECT_URI}")

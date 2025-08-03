@@ -1,6 +1,6 @@
 """
 Financial Adviser CRM System - Optimized for Render
-Complete CRM with Google Drive integration
+Complete CRM with Google Drive integration - FIXED REDIRECT URI
 """
 
 import os
@@ -28,14 +28,14 @@ app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 PORT = int(os.environ.get('PORT', 10000))
 HOST = '0.0.0.0'
 
-# Google OAuth 2.0 settings for Render
+# Google OAuth 2.0 settings for Render - FIXED REDIRECT URI
 SCOPES = [
     'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
-# Get the redirect URI for Render
-RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', 'http://localhost:10000')
+# Get the redirect URI for Render - FIXED TO MATCH GOOGLE SETTINGS
+RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', 'https://wealthpro-crm.onrender.com')
 REDIRECT_URI = f"{RENDER_URL}/callback"
 
 CLIENT_CONFIG = {
@@ -69,6 +69,26 @@ class GoogleDriveService:
     def __init__(self, credentials):
         self.service = build('drive', 'v3', credentials=credentials)
         self.sheets_service = build('sheets', 'v4', credentials=credentials)
+    
+    def create_main_crm_folder(self) -> str:
+        """Create the main WealthPro CRM folder"""
+        try:
+            folder_metadata = {
+                'name': 'WealthPro CRM Data',
+                'mimeType': 'application/vnd.google-apps.folder'
+            }
+            
+            folder = self.service.files().create(
+                body=folder_metadata,
+                fields='id'
+            ).execute()
+            
+            logger.info(f"Created main CRM folder: {folder.get('id')}")
+            return folder.get('id')
+            
+        except HttpError as error:
+            logger.error(f"Error creating main folder: {error}")
+            return None
     
     def create_client_folder(self, client_name: str, parent_folder_id: str = None) -> str:
         """Create a folder for a new client"""
@@ -115,7 +135,7 @@ class CRMDataManager:
         self.sheets_service = sheets_service
         self.spreadsheet_id = os.environ.get('CRM_SPREADSHEET_ID')
     
-    def create_crm_spreadsheet(self) -> str:
+    def create_crm_spreadsheet(self, parent_folder_id: str = None) -> str:
         """Create the main CRM spreadsheet"""
         try:
             spreadsheet = {
@@ -140,6 +160,16 @@ class CRMDataManager:
             ).execute()
             
             spreadsheet_id = result['spreadsheetId']
+            
+            # Move to CRM folder if provided
+            if parent_folder_id:
+                drive_service = build('drive', 'v3', credentials=self.sheets_service._http.credentials)
+                drive_service.files().update(
+                    fileId=spreadsheet_id,
+                    addParents=parent_folder_id,
+                    removeParents='root',
+                    fields='id, parents'
+                ).execute()
             
             # Add headers
             headers = [
@@ -254,10 +284,16 @@ DASHBOARD_TEMPLATE = """
                 <div class="flex items-center space-x-6">
                     <a href="/" class="hover:text-blue-200">Dashboard</a>
                     <a href="/clients" class="hover:text-blue-200">Clients</a>
+                    {% if 'credentials' in session %}
                     <div class="flex items-center space-x-2 bg-white bg-opacity-10 px-3 py-1 rounded-lg">
                         <div class="w-2 h-2 bg-green-400 rounded-full"></div>
                         <span class="text-sm">Google Drive Connected</span>
                     </div>
+                    {% else %}
+                    <a href="/authorize" class="bg-white bg-opacity-10 px-3 py-1 rounded-lg text-sm hover:bg-opacity-20">
+                        Connect Google Drive
+                    </a>
+                    {% endif %}
                 </div>
             </div>
         </div>
@@ -265,7 +301,58 @@ DASHBOARD_TEMPLATE = """
 
     <!-- Main Content -->
     <main class="max-w-7xl mx-auto px-6 py-8">
-        <!-- Dashboard Header -->
+        {% if 'credentials' not in session %}
+        <!-- Welcome Screen -->
+        <div class="gradient-wealth text-white rounded-lg p-8 mb-8 text-center">
+            <h1 class="text-4xl font-bold mb-4">Welcome to WealthPro CRM!</h1>
+            <p class="text-xl text-blue-100 mb-6">Professional Financial Advisory Platform</p>
+            <a href="/authorize" class="inline-flex items-center px-6 py-3 bg-white text-blue-600 rounded-lg hover:bg-blue-50 transition-colors font-semibold">
+                <svg class="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                    <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                    <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                    <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                </svg>
+                Connect Google Drive to Get Started
+            </a>
+        </div>
+        
+        <!-- Features Preview -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div class="card-professional bg-white rounded-xl p-6 text-center">
+                <div class="w-16 h-16 bg-blue-100 rounded-lg flex items-center justify-center mx-auto mb-4">
+                    <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                    </svg>
+                </div>
+                <h3 class="text-lg font-semibold text-gray-900 mb-2">Client Management</h3>
+                <p class="text-gray-600">Organize client profiles with automatic Google Drive folder creation</p>
+            </div>
+            
+            <div class="card-professional bg-white rounded-xl p-6 text-center">
+                <div class="w-16 h-16 bg-green-100 rounded-lg flex items-center justify-center mx-auto mb-4">
+                    <svg class="w-8 h-8 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                    </svg>
+                </div>
+                <h3 class="text-lg font-semibold text-gray-900 mb-2">Fact Find Integration</h3>
+                <p class="text-gray-600">Seamlessly integrate your existing fact find forms</p>
+            </div>
+            
+            <div class="card-professional bg-white rounded-xl p-6 text-center">
+                <div class="w-16 h-16 bg-purple-100 rounded-lg flex items-center justify-center mx-auto mb-4">
+                    <svg class="w-8 h-8 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path>
+                    </svg>
+                </div>
+                <h3 class="text-lg font-semibold text-gray-900 mb-2">Document Vault</h3>
+                <p class="text-gray-600">Secure document storage with Google Drive integration</p>
+            </div>
+        </div>
+        
+        {% else %}
+        
+        <!-- Connected Dashboard -->
         <div class="gradient-wealth text-white rounded-lg p-6 mb-8">
             <h1 class="text-3xl font-bold mb-2">Dashboard Overview</h1>
             <p class="text-blue-100">Monitor your practice performance and client portfolio</p>
@@ -331,7 +418,7 @@ DASHBOARD_TEMPLATE = """
         </div>
 
         <!-- Quick Actions -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <a href="/clients/add" class="card-professional bg-white rounded-xl p-6 block hover:no-underline">
                 <div class="flex items-center">
                     <div class="p-3 bg-blue-100 rounded-lg">
@@ -375,19 +462,17 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Success Message -->
+        <div class="bg-green-50 border border-green-200 rounded-lg p-6 text-center">
+            <h3 class="text-lg font-medium text-green-900 mb-2">🎉 Google Drive Successfully Connected!</h3>
+            <p class="text-green-700">Your CRM is now ready to create client folders and manage documents automatically.</p>
+        </div>
+        
+        {% endif %}
+
         {% if error %}
         <div class="mt-8 bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded">
             {{ error }}
-        </div>
-        {% endif %}
-        
-        {% if not stats.total_clients %}
-        <div class="mt-8 bg-blue-50 border border-blue-200 rounded-lg p-6 text-center">
-            <h3 class="text-lg font-medium text-blue-900 mb-2">Welcome to WealthPro CRM!</h3>
-            <p class="text-blue-700 mb-4">Get started by authorizing Google Drive access and adding your first client.</p>
-            <a href="/authorize" class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700">
-                Connect Google Drive
-            </a>
         </div>
         {% endif %}
     </main>
@@ -399,10 +484,10 @@ DASHBOARD_TEMPLATE = """
 @app.route('/')
 def index():
     """Main dashboard"""
-    if 'credentials' not in session:
-        return render_template_string(DASHBOARD_TEMPLATE, stats={}, clients=[], error=None)
-    
     try:
+        if 'credentials' not in session:
+            return render_template_string(DASHBOARD_TEMPLATE, stats={}, clients=[], error=None)
+        
         # Get summary statistics
         credentials = Credentials(**session['credentials'])
         data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
@@ -438,6 +523,7 @@ def authorize():
         )
         
         session['state'] = state
+        logger.info(f"Redirecting to Google OAuth with redirect_uri: {REDIRECT_URI}")
         return redirect(authorization_url)
     
     except Exception as e:
@@ -448,6 +534,9 @@ def authorize():
 def callback():
     """Handle OAuth callback"""
     try:
+        logger.info(f"OAuth callback received. Request URL: {request.url}")
+        logger.info(f"Expected redirect_uri: {REDIRECT_URI}")
+        
         flow = Flow.from_client_config(
             CLIENT_CONFIG,
             scopes=SCOPES,
@@ -468,15 +557,22 @@ def callback():
             'scopes': credentials.scopes
         }
         
-        # Try to initialize CRM spreadsheet
+        # Initialize CRM folder structure
         try:
+            drive_service = GoogleDriveService(credentials)
             data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
+            
+            # Create main CRM folder
+            main_folder_id = drive_service.create_main_crm_folder()
+            
+            # Create CRM spreadsheet in the main folder
             if not data_manager.spreadsheet_id:
-                spreadsheet_id = data_manager.create_crm_spreadsheet()
+                spreadsheet_id = data_manager.create_crm_spreadsheet(main_folder_id)
                 if spreadsheet_id:
                     logger.info(f"Created new CRM spreadsheet: {spreadsheet_id}")
+                    
         except Exception as e:
-            logger.warning(f"Could not create spreadsheet automatically: {e}")
+            logger.warning(f"Could not create CRM structure automatically: {e}")
         
         return redirect(url_for('index'))
     
@@ -506,16 +602,19 @@ def health_check():
     return jsonify({
         'status': 'healthy', 
         'timestamp': datetime.now().isoformat(),
-        'service': 'WealthPro CRM'
+        'service': 'WealthPro CRM',
+        'redirect_uri': REDIRECT_URI
     })
 
 @app.route('/test')
 def test():
     """Test page to verify deployment"""
-    return """
+    return f"""
     <h1>WealthPro CRM Test Page</h1>
     <p>✅ Flask is working!</p>
     <p>✅ Render deployment successful!</p>
+    <p>🔧 Redirect URI: {REDIRECT_URI}</p>
+    <p>🌐 Client ID configured: {'Yes' if os.environ.get('GOOGLE_CLIENT_ID') else 'No'}</p>
     <a href="/">Go to Dashboard</a>
     """
 

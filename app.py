@@ -1,6 +1,5 @@
 """
-Financial Adviser CRM System - Optimized for Render
-FIXED: OAuth redirect URI properly configured (NO /callback)
+Financial Adviser CRM System - Complete with A-Z Filing & Policy Management
 """
 
 import os
@@ -53,147 +52,56 @@ CLIENT_CONFIG = {
     }
 }
 
-class CRMDataManager:
-    """Manages CRM data using Google Sheets as backend"""
-    
-    def __init__(self, sheets_service):
-        self.sheets_service = sheets_service
-        self.spreadsheet_id = None
-        self.setup_crm_spreadsheet()
-    
-    def setup_crm_spreadsheet(self):
-        """Setup or find the CRM spreadsheet"""
-        try:
-            # Try to find existing CRM spreadsheet
-            # For now, we'll create a new one each time - you can modify this to search for existing
-            spreadsheet = {
-                'properties': {
-                    'title': 'WealthPro CRM Data - ' + datetime.now().strftime('%Y-%m-%d')
-                },
-                'sheets': [
-                    {
-                        'properties': {
-                            'title': 'Clients',
-                            'gridProperties': {
-                                'rowCount': 1000,
-                                'columnCount': 15
-                            }
-                        }
-                    }
-                ]
-            }
-            
-            result = self.sheets_service.spreadsheets().create(
-                body=spreadsheet
-            ).execute()
-            
-            self.spreadsheet_id = result['spreadsheetId']
-            
-            # Add headers
-            headers = [
-                'ID', 'Name', 'Email', 'Phone', 'Status', 'Date Added',
-                'Last Contact', 'Client Folder ID', 'Notes', 'Portfolio Value', 
-                'Risk Profile', 'Address', 'Date of Birth', 'Occupation'
-            ]
-            
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=self.spreadsheet_id,
-                range='Clients!A1:N1',
-                valueInputOption='RAW',
-                body={'values': [headers]}
-            ).execute()
-            
-            logger.info(f"Created CRM spreadsheet: {self.spreadsheet_id}")
-            
-        except HttpError as error:
-            logger.error(f"Error setting up CRM spreadsheet: {error}")
-    
-    def add_client(self, client_data: Dict) -> bool:
-        """Add a new client to the spreadsheet"""
-        try:
-            values = [list(client_data.values())]
-            
-            self.sheets_service.spreadsheets().values().append(
-                spreadsheetId=self.spreadsheet_id,
-                range='Clients!A:N',
-                valueInputOption='RAW',
-                body={'values': values}
-            ).execute()
-            
-            return True
-            
-        except HttpError as error:
-            logger.error(f"Error adding client: {error}")
-            return False
-    
-    def get_clients(self) -> List[Dict]:
-        """Get all clients from the spreadsheet"""
-        try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Clients!A2:N'
-            ).execute()
-            
-            values = result.get('values', [])
-            clients = []
-            
-            for row in values:
-                if len(row) >= 8:  # Minimum required fields
-                    # Pad row with empty strings if needed
-                    while len(row) < 14:
-                        row.append('')
-                    
-                    client = {
-                        'id': row[0],
-                        'name': row[1], 
-                        'email': row[2],
-                        'phone': row[3],
-                        'status': row[4],
-                        'date_added': row[5],
-                        'last_contact': row[6],
-                        'folder_id': row[7] if row[7] else None,
-                        'notes': row[8],
-                        'portfolio_value': float(row[9]) if row[9] else 0.0,
-                        'risk_profile': row[10] if row[10] else 'moderate',
-                        'address': row[11],
-                        'date_of_birth': row[12],
-                        'occupation': row[13]
-                    }
-                    clients.append(client)
-            
-            return clients
-            
-        except HttpError as error:
-            logger.error(f"Error getting clients: {error}")
-            return []
-
 class GoogleDriveService:
-    """Service for Google Drive operations"""
+    """Service for Google Drive operations with A-Z filing system"""
     
     def __init__(self, credentials):
         self.service = build('drive', 'v3', credentials=credentials)
         self.sheets_service = build('sheets', 'v4', credentials=credentials)
+        self.main_folder_id = None
+        self.client_files_folder_id = None
+        self.setup_folder_structure()
     
-    def find_or_create_main_crm_folder(self) -> str:
-        """Find existing or create main WealthPro CRM folder"""
+    def setup_folder_structure(self):
+        """Setup the main CRM folder structure"""
         try:
-            # First, search for existing CRM folder
-            query = "name='WealthPro CRM - Client Files' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
+            # Find or create main CRM folder
+            self.main_folder_id = self.find_or_create_folder('WealthPro CRM - Client Files', None)
             
+            # Find or create Client Files folder inside main folder
+            self.client_files_folder_id = self.find_or_create_folder('Client Files', self.main_folder_id)
+            
+            # Create A-Z folders inside Client Files
+            self.create_az_folders()
+            
+        except Exception as e:
+            logger.error(f"Error setting up folder structure: {e}")
+    
+    def find_or_create_folder(self, folder_name: str, parent_id: Optional[str]) -> str:
+        """Find existing folder or create new one"""
+        try:
+            # Search for existing folder
+            if parent_id:
+                query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed=false"
+            else:
+                query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            
+            results = self.service.files().list(q=query, fields="files(id, name)").execute()
             folders = results.get('files', [])
             
             if folders:
-                # Found existing folder
                 folder_id = folders[0]['id']
-                logger.info(f"Found existing CRM folder: {folder_id}")
+                logger.info(f"Found existing folder '{folder_name}': {folder_id}")
                 return folder_id
             else:
-                # Create new main folder
+                # Create new folder
                 folder_metadata = {
-                    'name': 'WealthPro CRM - Client Files',
+                    'name': folder_name,
                     'mimeType': 'application/vnd.google-apps.folder'
                 }
+                
+                if parent_id:
+                    folder_metadata['parents'] = [parent_id]
                 
                 folder = self.service.files().create(
                     body=folder_metadata,
@@ -201,47 +109,70 @@ class GoogleDriveService:
                 ).execute()
                 
                 folder_id = folder.get('id')
-                logger.info(f"Created new CRM folder: {folder_id}")
+                logger.info(f"Created new folder '{folder_name}': {folder_id}")
                 return folder_id
                 
         except HttpError as error:
-            logger.error(f"Error with main CRM folder: {error}")
+            logger.error(f"Error with folder '{folder_name}': {error}")
             return None
     
-    def create_client_folder_structure(self, client_name: str, main_crm_folder_id: str) -> Dict:
-        """Create complete folder structure for a new client INSIDE the main CRM folder"""
+    def create_az_folders(self):
+        """Create A-Z folders for client filing"""
         try:
-            # Create main client folder INSIDE the CRM folder
-            client_folder_metadata = {
-                'name': f"Client - {client_name}",
-                'mimeType': 'application/vnd.google-apps.folder',
-                'parents': [main_crm_folder_id]  # ALWAYS inside CRM folder
+            for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+                self.find_or_create_folder(letter, self.client_files_folder_id)
+            logger.info("A-Z folder structure ready")
+        except Exception as e:
+            logger.error(f"Error creating A-Z folders: {e}")
+    
+    def get_letter_folder_id(self, surname: str) -> str:
+        """Get the folder ID for a client's surname letter"""
+        try:
+            first_letter = surname[0].upper() if surname else 'Z'
+            folder_id = self.find_or_create_folder(first_letter, self.client_files_folder_id)
+            return folder_id
+        except Exception as e:
+            logger.error(f"Error getting letter folder: {e}")
+            return None
+    
+    def create_client_folder(self, client_name: str, surname: str) -> Dict:
+        """Create client folder in appropriate A-Z folder"""
+        try:
+            # Get the appropriate letter folder
+            letter_folder_id = self.get_letter_folder_id(surname)
+            
+            if not letter_folder_id:
+                raise Exception(f"Could not create/find folder for letter {surname[0].upper()}")
+            
+            # Create client folder
+            client_folder_id = self.find_or_create_folder(f"Client - {client_name}", letter_folder_id)
+            
+            if not client_folder_id:
+                raise Exception("Could not create client folder")
+            
+            # Create Reviews folder
+            reviews_folder_id = self.find_or_create_folder("Reviews", client_folder_id)
+            
+            logger.info(f"Created client folder structure for {client_name} in {surname[0].upper()} folder")
+            
+            return {
+                'client_folder_id': client_folder_id,
+                'reviews_folder_id': reviews_folder_id,
+                'letter_folder': surname[0].upper()
             }
             
-            client_folder = self.service.files().create(
-                body=client_folder_metadata,
-                fields='id'
-            ).execute()
+        except Exception as error:
+            logger.error(f"Error creating client folder: {error}")
+            return None
+    
+    def create_policy_folder(self, client_folder_id: str, policy_name: str) -> Dict:
+        """Create a new policy folder with document sub-folders"""
+        try:
+            # Create policy folder
+            policy_folder_id = self.find_or_create_folder(policy_name, client_folder_id)
             
-            client_folder_id = client_folder.get('id')
-            logger.info(f"Created client folder INSIDE CRM folder for {client_name}: {client_folder_id}")
-            
-            # Create policy sub-folders with specific structure
-            policy_folders = [
-                "Life Insurance",
-                "Critical Illness", 
-                "Income Protection",
-                "Private Medical Insurance",
-                "General Insurance",
-                "Pension/Retirement Planning",
-                "Investment Bonds",
-                "ISAs & Savings",
-                "Mortgage Protection",
-                "Business Protection"
-            ]
-            
-            # Documents that go in each policy folder
-            policy_documents = [
+            # Document types for each policy
+            document_types = [
                 "ID&V",
                 "FF & ATR", 
                 "Research",
@@ -253,67 +184,229 @@ class GoogleDriveService:
                 "Valuation"
             ]
             
-            sub_folder_ids = {}
+            # Create document sub-folders
+            doc_folder_ids = {}
+            for doc_type in document_types:
+                doc_folder_id = self.find_or_create_folder(doc_type, policy_folder_id)
+                doc_folder_ids[doc_type] = doc_folder_id
             
-            # Create each policy folder INSIDE the client folder
-            for policy_name in policy_folders:
-                policy_folder_metadata = {
-                    'name': policy_name,
-                    'mimeType': 'application/vnd.google-apps.folder',
-                    'parents': [client_folder_id]  # Inside client folder
-                }
-                
-                policy_folder = self.service.files().create(
-                    body=policy_folder_metadata,
-                    fields='id'
-                ).execute()
-                
-                policy_folder_id = policy_folder.get('id')
-                sub_folder_ids[policy_name] = policy_folder_id
-                logger.info(f"Created policy folder INSIDE client folder: {policy_name}")
-                
-                # Create document folders within each policy folder
-                for doc_type in policy_documents:
-                    doc_folder_metadata = {
-                        'name': doc_type,
-                        'mimeType': 'application/vnd.google-apps.folder',
-                        'parents': [policy_folder_id]  # Inside policy folder
-                    }
-                    
-                    doc_folder = self.service.files().create(
-                        body=doc_folder_metadata,
-                        fields='id'
-                    ).execute()
-                    
-                    logger.info(f"Created document folder: {policy_name}/{doc_type}")
-            
-            # Create separate Reviews folder at client level
-            reviews_folder_metadata = {
-                'name': 'Reviews',
-                'mimeType': 'application/vnd.google-apps.folder',
-                'parents': [client_folder_id]  # Inside client folder
-            }
-            
-            reviews_folder = self.service.files().create(
-                body=reviews_folder_metadata,
-                fields='id'
-            ).execute()
-            
-            sub_folder_ids['Reviews'] = reviews_folder.get('id')
-            logger.info("Created Reviews folder INSIDE client folder")
+            logger.info(f"Created policy folder '{policy_name}' with document sub-folders")
             
             return {
-                'client_folder_id': client_folder_id,
-                'sub_folders': sub_folder_ids
+                'policy_folder_id': policy_folder_id,
+                'document_folders': doc_folder_ids
             }
             
-        except HttpError as error:
-            logger.error(f"Error creating client folder structure: {error}")
+        except Exception as error:
+            logger.error(f"Error creating policy folder: {error}")
             return None
     
     def get_folder_url(self, folder_id: str) -> str:
         """Get the Google Drive URL for a folder"""
         return f"https://drive.google.com/drive/folders/{folder_id}"
+
+class CRMDataManager:
+    """Manages CRM data using Google Sheets as backend"""
+    
+    def __init__(self, sheets_service):
+        self.sheets_service = sheets_service
+        self.clients_spreadsheet_id = None
+        self.policies_spreadsheet_id = None
+        self.setup_spreadsheets()
+    
+    def setup_spreadsheets(self):
+        """Setup CRM spreadsheets"""
+        try:
+            # Create clients spreadsheet
+            self.clients_spreadsheet_id = self.create_spreadsheet('WealthPro CRM - Clients')
+            self.setup_clients_sheet()
+            
+            # Create policies spreadsheet  
+            self.policies_spreadsheet_id = self.create_spreadsheet('WealthPro CRM - Policies')
+            self.setup_policies_sheet()
+            
+        except Exception as e:
+            logger.error(f"Error setting up spreadsheets: {e}")
+    
+    def create_spreadsheet(self, title: str) -> str:
+        """Create a new spreadsheet"""
+        try:
+            spreadsheet = {
+                'properties': {'title': title}
+            }
+            
+            result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
+            spreadsheet_id = result['spreadsheetId']
+            
+            logger.info(f"Created spreadsheet '{title}': {spreadsheet_id}")
+            return spreadsheet_id
+            
+        except Exception as e:
+            logger.error(f"Error creating spreadsheet: {e}")
+            return None
+    
+    def setup_clients_sheet(self):
+        """Setup clients sheet with headers"""
+        try:
+            headers = [
+                'Client ID', 'Full Name', 'Surname', 'Email', 'Phone', 'Status', 
+                'Date Added', 'Last Contact', 'Client Folder ID', 'Notes', 
+                'Portfolio Value', 'Risk Profile', 'Address', 'Date of Birth', 'Occupation'
+            ]
+            
+            self.sheets_service.spreadsheets().values().update(
+                spreadsheetId=self.clients_spreadsheet_id,
+                range='Sheet1!A1:O1',
+                valueInputOption='RAW',
+                body={'values': [headers]}
+            ).execute()
+            
+        except Exception as e:
+            logger.error(f"Error setting up clients sheet: {e}")
+    
+    def setup_policies_sheet(self):
+        """Setup policies sheet with headers"""
+        try:
+            headers = [
+                'Policy ID', 'Client ID', 'Policy Name', 'Policy Type', 'Provider',
+                'Premium', 'Sum Assured', 'Start Date', 'Review Date', 'Status',
+                'Policy Folder ID', 'Notes', 'Date Added'
+            ]
+            
+            self.sheets_service.spreadsheets().values().update(
+                spreadsheetId=self.policies_spreadsheet_id,
+                range='Sheet1!A1:M1',
+                valueInputOption='RAW',
+                body={'values': [headers]}
+            ).execute()
+            
+        except Exception as e:
+            logger.error(f"Error setting up policies sheet: {e}")
+    
+    def add_client(self, client_data: Dict) -> bool:
+        """Add a new client"""
+        try:
+            values = [list(client_data.values())]
+            
+            self.sheets_service.spreadsheets().values().append(
+                spreadsheetId=self.clients_spreadsheet_id,
+                range='Sheet1!A:O',
+                valueInputOption='RAW',
+                body={'values': values}
+            ).execute()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding client: {e}")
+            return False
+    
+    def get_clients(self) -> List[Dict]:
+        """Get all clients"""
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.clients_spreadsheet_id,
+                range='Sheet1!A2:O'
+            ).execute()
+            
+            values = result.get('values', [])
+            clients = []
+            
+            for row in values:
+                if len(row) >= 9:  # Minimum required fields
+                    # Pad row with empty strings if needed
+                    while len(row) < 15:
+                        row.append('')
+                    
+                    client = {
+                        'client_id': row[0],
+                        'full_name': row[1],
+                        'surname': row[2], 
+                        'email': row[3],
+                        'phone': row[4],
+                        'status': row[5],
+                        'date_added': row[6],
+                        'last_contact': row[7],
+                        'folder_id': row[8] if row[8] else None,
+                        'notes': row[9],
+                        'portfolio_value': float(row[10]) if row[10] else 0.0,
+                        'risk_profile': row[11] if row[11] else 'moderate',
+                        'address': row[12],
+                        'date_of_birth': row[13],
+                        'occupation': row[14]
+                    }
+                    clients.append(client)
+            
+            return clients
+            
+        except Exception as e:
+            logger.error(f"Error getting clients: {e}")
+            return []
+    
+    def get_client_by_id(self, client_id: str) -> Dict:
+        """Get specific client by ID"""
+        clients = self.get_clients()
+        for client in clients:
+            if client['client_id'] == client_id:
+                return client
+        return None
+    
+    def add_policy(self, policy_data: Dict) -> bool:
+        """Add a new policy"""
+        try:
+            values = [list(policy_data.values())]
+            
+            self.sheets_service.spreadsheets().values().append(
+                spreadsheetId=self.policies_spreadsheet_id,
+                range='Sheet1!A:M',
+                valueInputOption='RAW',
+                body={'values': values}
+            ).execute()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding policy: {e}")
+            return False
+    
+    def get_client_policies(self, client_id: str) -> List[Dict]:
+        """Get all policies for a client"""
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.policies_spreadsheet_id,
+                range='Sheet1!A2:M'
+            ).execute()
+            
+            values = result.get('values', [])
+            policies = []
+            
+            for row in values:
+                if len(row) >= 3 and row[1] == client_id:  # Match client ID
+                    while len(row) < 13:
+                        row.append('')
+                    
+                    policy = {
+                        'policy_id': row[0],
+                        'client_id': row[1],
+                        'policy_name': row[2],
+                        'policy_type': row[3],
+                        'provider': row[4],
+                        'premium': row[5],
+                        'sum_assured': row[6],
+                        'start_date': row[7],
+                        'review_date': row[8],
+                        'status': row[9],
+                        'folder_id': row[10],
+                        'notes': row[11],
+                        'date_added': row[12]
+                    }
+                    policies.append(policy)
+            
+            return policies
+            
+        except Exception as e:
+            logger.error(f"Error getting client policies: {e}")
+            return []
 
 # HTML Templates
 DASHBOARD_TEMPLATE = """
@@ -377,7 +470,7 @@ DASHBOARD_TEMPLATE = """
                 <div class="flex items-center">
                     <div class="p-3 bg-blue-100 rounded-lg">
                         <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 515.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
                         </svg>
                     </div>
                     <div class="ml-4">
@@ -409,8 +502,8 @@ DASHBOARD_TEMPLATE = """
                         </svg>
                     </div>
                     <div class="ml-4">
-                        <p class="text-sm font-medium text-gray-600">Prospects</p>
-                        <p class="text-2xl font-bold text-gray-900">{{ stats.prospects or 0 }}</p>
+                        <p class="text-sm font-medium text-gray-600">Policies</p>
+                        <p class="text-2xl font-bold text-gray-900">{{ stats.total_policies or 0 }}</p>
                     </div>
                 </div>
             </div>
@@ -424,7 +517,7 @@ DASHBOARD_TEMPLATE = """
                     </div>
                     <div class="ml-4">
                         <p class="text-sm font-medium text-gray-600">Total Portfolio</p>
-                        <p class="text-2xl font-bold text-gray-900">£{{ "{:,.0f}".format(stats.total_portfolio_value or 0) }}</p>
+                        <p class="text-2xl font-bold text-gray-900">£{{ "{:,.0f}".format(stats.total_portfolio or 0) }}</p>
                     </div>
                 </div>
             </div>
@@ -441,7 +534,7 @@ DASHBOARD_TEMPLATE = """
                     </div>
                     <div class="ml-4">
                         <h3 class="text-lg font-medium text-gray-900">Add New Client</h3>
-                        <p class="text-sm text-gray-600">Create client profile</p>
+                        <p class="text-sm text-gray-600">Create client profile & folders</p>
                     </div>
                 </div>
             </a>
@@ -450,12 +543,12 @@ DASHBOARD_TEMPLATE = """
                 <div class="flex items-center">
                     <div class="p-3 bg-green-100 rounded-lg">
                         <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0Â 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 515.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
                         </svg>
                     </div>
                     <div class="ml-4">
                         <h3 class="text-lg font-medium text-gray-900">Manage Clients</h3>
-                        <p class="text-sm text-gray-600">View all clients</p>
+                        <p class="text-sm text-gray-600">View & edit all clients</p>
                     </div>
                 </div>
             </a>
@@ -468,8 +561,8 @@ DASHBOARD_TEMPLATE = """
                         </svg>
                     </div>
                     <div class="ml-4">
-                        <h3 class="text-lg font-medium text-gray-900">View Reports</h3>
-                        <p class="text-sm text-gray-600">Business analytics</p>
+                        <h3 class="text-lg font-medium text-gray-900">A-Z Filing System</h3>
+                        <p class="text-sm text-gray-600">Organized Google Drive</p>
                     </div>
                 </div>
             </div>
@@ -495,8 +588,8 @@ DASHBOARD_TEMPLATE = """
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 515.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
                     </svg>
                 </div>
-                <h3 class="text-xl font-semibold text-gray-900 mb-2">Client Management</h3>
-                <p class="text-gray-600">Organize client profiles with automatic Google Drive folder creation</p>
+                <h3 class="text-xl font-semibold text-gray-900 mb-2">A-Z Client Filing</h3>
+                <p class="text-gray-600">Organized by surname for easy access</p>
             </div>
 
             <div class="card-professional bg-white rounded-xl p-8 text-center">
@@ -505,8 +598,8 @@ DASHBOARD_TEMPLATE = """
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
                     </svg>
                 </div>
-                <h3 class="text-xl font-semibold text-gray-900 mb-2">Fact Find Integration</h3>
-                <p class="text-gray-600">Seamlessly integrate your existing fact find forms</p>
+                <h3 class="text-xl font-semibold text-gray-900 mb-2">Policy Management</h3>
+                <p class="text-gray-600">Create & manage policies through CRM</p>
             </div>
 
             <div class="card-professional bg-white rounded-xl p-8 text-center">
@@ -515,8 +608,8 @@ DASHBOARD_TEMPLATE = """
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m-2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
                     </svg>
                 </div>
-                <h3 class="text-xl font-semibold text-gray-900 mb-2">Document Vault</h3>
-                <p class="text-gray-600">Secure document storage with Google Drive integration</p>
+                <h3 class="text-xl font-semibold text-gray-900 mb-2">Google Drive Sync</h3>
+                <p class="text-gray-600">Everything syncs automatically</p>
             </div>
         </div>
         {% endif %}
@@ -538,7 +631,44 @@ DASHBOARD_TEMPLATE = """
 """
 
 # Flask Routes
-@app.route('/')
+@app.route('/session-test-clear')
+def session_test_clear():
+    """Clear session test data"""
+    session.pop('test_data', None)
+    return redirect(url_for('session_test'))
+
+@app.route('/test')
+def test():
+    """Test page to verify deployment and configuration"""
+    google_connected = 'credentials' in session
+    
+    return f"""
+    <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px;">
+        <h1>WealthPro CRM Test Page</h1>
+        <p>✅ Flask is working!</p>
+        <p>✅ Render deployment successful!</p>
+        <p>🔧 Redirect URI: {REDIRECT_URI}</p>
+        <p>🌐 Client ID configured: {'Yes' if CLIENT_CONFIG['web']['client_id'] else 'No'}</p>
+        <p>🔗 Google Drive connected: {'Yes' if google_connected else 'No'}</p>
+        <p><a href="/session-test">Test Sessions</a></p>
+        <p><a href="/">Go to Dashboard</a></p>
+        <p><strong>DEBUG: RENDER_URL = {RENDER_URL}</strong></p>
+    </div>
+    """
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint for Render"""
+    return jsonify({
+        'status': 'healthy', 
+        'timestamp': datetime.now().isoformat(),
+        'service': 'WealthPro CRM'
+    })
+
+if __name__ == '__main__':
+    logger.info(f"Starting WealthPro CRM on {HOST}:{PORT}")
+    logger.info(f"Redirect URI configured as: {REDIRECT_URI}")
+    app.run(host=HOST, port=PORT, debug=False)route('/')
 def index():
     """Main dashboard - ALSO HANDLES OAUTH CALLBACK"""
     
@@ -562,13 +692,19 @@ def index():
     
     if google_connected:
         try:
-            # Get basic stats (can be expanded later)
+            credentials = Credentials(**session['credentials'])
+            data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
+            
+            clients = data_manager.get_clients()
+            
+            # Calculate stats
             stats = {
-                'total_clients': 0,
-                'active_clients': 0,
-                'prospects': 0,
-                'total_portfolio_value': 0
+                'total_clients': len(clients),
+                'active_clients': len([c for c in clients if c.get('status') == 'active']),
+                'total_policies': 0,  # Will be calculated when we add policies
+                'total_portfolio': sum(c.get('portfolio_value', 0) for c in clients)
             }
+            
             return render_template_string(DASHBOARD_TEMPLATE, 
                                         google_connected=True, 
                                         stats=stats, 
@@ -700,12 +836,6 @@ def authorize():
         logger.error(f"Authorization error: {e}")
         return f"Authorization setup error: {e}", 500
 
-@app.route('/callback')
-def callback():
-    """Legacy callback route - redirects to main route"""
-    # In case anything still tries to use /callback, redirect to main route
-    return redirect(url_for('index'))
-
 @app.route('/clients')
 def clients():
     """Clients management page"""
@@ -790,8 +920,8 @@ def clients():
                 clients_html += f"""
                             <tr>
                                 <td class="px-6 py-4 whitespace-nowrap">
-                                    <div class="text-sm font-medium text-gray-900">{client.get('name', 'N/A')}</div>
-                                    <div class="text-sm text-gray-500">ID: {client.get('id', 'N/A')}</div>
+                                    <div class="text-sm font-medium text-gray-900">{client.get('full_name', 'N/A')}</div>
+                                    <div class="text-sm text-gray-500">ID: {client.get('client_id', 'N/A')}</div>
                                 </td>
                                 <td class="px-6 py-4 whitespace-nowrap">
                                     <div class="text-sm text-gray-900">{client.get('email', 'N/A')}</div>
@@ -809,8 +939,8 @@ def clients():
                                     {folder_link}
                                 </td>
                                 <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
-                                    <a href="/clients/edit/{client.get('id', '')}" class="text-indigo-600 hover:text-indigo-900 mr-4">Edit</a>
-                                    <a href="/clients/view/{client.get('id', '')}" class="text-green-600 hover:text-green-900">View</a>
+                                    <a href="/clients/{client.get('client_id', '')}" class="text-indigo-600 hover:text-indigo-900 mr-4">View</a>
+                                    <a href="/clients/{client.get('client_id', '')}/policies" class="text-green-600 hover:text-green-900">Policies</a>
                                 </td>
                             </tr>
                 """
@@ -851,7 +981,8 @@ def add_client():
             data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
             
             # Get form data
-            client_name = request.form.get('name', '').strip()
+            full_name = request.form.get('full_name', '').strip()
+            surname = request.form.get('surname', '').strip()
             client_email = request.form.get('email', '').strip()
             client_phone = request.form.get('phone', '').strip()
             client_status = request.form.get('status', 'prospect')
@@ -862,34 +993,25 @@ def add_client():
             risk_profile = request.form.get('risk_profile', 'moderate')
             notes = request.form.get('notes', '').strip()
             
-            if not client_name:
-                raise ValueError("Client name is required")
+            if not full_name or not surname:
+                raise ValueError("Full name and surname are required")
             
             # Generate client ID
             client_id = f"WP{datetime.now().strftime('%Y%m%d%H%M%S')}"
             
-            # Create folder structure in Google Drive - ALWAYS INSIDE CRM FOLDER
-            logger.info(f"Creating folder structure for client: {client_name}")
+            # Create folder structure in Google Drive
+            logger.info(f"Creating A-Z folder structure for client: {full_name}")
             
-            # First ensure we have a main CRM folder (finds existing or creates new)
-            main_folder_id = drive_service.find_or_create_main_crm_folder()
-            
-            if not main_folder_id:
-                raise Exception("Failed to create/find main CRM folder")
-            
-            # Create client folder structure INSIDE the main CRM folder
-            folder_structure = drive_service.create_client_folder_structure(
-                client_name, 
-                main_folder_id  # This ensures everything goes inside CRM folder
-            )
+            folder_structure = drive_service.create_client_folder(full_name, surname)
             
             if not folder_structure:
                 raise Exception("Failed to create Google Drive folder structure")
             
             # Prepare client data
             client_data = {
-                'id': client_id,
-                'name': client_name,
+                'client_id': client_id,
+                'full_name': full_name,
+                'surname': surname,
                 'email': client_email,
                 'phone': client_phone,
                 'status': client_status,
@@ -908,8 +1030,7 @@ def add_client():
             success = data_manager.add_client(client_data)
             
             if success:
-                logger.info(f"Successfully added client: {client_name}")
-                # Redirect to clients page with success message
+                logger.info(f"Successfully added client: {full_name} in {surname[0].upper()} folder")
                 return redirect(url_for('clients'))
             else:
                 raise Exception("Failed to save client data")
@@ -951,7 +1072,7 @@ def add_client():
         <main class="max-w-4xl mx-auto px-6 py-8">
             <div class="mb-8">
                 <h1 class="text-3xl font-bold text-gray-900">Add New Client</h1>
-                <p class="text-gray-600 mt-2">Create a new client profile with automatic Google Drive folder structure</p>
+                <p class="text-gray-600 mt-2">Create a new client with A-Z organized Google Drive folders</p>
             </div>
             
             <div class="bg-white rounded-lg shadow p-8">
@@ -959,7 +1080,13 @@ def add_client():
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div>
                             <label class="block text-sm font-medium text-gray-700 mb-2">Full Name *</label>
-                            <input type="text" name="name" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <input type="text" name="full_name" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Surname *</label>
+                            <input type="text" name="surname" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <p class="text-xs text-gray-500 mt-1">Used for A-Z filing system</p>
                         </div>
                         
                         <div>
@@ -1017,39 +1144,13 @@ def add_client():
                     </div>
                     
                     <div class="bg-blue-50 p-4 rounded-lg">
-                        <h3 class="text-sm font-medium text-blue-800 mb-2">📁 Google Drive Folder Structure</h3>
-                        <p class="text-sm text-blue-700">When you create this client, the following folder structure will be automatically created in your Google Drive:</p>
-                        <div class="text-xs text-blue-600 mt-2 ml-4 space-y-1">
-                            <p class="font-semibold">Policy Folders (each containing 9 document types):</p>
-                            <ul class="ml-4 space-y-1">
-                                <li>• Life Insurance</li>
-                                <li>• Critical Illness</li>
-                                <li>• Income Protection</li>
-                                <li>• Private Medical Insurance</li>
-                                <li>• General Insurance</li>
-                                <li>• Pension/Retirement Planning</li>
-                                <li>• Investment Bonds</li>
-                                <li>• ISAs & Savings</li>
-                                <li>• Mortgage Protection</li>
-                                <li>• Business Protection</li>
-                            </ul>
-                            <p class="font-semibold mt-2">Each policy folder contains:</p>
-                            <ul class="ml-4 space-y-1">
-                                <li>• ID&V</li>
-                                <li>• FF & ATR</li>
-                                <li>• Research</li>
-                                <li>• LOA's</li>
-                                <li>• Suitability Letter</li>
-                                <li>• Meeting Notes</li>
-                                <li>• Terms of Business</li>
-                                <li>• Policy Information</li>
-                                <li>• Valuation</li>
-                            </ul>
-                            <p class="font-semibold mt-2">Plus separate folder:</p>
-                            <ul class="ml-4">
-                                <li>• Reviews</li>
-                            </ul>
-                        </div>
+                        <h3 class="text-sm font-medium text-blue-800 mb-2">📁 A-Z Filing System</h3>
+                        <p class="text-sm text-blue-700">Client will be filed under: <strong>[Surname Letter]/Client - [Full Name]</strong></p>
+                        <p class="text-xs text-blue-600 mt-2">Folder structure created:</p>
+                        <ul class="text-xs text-blue-600 mt-1 ml-4">
+                            <li>• Reviews folder (for client reviews)</li>
+                            <li>• Ready for policy folders (created through CRM)</li>
+                        </ul>
                     </div>
                     
                     <div class="flex justify-between">
@@ -1064,6 +1165,51 @@ def add_client():
     """
     
     return add_client_html
+
+@app.route('/clients/<client_id>')
+def view_client(client_id):
+    """View specific client details"""
+    if 'credentials' not in session:
+        return redirect(url_for('authorize'))
+    
+    try:
+        credentials = Credentials(**session['credentials'])
+        data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
+        drive_service = GoogleDriveService(credentials)
+        
+        client = data_manager.get_client_by_id(client_id)
+        if not client:
+            return "Client not found", 404
+        
+        policies = data_manager.get_client_policies(client_id)
+        
+        return f"<h1>Client Details: {client['full_name']}</h1><p>Policies: {len(policies)}</p><a href='/clients'>Back to Clients</a>"
+        
+    except Exception as e:
+        logger.error(f"Error viewing client: {e}")
+        return f"Error: {e}", 500
+
+@app.route('/clients/<client_id>/policies')
+def client_policies(client_id):
+    """View client policies"""
+    if 'credentials' not in session:
+        return redirect(url_for('authorize'))
+    
+    try:
+        credentials = Credentials(**session['credentials'])
+        data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
+        
+        client = data_manager.get_client_by_id(client_id)
+        if not client:
+            return "Client not found", 404
+        
+        policies = data_manager.get_client_policies(client_id)
+        
+        return f"<h1>Policies for {client['full_name']}</h1><p>Total policies: {len(policies)}</p><a href='/clients/{client_id}/policies/add'>Add Policy</a><br><a href='/clients'>Back to Clients</a>"
+        
+    except Exception as e:
+        logger.error(f"Error loading policies: {e}")
+        return f"Error: {e}", 500
 
 @app.route('/session-test')
 def session_test():
@@ -1091,41 +1237,4 @@ def session_test():
         </div>
         """
 
-@app.route('/session-test-clear')
-def session_test_clear():
-    """Clear session test data"""
-    session.pop('test_data', None)
-    return redirect(url_for('session_test'))
-
-@app.route('/test')
-def test():
-    """Test page to verify deployment and configuration"""
-    google_connected = 'credentials' in session
-    
-    return f"""
-    <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px;">
-        <h1>WealthPro CRM Test Page</h1>
-        <p>✅ Flask is working!</p>
-        <p>✅ Render deployment successful!</p>
-        <p>🔧 Redirect URI: {REDIRECT_URI}</p>
-        <p>🌐 Client ID configured: {'Yes' if CLIENT_CONFIG['web']['client_id'] else 'No'}</p>
-        <p>🔗 Google Drive connected: {'Yes' if google_connected else 'No'}</p>
-        <p><a href="/session-test">Test Sessions</a></p>
-        <p><a href="/">Go to Dashboard</a></p>
-        <p><strong>DEBUG: RENDER_URL = {RENDER_URL}</strong></p>
-    </div>
-    """
-
-@app.route('/health')
-def health_check():
-    """Health check endpoint for Render"""
-    return jsonify({
-        'status': 'healthy', 
-        'timestamp': datetime.now().isoformat(),
-        'service': 'WealthPro CRM'
-    })
-
-if __name__ == '__main__':
-    logger.info(f"Starting WealthPro CRM on {HOST}:{PORT}")
-    logger.info(f"Redirect URI configured as: {REDIRECT_URI}")
-    app.run(host=HOST, port=PORT, debug=False)
+@app.

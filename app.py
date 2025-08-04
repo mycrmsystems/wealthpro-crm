@@ -174,37 +174,49 @@ class GoogleDriveService:
         self.service = build('drive', 'v3', credentials=credentials)
         self.sheets_service = build('sheets', 'v4', credentials=credentials)
     
-    def create_crm_main_folder(self) -> str:
-        """Create main WealthPro CRM folder"""
+    def find_or_create_main_crm_folder(self) -> str:
+        """Find existing or create main WealthPro CRM folder"""
         try:
-            folder_metadata = {
-                'name': 'WealthPro CRM - Client Files',
-                'mimeType': 'application/vnd.google-apps.folder'
-            }
+            # First, search for existing CRM folder
+            query = "name='WealthPro CRM - Client Files' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            results = self.service.files().list(q=query, fields="files(id, name)").execute()
             
-            folder = self.service.files().create(
-                body=folder_metadata,
-                fields='id'
-            ).execute()
+            folders = results.get('files', [])
             
-            logger.info(f"Created main CRM folder: {folder.get('id')}")
-            return folder.get('id')
-            
+            if folders:
+                # Found existing folder
+                folder_id = folders[0]['id']
+                logger.info(f"Found existing CRM folder: {folder_id}")
+                return folder_id
+            else:
+                # Create new main folder
+                folder_metadata = {
+                    'name': 'WealthPro CRM - Client Files',
+                    'mimeType': 'application/vnd.google-apps.folder'
+                }
+                
+                folder = self.service.files().create(
+                    body=folder_metadata,
+                    fields='id'
+                ).execute()
+                
+                folder_id = folder.get('id')
+                logger.info(f"Created new CRM folder: {folder_id}")
+                return folder_id
+                
         except HttpError as error:
-            logger.error(f"Error creating main CRM folder: {error}")
+            logger.error(f"Error with main CRM folder: {error}")
             return None
     
-    def create_client_folder_structure(self, client_name: str, parent_folder_id: str = None) -> Dict:
-        """Create complete folder structure for a new client"""
+    def create_client_folder_structure(self, client_name: str, main_crm_folder_id: str) -> Dict:
+        """Create complete folder structure for a new client INSIDE the main CRM folder"""
         try:
-            # Create main client folder
+            # Create main client folder INSIDE the CRM folder
             client_folder_metadata = {
                 'name': f"Client - {client_name}",
-                'mimeType': 'application/vnd.google-apps.folder'
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': [main_crm_folder_id]  # ALWAYS inside CRM folder
             }
-            
-            if parent_folder_id:
-                client_folder_metadata['parents'] = [parent_folder_id]
             
             client_folder = self.service.files().create(
                 body=client_folder_metadata,
@@ -212,38 +224,83 @@ class GoogleDriveService:
             ).execute()
             
             client_folder_id = client_folder.get('id')
-            logger.info(f"Created client folder for {client_name}: {client_folder_id}")
+            logger.info(f"Created client folder INSIDE CRM folder for {client_name}: {client_folder_id}")
             
-            # Create sub-folders within client folder
-            sub_folders = [
-                "01 - Personal Documents",
-                "02 - Financial Statements", 
-                "03 - Investment Documents",
-                "04 - Insurance Documents",
-                "05 - Tax Documents",
-                "06 - Estate Planning",
-                "07 - Fact Find Forms",
-                "08 - Meeting Notes",
-                "09 - Correspondence",
-                "10 - Reports & Proposals"
+            # Create policy sub-folders with specific structure
+            policy_folders = [
+                "Life Insurance",
+                "Critical Illness", 
+                "Income Protection",
+                "Private Medical Insurance",
+                "General Insurance",
+                "Pension/Retirement Planning",
+                "Investment Bonds",
+                "ISAs & Savings",
+                "Mortgage Protection",
+                "Business Protection"
+            ]
+            
+            # Documents that go in each policy folder
+            policy_documents = [
+                "ID&V",
+                "FF & ATR", 
+                "Research",
+                "LOA's",
+                "Suitability Letter",
+                "Meeting Notes",
+                "Terms of Business",
+                "Policy Information",
+                "Valuation"
             ]
             
             sub_folder_ids = {}
             
-            for folder_name in sub_folders:
-                sub_folder_metadata = {
-                    'name': folder_name,
+            # Create each policy folder INSIDE the client folder
+            for policy_name in policy_folders:
+                policy_folder_metadata = {
+                    'name': policy_name,
                     'mimeType': 'application/vnd.google-apps.folder',
-                    'parents': [client_folder_id]
+                    'parents': [client_folder_id]  # Inside client folder
                 }
                 
-                sub_folder = self.service.files().create(
-                    body=sub_folder_metadata,
+                policy_folder = self.service.files().create(
+                    body=policy_folder_metadata,
                     fields='id'
                 ).execute()
                 
-                sub_folder_ids[folder_name] = sub_folder.get('id')
-                logger.info(f"Created sub-folder: {folder_name}")
+                policy_folder_id = policy_folder.get('id')
+                sub_folder_ids[policy_name] = policy_folder_id
+                logger.info(f"Created policy folder INSIDE client folder: {policy_name}")
+                
+                # Create document folders within each policy folder
+                for doc_type in policy_documents:
+                    doc_folder_metadata = {
+                        'name': doc_type,
+                        'mimeType': 'application/vnd.google-apps.folder',
+                        'parents': [policy_folder_id]  # Inside policy folder
+                    }
+                    
+                    doc_folder = self.service.files().create(
+                        body=doc_folder_metadata,
+                        fields='id'
+                    ).execute()
+                    
+                    logger.info(f"Created document folder: {policy_name}/{doc_type}")
+            
+            # Create separate Reviews folder at client level
+            reviews_folder_metadata = {
+                'name': 'Reviews',
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': [client_folder_id]  # Inside client folder
+            }
+            
+            reviews_folder = self.service.files().create(
+                body=reviews_folder_metadata,
+                fields='id'
+            ).execute()
+            
+            sub_folder_ids['Reviews'] = reviews_folder.get('id')
+            logger.info("Created Reviews folder INSIDE client folder")
             
             return {
                 'client_folder_id': client_folder_id,
@@ -811,16 +868,19 @@ def add_client():
             # Generate client ID
             client_id = f"WP{datetime.now().strftime('%Y%m%d%H%M%S')}"
             
-            # Create folder structure in Google Drive
+            # Create folder structure in Google Drive - ALWAYS INSIDE CRM FOLDER
             logger.info(f"Creating folder structure for client: {client_name}")
             
-            # First ensure we have a main CRM folder
-            main_folder_id = drive_service.create_crm_main_folder()
+            # First ensure we have a main CRM folder (finds existing or creates new)
+            main_folder_id = drive_service.find_or_create_main_crm_folder()
             
-            # Create client folder structure
+            if not main_folder_id:
+                raise Exception("Failed to create/find main CRM folder")
+            
+            # Create client folder structure INSIDE the main CRM folder
             folder_structure = drive_service.create_client_folder_structure(
                 client_name, 
-                main_folder_id
+                main_folder_id  # This ensures everything goes inside CRM folder
             )
             
             if not folder_structure:
@@ -959,18 +1019,37 @@ def add_client():
                     <div class="bg-blue-50 p-4 rounded-lg">
                         <h3 class="text-sm font-medium text-blue-800 mb-2">📁 Google Drive Folder Structure</h3>
                         <p class="text-sm text-blue-700">When you create this client, the following folder structure will be automatically created in your Google Drive:</p>
-                        <ul class="text-xs text-blue-600 mt-2 ml-4 space-y-1">
-                            <li>• 01 - Personal Documents</li>
-                            <li>• 02 - Financial Statements</li>
-                            <li>• 03 - Investment Documents</li>
-                            <li>• 04 - Insurance Documents</li>
-                            <li>• 05 - Tax Documents</li>
-                            <li>• 06 - Estate Planning</li>
-                            <li>• 07 - Fact Find Forms</li>
-                            <li>• 08 - Meeting Notes</li>
-                            <li>• 09 - Correspondence</li>
-                            <li>• 10 - Reports & Proposals</li>
-                        </ul>
+                        <div class="text-xs text-blue-600 mt-2 ml-4 space-y-1">
+                            <p class="font-semibold">Policy Folders (each containing 9 document types):</p>
+                            <ul class="ml-4 space-y-1">
+                                <li>• Life Insurance</li>
+                                <li>• Critical Illness</li>
+                                <li>• Income Protection</li>
+                                <li>• Private Medical Insurance</li>
+                                <li>• General Insurance</li>
+                                <li>• Pension/Retirement Planning</li>
+                                <li>• Investment Bonds</li>
+                                <li>• ISAs & Savings</li>
+                                <li>• Mortgage Protection</li>
+                                <li>• Business Protection</li>
+                            </ul>
+                            <p class="font-semibold mt-2">Each policy folder contains:</p>
+                            <ul class="ml-4 space-y-1">
+                                <li>• ID&V</li>
+                                <li>• FF & ATR</li>
+                                <li>• Research</li>
+                                <li>• LOA's</li>
+                                <li>• Suitability Letter</li>
+                                <li>• Meeting Notes</li>
+                                <li>• Terms of Business</li>
+                                <li>• Policy Information</li>
+                                <li>• Valuation</li>
+                            </ul>
+                            <p class="font-semibold mt-2">Plus separate folder:</p>
+                            <ul class="ml-4">
+                                <li>• Reviews</li>
+                            </ul>
+                        </div>
                     </div>
                     
                     <div class="flex justify-between">

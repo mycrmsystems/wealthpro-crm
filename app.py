@@ -1,10 +1,11 @@
 """
 Financial Adviser CRM System - Optimized for Render
-Complete CRM with Google Drive integration - PROPERLY FIXED REDIRECT URI
+FIXED: Robust Google Drive integration with better session handling
 """
 
 import os
 import json
+import base64
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
@@ -20,24 +21,28 @@ import secrets
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
+# Initialize Flask app with robust session configuration
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-app.config['SESSION_COOKIE_SECURE'] = False  # For development
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config.update(
+    SESSION_COOKIE_SECURE=False,  # Set to True in production with HTTPS
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=24),
+    SESSION_REFRESH_EACH_REQUEST=True
+)
 
 # Render configuration
 PORT = int(os.environ.get('PORT', 10000))
 HOST = '0.0.0.0'
 
-# Google OAuth 2.0 settings for Render - PROPERLY FIXED REDIRECT URI
+# Google OAuth 2.0 settings for Render
 SCOPES = [
     'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
-# Get the redirect URI for Render - NO /callback TO MATCH GOOGLE SETTINGS
+# Get the redirect URI for Render - FIXED TO MATCH GOOGLE SETTINGS
 RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', 'https://wealthpro-crm.onrender.com')
 REDIRECT_URI = RENDER_URL
 
@@ -50,6 +55,47 @@ CLIENT_CONFIG = {
         "redirect_uris": [REDIRECT_URI]
     }
 }
+
+def get_stored_credentials():
+    """Get stored credentials from environment or session"""
+    # First try session
+    if 'credentials' in session:
+        try:
+            return Credentials(**session['credentials'])
+        except Exception as e:
+            logger.warning(f"Session credentials invalid: {e}")
+    
+    # Try environment variable (for persistent storage)
+    stored_creds = os.environ.get('STORED_GOOGLE_CREDENTIALS')
+    if stored_creds:
+        try:
+            creds_data = json.loads(base64.b64decode(stored_creds).decode())
+            return Credentials(**creds_data)
+        except Exception as e:
+            logger.warning(f"Stored credentials invalid: {e}")
+    
+    return None
+
+def store_credentials(credentials):
+    """Store credentials in both session and log for environment variable"""
+    creds_dict = {
+        'token': credentials.token,
+        'refresh_token': credentials.refresh_token,
+        'token_uri': credentials.token_uri,
+        'client_id': credentials.client_id,
+        'client_secret': credentials.client_secret,
+        'scopes': credentials.scopes
+    }
+    
+    # Store in session
+    session['credentials'] = creds_dict
+    session.permanent = True
+    
+    # Log encoded credentials for manual storage in environment
+    encoded_creds = base64.b64encode(json.dumps(creds_dict).encode()).decode()
+    logger.info(f"STORE THIS IN RENDER ENVIRONMENT VARIABLE 'STORED_GOOGLE_CREDENTIALS': {encoded_creds}")
+    
+    return creds_dict
 
 @dataclass
 class Client:
@@ -73,13 +119,38 @@ class GoogleDriveService:
         self.service = build('drive', 'v3', credentials=credentials)
         self.sheets_service = build('sheets', 'v4', credentials=credentials)
     
-    def create_main_crm_folder(self) -> str:
+    def find_workflow_folder(self) -> str:
+        """Find the workflow folder in Google Drive"""
+        try:
+            # Search for folders with 'workflow' in the name (case insensitive)
+            query = "mimeType='application/vnd.google-apps.folder' and (name contains 'workflow' or name contains 'Workflow' or name contains 'Work Flow')"
+            results = self.service.files().list(
+                q=query,
+                fields="files(id, name)"
+            ).execute()
+            
+            folders = results.get('files', [])
+            if folders:
+                logger.info(f"Found workflow folder: {folders[0]['name']} ({folders[0]['id']})")
+                return folders[0]['id']
+            else:
+                logger.info("No workflow folder found, will create in root")
+                return None
+                
+        except HttpError as error:
+            logger.error(f"Error finding workflow folder: {error}")
+            return None
+    
+    def create_main_crm_folder(self, parent_folder_id: str = None) -> str:
         """Create the main WealthPro CRM folder"""
         try:
             folder_metadata = {
                 'name': 'WealthPro CRM Data',
                 'mimeType': 'application/vnd.google-apps.folder'
             }
+            
+            if parent_folder_id:
+                folder_metadata['parents'] = [parent_folder_id]
             
             folder = self.service.files().create(
                 body=folder_metadata,
@@ -287,7 +358,7 @@ DASHBOARD_TEMPLATE = """
                 <div class="flex items-center space-x-6">
                     <a href="/" class="hover:text-blue-200">Dashboard</a>
                     <a href="/clients" class="hover:text-blue-200">Clients</a>
-                    {% if 'credentials' in session %}
+                    {% if connected %}
                     <div class="flex items-center space-x-2 bg-white bg-opacity-10 px-3 py-1 rounded-lg">
                         <div class="w-2 h-2 bg-green-400 rounded-full"></div>
                         <span class="text-sm">Google Drive Connected</span>
@@ -304,7 +375,7 @@ DASHBOARD_TEMPLATE = """
 
     <!-- Main Content -->
     <main class="max-w-7xl mx-auto px-6 py-8">
-        {% if 'credentials' not in session %}
+        {% if not connected %}
         <!-- Welcome Screen -->
         <div class="gradient-wealth text-white rounded-lg p-8 mb-8 text-center">
             <h1 class="text-4xl font-bold mb-4">Welcome to WealthPro CRM!</h1>
@@ -440,7 +511,7 @@ DASHBOARD_TEMPLATE = """
                 <div class="flex items-center">
                     <div class="p-3 bg-green-100 rounded-lg">
                         <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 715.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
                         </svg>
                     </div>
                     <div class="ml-4">
@@ -468,7 +539,10 @@ DASHBOARD_TEMPLATE = """
         <!-- Success Message -->
         <div class="bg-green-50 border border-green-200 rounded-lg p-6 text-center">
             <h3 class="text-lg font-medium text-green-900 mb-2">🎉 Google Drive Successfully Connected!</h3>
-            <p class="text-green-700">Your CRM is now ready to create client folders and manage documents automatically.</p>
+            <p class="text-green-700 mb-3">Your CRM is now ready to create client folders and manage documents automatically.</p>
+            {% if folder_info %}
+            <p class="text-sm text-green-600">📁 CRM folder created in: {{ folder_info }}</p>
+            {% endif %}
         </div>
         
         {% endif %}
@@ -488,11 +562,13 @@ DASHBOARD_TEMPLATE = """
 def index():
     """Main dashboard"""
     try:
-        if 'credentials' not in session:
-            return render_template_string(DASHBOARD_TEMPLATE, stats={}, clients=[], error=None)
+        credentials = get_stored_credentials()
+        connected = credentials is not None
+        
+        if not connected:
+            return render_template_string(DASHBOARD_TEMPLATE, connected=False, stats={}, clients=[], error=None)
         
         # Get summary statistics
-        credentials = Credentials(**session['credentials'])
         data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
         
         clients = data_manager.get_clients()
@@ -504,11 +580,16 @@ def index():
             'total_portfolio_value': sum(c.portfolio_value for c in clients)
         }
         
-        return render_template_string(DASHBOARD_TEMPLATE, stats=stats, clients=clients[:5], error=None)
+        # Check if CRM folder exists
+        drive_service = GoogleDriveService(credentials)
+        workflow_folder = drive_service.find_workflow_folder()
+        folder_info = "your workflow folder" if workflow_folder else "Google Drive root"
+        
+        return render_template_string(DASHBOARD_TEMPLATE, connected=True, stats=stats, clients=clients[:5], folder_info=folder_info, error=None)
     
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
-        return render_template_string(DASHBOARD_TEMPLATE, stats={}, clients=[], error="Unable to load data. Please reconnect to Google Drive.")
+        return render_template_string(DASHBOARD_TEMPLATE, connected=False, stats={}, clients=[], error="Error loading dashboard. Please reconnect to Google Drive.")
 
 @app.route('/authorize')
 def authorize():
@@ -526,7 +607,7 @@ def authorize():
         )
         
         session['state'] = state
-        logger.info(f"Redirecting to Google OAuth with redirect_uri: {REDIRECT_URI}")
+        logger.info(f"Starting OAuth flow with redirect_uri: {REDIRECT_URI}")
         return redirect(authorization_url)
     
     except Exception as e:
@@ -535,10 +616,14 @@ def authorize():
 
 @app.route('/callback')
 def callback():
-    """Handle OAuth callback - FIXED TO WORK WITHOUT /callback"""
+    """Handle OAuth callback - ROBUST VERSION"""
     try:
         logger.info(f"OAuth callback received. Request URL: {request.url}")
-        logger.info(f"Expected redirect_uri: {REDIRECT_URI}")
+        
+        # Verify state parameter
+        if 'state' not in session:
+            logger.error("No state in session")
+            return redirect(url_for('index'))
         
         flow = Flow.from_client_config(
             CLIENT_CONFIG,
@@ -551,22 +636,20 @@ def callback():
         flow.fetch_token(authorization_response=authorization_response)
         
         credentials = flow.credentials
-        session['credentials'] = {
-            'token': credentials.token,
-            'refresh_token': credentials.refresh_token,
-            'token_uri': credentials.token_uri,
-            'client_id': credentials.client_id,
-            'client_secret': credentials.client_secret,
-            'scopes': credentials.scopes
-        }
+        
+        # Store credentials using robust method
+        store_credentials(credentials)
         
         # Initialize CRM folder structure
         try:
             drive_service = GoogleDriveService(credentials)
             data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
             
-            # Create main CRM folder
-            main_folder_id = drive_service.create_main_crm_folder()
+            # Find workflow folder
+            workflow_folder_id = drive_service.find_workflow_folder()
+            
+            # Create main CRM folder (in workflow folder if found)
+            main_folder_id = drive_service.create_main_crm_folder(workflow_folder_id)
             
             # Create CRM spreadsheet in the main folder
             if not data_manager.spreadsheet_id:
@@ -575,18 +658,20 @@ def callback():
                     logger.info(f"Created new CRM spreadsheet: {spreadsheet_id}")
                     
         except Exception as e:
-            logger.warning(f"Could not create CRM structure automatically: {e}")
+            logger.warning(f"Could not create CRM structure: {e}")
         
+        logger.info("OAuth callback successful, redirecting to dashboard")
         return redirect(url_for('index'))
     
     except Exception as e:
         logger.error(f"Callback error: {e}")
-        return f"Authentication callback error: {e}", 500
+        return f"Authentication callback error: {e}. <a href='/'>Try again</a>", 500
 
 @app.route('/clients')
 def clients():
     """Simple clients page"""
-    if 'credentials' not in session:
+    credentials = get_stored_credentials()
+    if not credentials:
         return redirect(url_for('authorize'))
     
     return "<h1>Clients page - Coming soon!</h1><a href='/'>Back to Dashboard</a>"
@@ -594,7 +679,8 @@ def clients():
 @app.route('/clients/add')
 def add_client():
     """Simple add client page"""
-    if 'credentials' not in session:
+    credentials = get_stored_credentials()
+    if not credentials:
         return redirect(url_for('authorize'))
     
     return "<h1>Add client page - Coming soon!</h1><a href='/'>Back to Dashboard</a>"
@@ -602,22 +688,26 @@ def add_client():
 @app.route('/health')
 def health_check():
     """Health check endpoint for Render"""
+    credentials = get_stored_credentials()
     return jsonify({
         'status': 'healthy', 
         'timestamp': datetime.now().isoformat(),
         'service': 'WealthPro CRM',
-        'redirect_uri': REDIRECT_URI
+        'redirect_uri': REDIRECT_URI,
+        'connected': credentials is not None
     })
 
 @app.route('/test')
 def test():
     """Test page to verify deployment"""
+    credentials = get_stored_credentials()
     return f"""
     <h1>WealthPro CRM Test Page</h1>
     <p>✅ Flask is working!</p>
     <p>✅ Render deployment successful!</p>
     <p>🔧 Redirect URI: {REDIRECT_URI}</p>
     <p>🌐 Client ID configured: {'Yes' if os.environ.get('GOOGLE_CLIENT_ID') else 'No'}</p>
+    <p>🔗 Google Drive connected: {'Yes' if credentials else 'No'}</p>
     <a href="/">Go to Dashboard</a>
     """
 

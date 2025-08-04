@@ -53,20 +53,119 @@ CLIENT_CONFIG = {
     }
 }
 
-@dataclass
-class Client:
-    """Client data model"""
-    id: str
-    name: str
-    email: str
-    phone: str
-    status: str
-    date_added: str
-    last_contact: str
-    folder_id: Optional[str] = None
-    notes: str = ""
-    portfolio_value: float = 0.0
-    risk_profile: str = "moderate"
+class CRMDataManager:
+    """Manages CRM data using Google Sheets as backend"""
+    
+    def __init__(self, sheets_service):
+        self.sheets_service = sheets_service
+        self.spreadsheet_id = None
+        self.setup_crm_spreadsheet()
+    
+    def setup_crm_spreadsheet(self):
+        """Setup or find the CRM spreadsheet"""
+        try:
+            # Try to find existing CRM spreadsheet
+            # For now, we'll create a new one each time - you can modify this to search for existing
+            spreadsheet = {
+                'properties': {
+                    'title': 'WealthPro CRM Data - ' + datetime.now().strftime('%Y-%m-%d')
+                },
+                'sheets': [
+                    {
+                        'properties': {
+                            'title': 'Clients',
+                            'gridProperties': {
+                                'rowCount': 1000,
+                                'columnCount': 15
+                            }
+                        }
+                    }
+                ]
+            }
+            
+            result = self.sheets_service.spreadsheets().create(
+                body=spreadsheet
+            ).execute()
+            
+            self.spreadsheet_id = result['spreadsheetId']
+            
+            # Add headers
+            headers = [
+                'ID', 'Name', 'Email', 'Phone', 'Status', 'Date Added',
+                'Last Contact', 'Client Folder ID', 'Notes', 'Portfolio Value', 
+                'Risk Profile', 'Address', 'Date of Birth', 'Occupation'
+            ]
+            
+            self.sheets_service.spreadsheets().values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range='Clients!A1:N1',
+                valueInputOption='RAW',
+                body={'values': [headers]}
+            ).execute()
+            
+            logger.info(f"Created CRM spreadsheet: {self.spreadsheet_id}")
+            
+        except HttpError as error:
+            logger.error(f"Error setting up CRM spreadsheet: {error}")
+    
+    def add_client(self, client_data: Dict) -> bool:
+        """Add a new client to the spreadsheet"""
+        try:
+            values = [list(client_data.values())]
+            
+            self.sheets_service.spreadsheets().values().append(
+                spreadsheetId=self.spreadsheet_id,
+                range='Clients!A:N',
+                valueInputOption='RAW',
+                body={'values': values}
+            ).execute()
+            
+            return True
+            
+        except HttpError as error:
+            logger.error(f"Error adding client: {error}")
+            return False
+    
+    def get_clients(self) -> List[Dict]:
+        """Get all clients from the spreadsheet"""
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range='Clients!A2:N'
+            ).execute()
+            
+            values = result.get('values', [])
+            clients = []
+            
+            for row in values:
+                if len(row) >= 8:  # Minimum required fields
+                    # Pad row with empty strings if needed
+                    while len(row) < 14:
+                        row.append('')
+                    
+                    client = {
+                        'id': row[0],
+                        'name': row[1], 
+                        'email': row[2],
+                        'phone': row[3],
+                        'status': row[4],
+                        'date_added': row[5],
+                        'last_contact': row[6],
+                        'folder_id': row[7] if row[7] else None,
+                        'notes': row[8],
+                        'portfolio_value': float(row[9]) if row[9] else 0.0,
+                        'risk_profile': row[10] if row[10] else 'moderate',
+                        'address': row[11],
+                        'date_of_birth': row[12],
+                        'occupation': row[13]
+                    }
+                    clients.append(client)
+            
+            return clients
+            
+        except HttpError as error:
+            logger.error(f"Error getting clients: {error}")
+            return []
 
 class GoogleDriveService:
     """Service for Google Drive operations"""
@@ -75,28 +174,89 @@ class GoogleDriveService:
         self.service = build('drive', 'v3', credentials=credentials)
         self.sheets_service = build('sheets', 'v4', credentials=credentials)
     
-    def create_client_folder(self, client_name: str, parent_folder_id: str = None) -> str:
-        """Create a folder for a new client"""
+    def create_crm_main_folder(self) -> str:
+        """Create main WealthPro CRM folder"""
         try:
             folder_metadata = {
-                'name': f"Client - {client_name}",
+                'name': 'WealthPro CRM - Client Files',
                 'mimeType': 'application/vnd.google-apps.folder'
             }
-            
-            if parent_folder_id:
-                folder_metadata['parents'] = [parent_folder_id]
             
             folder = self.service.files().create(
                 body=folder_metadata,
                 fields='id'
             ).execute()
             
-            logger.info(f"Created folder for {client_name}: {folder.get('id')}")
+            logger.info(f"Created main CRM folder: {folder.get('id')}")
             return folder.get('id')
             
         except HttpError as error:
-            logger.error(f"Error creating folder: {error}")
+            logger.error(f"Error creating main CRM folder: {error}")
             return None
+    
+    def create_client_folder_structure(self, client_name: str, parent_folder_id: str = None) -> Dict:
+        """Create complete folder structure for a new client"""
+        try:
+            # Create main client folder
+            client_folder_metadata = {
+                'name': f"Client - {client_name}",
+                'mimeType': 'application/vnd.google-apps.folder'
+            }
+            
+            if parent_folder_id:
+                client_folder_metadata['parents'] = [parent_folder_id]
+            
+            client_folder = self.service.files().create(
+                body=client_folder_metadata,
+                fields='id'
+            ).execute()
+            
+            client_folder_id = client_folder.get('id')
+            logger.info(f"Created client folder for {client_name}: {client_folder_id}")
+            
+            # Create sub-folders within client folder
+            sub_folders = [
+                "01 - Personal Documents",
+                "02 - Financial Statements", 
+                "03 - Investment Documents",
+                "04 - Insurance Documents",
+                "05 - Tax Documents",
+                "06 - Estate Planning",
+                "07 - Fact Find Forms",
+                "08 - Meeting Notes",
+                "09 - Correspondence",
+                "10 - Reports & Proposals"
+            ]
+            
+            sub_folder_ids = {}
+            
+            for folder_name in sub_folders:
+                sub_folder_metadata = {
+                    'name': folder_name,
+                    'mimeType': 'application/vnd.google-apps.folder',
+                    'parents': [client_folder_id]
+                }
+                
+                sub_folder = self.service.files().create(
+                    body=sub_folder_metadata,
+                    fields='id'
+                ).execute()
+                
+                sub_folder_ids[folder_name] = sub_folder.get('id')
+                logger.info(f"Created sub-folder: {folder_name}")
+            
+            return {
+                'client_folder_id': client_folder_id,
+                'sub_folders': sub_folder_ids
+            }
+            
+        except HttpError as error:
+            logger.error(f"Error creating client folder structure: {error}")
+            return None
+    
+    def get_folder_url(self, folder_id: str) -> str:
+        """Get the Google Drive URL for a folder"""
+        return f"https://drive.google.com/drive/folders/{folder_id}"
 
 # HTML Templates
 DASHBOARD_TEMPLATE = """
@@ -491,19 +651,340 @@ def callback():
 
 @app.route('/clients')
 def clients():
-    """Clients page"""
+    """Clients management page"""
     if 'credentials' not in session:
         return redirect(url_for('authorize'))
     
-    return "<h1>Clients Management - Coming Soon!</h1><p>This will show your client list with Google Drive folders.</p><a href='/'>Back to Dashboard</a>"
+    try:
+        credentials = Credentials(**session['credentials'])
+        drive_service = GoogleDriveService(credentials)
+        data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
+        
+        clients_list = data_manager.get_clients()
+        
+        # Create clients page HTML
+        clients_html = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>WealthPro CRM - Clients</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+            <style>
+                body {{ font-family: 'Inter', sans-serif; }}
+                .gradient-wealth {{ background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }}
+            </style>
+        </head>
+        <body class="bg-gray-50">
+            <nav class="gradient-wealth text-white shadow-lg">
+                <div class="max-w-7xl mx-auto px-6">
+                    <div class="flex justify-between items-center h-16">
+                        <div class="flex items-center space-x-4">
+                            <h1 class="text-xl font-bold">WealthPro CRM</h1>
+                        </div>
+                        <div class="flex items-center space-x-6">
+                            <a href="/" class="hover:text-blue-200">Dashboard</a>
+                            <a href="/clients" class="text-white font-semibold">Clients</a>
+                        </div>
+                    </div>
+                </div>
+            </nav>
+            
+            <main class="max-w-7xl mx-auto px-6 py-8">
+                <div class="flex justify-between items-center mb-8">
+                    <h1 class="text-3xl font-bold text-gray-900">Client Management</h1>
+                    <a href="/clients/add" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition-colors">
+                        Add New Client
+                    </a>
+                </div>
+                
+                <div class="bg-white rounded-lg shadow overflow-hidden">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Client</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Contact</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Portfolio</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Drive Folder</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+        """
+        
+        if clients_list:
+            for client in clients_list:
+                folder_link = ""
+                if client.get('folder_id'):
+                    folder_url = drive_service.get_folder_url(client['folder_id'])
+                    folder_link = f'<a href="{folder_url}" target="_blank" class="text-blue-600 hover:text-blue-800">📁 View Folder</a>'
+                else:
+                    folder_link = '<span class="text-gray-400">No folder</span>'
+                
+                status_color = {
+                    'active': 'bg-green-100 text-green-800',
+                    'inactive': 'bg-red-100 text-red-800', 
+                    'prospect': 'bg-yellow-100 text-yellow-800'
+                }.get(client.get('status', 'prospect'), 'bg-gray-100 text-gray-800')
+                
+                clients_html += f"""
+                            <tr>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="text-sm font-medium text-gray-900">{client.get('name', 'N/A')}</div>
+                                    <div class="text-sm text-gray-500">ID: {client.get('id', 'N/A')}</div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <div class="text-sm text-gray-900">{client.get('email', 'N/A')}</div>
+                                    <div class="text-sm text-gray-500">{client.get('phone', 'N/A')}</div>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full {status_color}">
+                                        {client.get('status', 'prospect').title()}
+                                    </span>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                    £{client.get('portfolio_value', 0):,.0f}
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                                    {folder_link}
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                    <a href="/clients/edit/{client.get('id', '')}" class="text-indigo-600 hover:text-indigo-900 mr-4">Edit</a>
+                                    <a href="/clients/view/{client.get('id', '')}" class="text-green-600 hover:text-green-900">View</a>
+                                </td>
+                            </tr>
+                """
+        else:
+            clients_html += """
+                            <tr>
+                                <td colspan="6" class="px-6 py-4 text-center text-gray-500">
+                                    No clients found. <a href="/clients/add" class="text-blue-600 hover:text-blue-800">Add your first client</a>
+                                </td>
+                            </tr>
+            """
+        
+        clients_html += """
+                        </tbody>
+                    </table>
+                </div>
+            </main>
+        </body>
+        </html>
+        """
+        
+        return clients_html
+        
+    except Exception as e:
+        logger.error(f"Error loading clients page: {e}")
+        return f"Error loading clients: {e}", 500
 
-@app.route('/clients/add')
+@app.route('/clients/add', methods=['GET', 'POST'])
 def add_client():
-    """Add client page"""
+    """Add new client page"""
     if 'credentials' not in session:
         return redirect(url_for('authorize'))
     
-    return "<h1>Add New Client - Coming Soon!</h1><p>This will create client profiles and Google Drive folders.</p><a href='/'>Back to Dashboard</a>"
+    if request.method == 'POST':
+        try:
+            credentials = Credentials(**session['credentials'])
+            drive_service = GoogleDriveService(credentials)
+            data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
+            
+            # Get form data
+            client_name = request.form.get('name', '').strip()
+            client_email = request.form.get('email', '').strip()
+            client_phone = request.form.get('phone', '').strip()
+            client_status = request.form.get('status', 'prospect')
+            client_address = request.form.get('address', '').strip()
+            client_dob = request.form.get('date_of_birth', '').strip()
+            client_occupation = request.form.get('occupation', '').strip()
+            portfolio_value = request.form.get('portfolio_value', '0')
+            risk_profile = request.form.get('risk_profile', 'moderate')
+            notes = request.form.get('notes', '').strip()
+            
+            if not client_name:
+                raise ValueError("Client name is required")
+            
+            # Generate client ID
+            client_id = f"WP{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+            # Create folder structure in Google Drive
+            logger.info(f"Creating folder structure for client: {client_name}")
+            
+            # First ensure we have a main CRM folder
+            main_folder_id = drive_service.create_crm_main_folder()
+            
+            # Create client folder structure
+            folder_structure = drive_service.create_client_folder_structure(
+                client_name, 
+                main_folder_id
+            )
+            
+            if not folder_structure:
+                raise Exception("Failed to create Google Drive folder structure")
+            
+            # Prepare client data
+            client_data = {
+                'id': client_id,
+                'name': client_name,
+                'email': client_email,
+                'phone': client_phone,
+                'status': client_status,
+                'date_added': datetime.now().strftime('%Y-%m-%d'),
+                'last_contact': datetime.now().strftime('%Y-%m-%d'),
+                'folder_id': folder_structure['client_folder_id'],
+                'notes': notes,
+                'portfolio_value': float(portfolio_value) if portfolio_value else 0.0,
+                'risk_profile': risk_profile,
+                'address': client_address,
+                'date_of_birth': client_dob,
+                'occupation': client_occupation
+            }
+            
+            # Add client to spreadsheet
+            success = data_manager.add_client(client_data)
+            
+            if success:
+                logger.info(f"Successfully added client: {client_name}")
+                # Redirect to clients page with success message
+                return redirect(url_for('clients'))
+            else:
+                raise Exception("Failed to save client data")
+                
+        except Exception as e:
+            logger.error(f"Error adding client: {e}")
+            error_message = str(e)
+        
+    # Show add client form (GET request or POST with error)
+    add_client_html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>WealthPro CRM - Add Client</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+        <style>
+            body { font-family: 'Inter', sans-serif; }
+            .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
+        </style>
+    </head>
+    <body class="bg-gray-50">
+        <nav class="gradient-wealth text-white shadow-lg">
+            <div class="max-w-7xl mx-auto px-6">
+                <div class="flex justify-between items-center h-16">
+                    <div class="flex items-center space-x-4">
+                        <h1 class="text-xl font-bold">WealthPro CRM</h1>
+                    </div>
+                    <div class="flex items-center space-x-6">
+                        <a href="/" class="hover:text-blue-200">Dashboard</a>
+                        <a href="/clients" class="hover:text-blue-200">Clients</a>
+                    </div>
+                </div>
+            </div>
+        </nav>
+        
+        <main class="max-w-4xl mx-auto px-6 py-8">
+            <div class="mb-8">
+                <h1 class="text-3xl font-bold text-gray-900">Add New Client</h1>
+                <p class="text-gray-600 mt-2">Create a new client profile with automatic Google Drive folder structure</p>
+            </div>
+            
+            <div class="bg-white rounded-lg shadow p-8">
+                <form method="POST" class="space-y-6">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Full Name *</label>
+                            <input type="text" name="name" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Email</label>
+                            <input type="email" name="email" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Phone</label>
+                            <input type="tel" name="phone" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Status</label>
+                            <select name="status" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                <option value="prospect">Prospect</option>
+                                <option value="active">Active Client</option>
+                                <option value="inactive">Inactive</option>
+                            </select>
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Date of Birth</label>
+                            <input type="date" name="date_of_birth" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Occupation</label>
+                            <input type="text" name="occupation" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Portfolio Value (£)</label>
+                            <input type="number" name="portfolio_value" step="0.01" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Risk Profile</label>
+                            <select name="risk_profile" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                <option value="conservative">Conservative</option>
+                                <option value="moderate" selected>Moderate</option>
+                                <option value="aggressive">Aggressive</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Address</label>
+                        <textarea name="address" rows="2" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"></textarea>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Notes</label>
+                        <textarea name="notes" rows="4" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"></textarea>
+                    </div>
+                    
+                    <div class="bg-blue-50 p-4 rounded-lg">
+                        <h3 class="text-sm font-medium text-blue-800 mb-2">📁 Google Drive Folder Structure</h3>
+                        <p class="text-sm text-blue-700">When you create this client, the following folder structure will be automatically created in your Google Drive:</p>
+                        <ul class="text-xs text-blue-600 mt-2 ml-4 space-y-1">
+                            <li>• 01 - Personal Documents</li>
+                            <li>• 02 - Financial Statements</li>
+                            <li>• 03 - Investment Documents</li>
+                            <li>• 04 - Insurance Documents</li>
+                            <li>• 05 - Tax Documents</li>
+                            <li>• 06 - Estate Planning</li>
+                            <li>• 07 - Fact Find Forms</li>
+                            <li>• 08 - Meeting Notes</li>
+                            <li>• 09 - Correspondence</li>
+                            <li>• 10 - Reports & Proposals</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="flex justify-between">
+                        <a href="/clients" class="px-6 py-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50">Cancel</a>
+                        <button type="submit" class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Create Client & Folders</button>
+                    </div>
+                </form>
+            </div>
+        </main>
+    </body>
+    </html>
+    """
+    
+    return add_client_html
 
 @app.route('/session-test')
 def session_test():

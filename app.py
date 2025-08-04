@@ -1,6 +1,6 @@
 """
 Financial Adviser CRM System - Optimized for Render
-WITH SESSION TEST TO DIAGNOSE THE ISSUE
+FIXED: Redirect URI properly configured for /callback
 """
 
 import os
@@ -42,9 +42,9 @@ SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
-# Get the redirect URI for Render
+# Get the redirect URI for Render - FIXED TO USE /callback
 RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', 'https://wealthpro-crm.onrender.com')
-REDIRECT_URI = RENDER_URL
+REDIRECT_URI = f"{RENDER_URL}/callback"
 
 CLIENT_CONFIG = {
     "web": {
@@ -335,7 +335,7 @@ DASHBOARD_TEMPLATE = """
             <div class="card-professional bg-white rounded-xl p-6 text-center">
                 <div class="w-16 h-16 bg-blue-100 rounded-lg flex items-center justify-center mx-auto mb-4">
                     <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 515.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 919.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
                     </svg>
                 </div>
                 <h3 class="text-lg font-semibold text-gray-900 mb-2">Client Management</h3>
@@ -375,7 +375,7 @@ DASHBOARD_TEMPLATE = """
                 <div class="flex items-center">
                     <div class="p-3 bg-blue-100 rounded-lg">
                         <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 515.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 515.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 919.288 0M15 7a3 3 0 11-6 0 3 3 0 916 0zm6 3a2 2 0 11-4 0 2 2 0 914 0zM7 10a2 2 0 11-4 0 2 2 0 914 0z"></path>
                         </svg>
                     </div>
                     <div class="ml-4">
@@ -524,6 +524,7 @@ def authorize():
         session['state'] = state
         session.permanent = True
         logger.info(f"Starting OAuth flow - state stored: {state}")
+        logger.info(f"Redirect URI: {REDIRECT_URI}")
         return redirect(authorization_url)
     
     except Exception as e:
@@ -532,7 +533,7 @@ def authorize():
 
 @app.route('/callback')
 def callback():
-    """Handle OAuth callback"""
+    """Handle OAuth callback - PROPERLY CONFIGURED"""
     try:
         logger.info("=== CALLBACK STARTED ===")
         logger.info(f"Request URL: {request.url}")
@@ -580,7 +581,7 @@ def callback():
         except Exception as e:
             logger.warning(f"Could not create CRM structure: {e}")
         
-        logger.info("=== CALLBACK COMPLETED - REDIRECTING ===")
+        logger.info("=== CALLBACK COMPLETED - REDIRECTING TO DASHBOARD ===")
         return redirect(url_for('index'))
     
     except Exception as e:

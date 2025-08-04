@@ -136,7 +136,7 @@ class GoogleDriveService:
             return None
     
     def create_client_folder(self, client_name: str, surname: str) -> Dict:
-        """Create client folder in appropriate A-Z folder"""
+        """Create client folder in appropriate A-Z folder - BASIC STRUCTURE ONLY"""
         try:
             # Get the appropriate letter folder
             letter_folder_id = self.get_letter_folder_id(surname)
@@ -150,10 +150,10 @@ class GoogleDriveService:
             if not client_folder_id:
                 raise Exception("Could not create client folder")
             
-            # Create Reviews folder
+            # Create ONLY Reviews folder - no policy folders
             reviews_folder_id = self.find_or_create_folder("Reviews", client_folder_id)
             
-            logger.info(f"Created client folder structure for {client_name} in {surname[0].upper()} folder")
+            logger.info(f"Created basic client folder structure for {client_name} in {surname[0].upper()} folder")
             
             return {
                 'client_folder_id': client_folder_id,
@@ -1149,7 +1149,7 @@ def add_client():
                         <p class="text-xs text-blue-600 mt-2">Folder structure created:</p>
                         <ul class="text-xs text-blue-600 mt-1 ml-4">
                             <li>• Reviews folder (for client reviews)</li>
-                            <li>• Ready for policy folders (created through CRM)</li>
+                            <li>• Ready for policy folders (you create these manually through CRM)</li>
                         </ul>
                     </div>
                     

@@ -1,6 +1,6 @@
 """
 Financial Adviser CRM System - Optimized for Render
-FIXED: Redirect URI properly configured for /callback
+FIXED: OAuth callback properly configured
 """
 
 import os
@@ -21,30 +21,27 @@ import secrets
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app with robust session configuration
+# Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
-app.config.update(
-    SESSION_COOKIE_SECURE=False,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='Lax',
-    PERMANENT_SESSION_LIFETIME=timedelta(hours=24),
-    SESSION_REFRESH_EACH_REQUEST=True
-)
+
+# Session configuration for Render
+app.config['SESSION_COOKIE_SECURE'] = False
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 # Render configuration
 PORT = int(os.environ.get('PORT', 10000))
 HOST = '0.0.0.0'
 
-# Google OAuth 2.0 settings for Render
+# Google OAuth 2.0 settings - FIXED REDIRECT URI
 SCOPES = [
     'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
-# Get the redirect URI for Render - FIXED TO USE /callback
 RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', 'https://wealthpro-crm.onrender.com')
-REDIRECT_URI = f"{RENDER_URL}/callback"
+REDIRECT_URI = f"{RENDER_URL}/callback"  # FIXED: Now includes /callback
 
 CLIENT_CONFIG = {
     "web": {
@@ -55,31 +52,6 @@ CLIENT_CONFIG = {
         "redirect_uris": [REDIRECT_URI]
     }
 }
-
-def get_stored_credentials():
-    """Get stored credentials from session"""
-    if 'credentials' in session:
-        try:
-            return Credentials(**session['credentials'])
-        except Exception as e:
-            logger.warning(f"Session credentials invalid: {e}")
-    return None
-
-def store_credentials(credentials):
-    """Store credentials in session"""
-    creds_dict = {
-        'token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'token_uri': credentials.token_uri,
-        'client_id': credentials.client_id,
-        'client_secret': credentials.client_secret,
-        'scopes': credentials.scopes
-    }
-    
-    session['credentials'] = creds_dict
-    session.permanent = True
-    logger.info("Credentials stored in session")
-    return creds_dict
 
 @dataclass
 class Client:
@@ -103,48 +75,6 @@ class GoogleDriveService:
         self.service = build('drive', 'v3', credentials=credentials)
         self.sheets_service = build('sheets', 'v4', credentials=credentials)
     
-    def find_workflow_folder(self) -> str:
-        """Find the workflow folder in Google Drive"""
-        try:
-            query = "mimeType='application/vnd.google-apps.folder' and (name contains 'workflow' or name contains 'Workflow' or name contains 'Work Flow')"
-            results = self.service.files().list(
-                q=query,
-                fields="files(id, name)"
-            ).execute()
-            
-            folders = results.get('files', [])
-            if folders:
-                logger.info(f"Found workflow folder: {folders[0]['name']} ({folders[0]['id']})")
-                return folders[0]['id']
-            else:
-                logger.info("No workflow folder found, will create in root")
-                return None
-        except HttpError as error:
-            logger.error(f"Error finding workflow folder: {error}")
-            return None
-    
-    def create_main_crm_folder(self, parent_folder_id: str = None) -> str:
-        """Create the main WealthPro CRM folder"""
-        try:
-            folder_metadata = {
-                'name': 'WealthPro CRM Data',
-                'mimeType': 'application/vnd.google-apps.folder'
-            }
-            
-            if parent_folder_id:
-                folder_metadata['parents'] = [parent_folder_id]
-            
-            folder = self.service.files().create(
-                body=folder_metadata,
-                fields='id'
-            ).execute()
-            
-            logger.info(f"Created main CRM folder: {folder.get('id')}")
-            return folder.get('id')
-        except HttpError as error:
-            logger.error(f"Error creating main folder: {error}")
-            return None
-    
     def create_client_folder(self, client_name: str, parent_folder_id: str = None) -> str:
         """Create a folder for a new client"""
         try:
@@ -163,107 +93,10 @@ class GoogleDriveService:
             
             logger.info(f"Created folder for {client_name}: {folder.get('id')}")
             return folder.get('id')
+            
         except HttpError as error:
             logger.error(f"Error creating folder: {error}")
             return None
-
-class CRMDataManager:
-    """Manages CRM data using Google Sheets as backend"""
-    
-    def __init__(self, sheets_service):
-        self.sheets_service = sheets_service
-        self.spreadsheet_id = os.environ.get('CRM_SPREADSHEET_ID')
-    
-    def create_crm_spreadsheet(self, parent_folder_id: str = None) -> str:
-        """Create the main CRM spreadsheet"""
-        try:
-            spreadsheet = {
-                'properties': {
-                    'title': 'WealthPro CRM Data - ' + datetime.now().strftime('%Y-%m-%d')
-                },
-                'sheets': [
-                    {
-                        'properties': {
-                            'title': 'Clients',
-                            'gridProperties': {
-                                'rowCount': 1000,
-                                'columnCount': 12
-                            }
-                        }
-                    }
-                ]
-            }
-            
-            result = self.sheets_service.spreadsheets().create(
-                body=spreadsheet
-            ).execute()
-            
-            spreadsheet_id = result['spreadsheetId']
-            
-            # Move to CRM folder if provided
-            if parent_folder_id:
-                drive_service = build('drive', 'v3', credentials=self.sheets_service._http.credentials)
-                drive_service.files().update(
-                    fileId=spreadsheet_id,
-                    addParents=parent_folder_id,
-                    removeParents='root',
-                    fields='id, parents'
-                ).execute()
-            
-            # Add headers
-            headers = [
-                'ID', 'Name', 'Email', 'Phone', 'Status', 'Date Added',
-                'Last Contact', 'Folder ID', 'Notes', 'Portfolio Value', 'Risk Profile'
-            ]
-            
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range='Clients!A1:K1',
-                valueInputOption='RAW',
-                body={'values': [headers]}
-            ).execute()
-            
-            logger.info(f"Created CRM spreadsheet: {spreadsheet_id}")
-            return spreadsheet_id
-        except HttpError as error:
-            logger.error(f"Error creating spreadsheet: {error}")
-            return None
-    
-    def get_clients(self) -> List[Client]:
-        """Get all clients from the spreadsheet"""
-        try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Clients!A2:K'
-            ).execute()
-            
-            values = result.get('values', [])
-            clients = []
-            
-            for row in values:
-                if len(row) >= 7:
-                    while len(row) < 11:
-                        row.append('')
-                    
-                    client = Client(
-                        id=row[0],
-                        name=row[1],
-                        email=row[2],
-                        phone=row[3],
-                        status=row[4],
-                        date_added=row[5],
-                        last_contact=row[6],
-                        folder_id=row[7] if row[7] else None,
-                        notes=row[8],
-                        portfolio_value=float(row[9]) if row[9] else 0.0,
-                        risk_profile=row[10] if row[10] else 'moderate'
-                    )
-                    clients.append(client)
-            
-            return clients
-        except HttpError as error:
-            logger.error(f"Error getting clients: {error}")
-            return []
 
 # HTML Templates
 DASHBOARD_TEMPLATE = """
@@ -283,6 +116,7 @@ DASHBOARD_TEMPLATE = """
     </style>
 </head>
 <body class="bg-gray-50">
+    <!-- Navigation -->
     <nav class="gradient-wealth text-white shadow-lg">
         <div class="max-w-7xl mx-auto px-6">
             <div class="flex justify-between items-center h-16">
@@ -300,82 +134,33 @@ DASHBOARD_TEMPLATE = """
                 <div class="flex items-center space-x-6">
                     <a href="/" class="hover:text-blue-200">Dashboard</a>
                     <a href="/clients" class="hover:text-blue-200">Clients</a>
-                    {% if connected %}
+                    {% if google_connected %}
                     <div class="flex items-center space-x-2 bg-white bg-opacity-10 px-3 py-1 rounded-lg">
                         <div class="w-2 h-2 bg-green-400 rounded-full"></div>
                         <span class="text-sm">Google Drive Connected</span>
                     </div>
-                    {% else %}
-                    <a href="/authorize" class="bg-white bg-opacity-10 px-3 py-1 rounded-lg text-sm hover:bg-opacity-20">
-                        Connect Google Drive
-                    </a>
                     {% endif %}
                 </div>
             </div>
         </div>
     </nav>
 
+    <!-- Main Content -->
     <main class="max-w-7xl mx-auto px-6 py-8">
-        {% if not connected %}
-        <div class="gradient-wealth text-white rounded-lg p-8 mb-8 text-center">
-            <h1 class="text-4xl font-bold mb-4">Welcome to WealthPro CRM!</h1>
-            <p class="text-xl text-blue-100 mb-6">Professional Financial Advisory Platform</p>
-            <a href="/authorize" class="inline-flex items-center px-6 py-3 bg-white text-blue-600 rounded-lg hover:bg-blue-50 transition-colors font-semibold">
-                <svg class="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-                    <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                    <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-                    <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-                </svg>
-                Connect Google Drive to Get Started
-            </a>
-        </div>
-        
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div class="card-professional bg-white rounded-xl p-6 text-center">
-                <div class="w-16 h-16 bg-blue-100 rounded-lg flex items-center justify-center mx-auto mb-4">
-                    <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 515.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 919.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
-                    </svg>
-                </div>
-                <h3 class="text-lg font-semibold text-gray-900 mb-2">Client Management</h3>
-                <p class="text-gray-600">Organize client profiles with automatic Google Drive folder creation</p>
-            </div>
-            
-            <div class="card-professional bg-white rounded-xl p-6 text-center">
-                <div class="w-16 h-16 bg-green-100 rounded-lg flex items-center justify-center mx-auto mb-4">
-                    <svg class="w-8 h-8 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                    </svg>
-                </div>
-                <h3 class="text-lg font-semibold text-gray-900 mb-2">Fact Find Integration</h3>
-                <p class="text-gray-600">Seamlessly integrate your existing fact find forms</p>
-            </div>
-            
-            <div class="card-professional bg-white rounded-xl p-6 text-center">
-                <div class="w-16 h-16 bg-purple-100 rounded-lg flex items-center justify-center mx-auto mb-4">
-                    <svg class="w-8 h-8 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path>
-                    </svg>
-                </div>
-                <h3 class="text-lg font-semibold text-gray-900 mb-2">Document Vault</h3>
-                <p class="text-gray-600">Secure document storage with Google Drive integration</p>
-            </div>
-        </div>
-        
-        {% else %}
-        
+        {% if google_connected %}
+        <!-- Connected Dashboard -->
         <div class="gradient-wealth text-white rounded-lg p-6 mb-8">
             <h1 class="text-3xl font-bold mb-2">Dashboard Overview</h1>
             <p class="text-blue-100">Monitor your practice performance and client portfolio</p>
         </div>
 
+        <!-- Key Metrics -->
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
             <div class="card-professional bg-white rounded-xl p-6">
                 <div class="flex items-center">
                     <div class="p-3 bg-blue-100 rounded-lg">
                         <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 515.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 919.288 0M15 7a3 3 0 11-6 0 3 3 0 916 0zm6 3a2 2 0 11-4 0 2 2 0 914 0zM7 10a2 2 0 11-4 0 2 2 0 914 0z"></path>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
                         </svg>
                     </div>
                     <div class="ml-4">
@@ -428,11 +213,101 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
 
-        <div class="bg-green-50 border border-green-200 rounded-lg p-6 text-center">
-            <h3 class="text-lg font-medium text-green-900 mb-2">🎉 Google Drive Successfully Connected!</h3>
-            <p class="text-green-700">Your CRM is now ready to create client folders and manage documents automatically.</p>
+        <!-- Quick Actions -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <a href="/clients/add" class="card-professional bg-white rounded-xl p-6 block hover:no-underline">
+                <div class="flex items-center">
+                    <div class="p-3 bg-blue-100 rounded-lg">
+                        <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path>
+                        </svg>
+                    </div>
+                    <div class="ml-4">
+                        <h3 class="text-lg font-medium text-gray-900">Add New Client</h3>
+                        <p class="text-sm text-gray-600">Create client profile</p>
+                    </div>
+                </div>
+            </a>
+
+            <a href="/clients" class="card-professional bg-white rounded-xl p-6 block hover:no-underline">
+                <div class="flex items-center">
+                    <div class="p-3 bg-green-100 rounded-lg">
+                        <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                        </svg>
+                    </div>
+                    <div class="ml-4">
+                        <h3 class="text-lg font-medium text-gray-900">Manage Clients</h3>
+                        <p class="text-sm text-gray-600">View all clients</p>
+                    </div>
+                </div>
+            </a>
+
+            <div class="card-professional bg-white rounded-xl p-6">
+                <div class="flex items-center">
+                    <div class="p-3 bg-purple-100 rounded-lg">
+                        <svg class="w-6 h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+                        </svg>
+                    </div>
+                    <div class="ml-4">
+                        <h3 class="text-lg font-medium text-gray-900">View Reports</h3>
+                        <p class="text-sm text-gray-600">Business analytics</p>
+                    </div>
+                </div>
+            </div>
         </div>
-        
+
+        {% else %}
+        <!-- Welcome Screen (Not Connected) -->
+        <div class="gradient-wealth text-white rounded-lg p-8 mb-8 text-center">
+            <h1 class="text-4xl font-bold mb-4">Welcome to WealthPro CRM!</h1>
+            <p class="text-xl text-blue-100 mb-8">Professional Financial Advisory Platform</p>
+            <a href="/authorize" class="inline-flex items-center px-8 py-4 bg-white text-blue-600 font-semibold rounded-lg hover:bg-blue-50 transition-colors">
+                <svg class="w-6 h-6 mr-3" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M20 6L9 17l-5-5"/>
+                </svg>
+                Connect Google Drive to Get Started
+            </a>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <div class="card-professional bg-white rounded-xl p-8 text-center">
+                <div class="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                    </svg>
+                </div>
+                <h3 class="text-xl font-semibold text-gray-900 mb-2">Client Management</h3>
+                <p class="text-gray-600">Organize client profiles with automatic Google Drive folder creation</p>
+            </div>
+
+            <div class="card-professional bg-white rounded-xl p-8 text-center">
+                <div class="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <svg class="w-8 h-8 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                    </svg>
+                </div>
+                <h3 class="text-xl font-semibold text-gray-900 mb-2">Fact Find Integration</h3>
+                <p class="text-gray-600">Seamlessly integrate your existing fact find forms</p>
+            </div>
+
+            <div class="card-professional bg-white rounded-xl p-8 text-center">
+                <div class="w-16 h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <svg class="w-8 h-8 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m-2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                    </svg>
+                </div>
+                <h3 class="text-xl font-semibold text-gray-900 mb-2">Document Vault</h3>
+                <p class="text-gray-600">Secure document storage with Google Drive integration</p>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if success %}
+        <div class="mt-8 bg-green-100 border border-green-400 text-green-700 px-4 py-3 rounded">
+            {{ success }}
+        </div>
         {% endif %}
 
         {% if error %}
@@ -448,63 +323,140 @@ DASHBOARD_TEMPLATE = """
 # Flask Routes
 @app.route('/')
 def index():
-    """Main dashboard"""
+    """Main dashboard - ALSO HANDLES OAUTH CALLBACK"""
+    
+    # Log all incoming requests for debugging
+    logger.info(f"=== MAIN ROUTE REQUEST ===")
+    logger.info(f"Request args: {dict(request.args)}")
+    logger.info(f"Session keys: {list(session.keys())}")
+    
+    # Check if this is an OAuth callback (has state and code parameters)
+    if request.args.get('state') and request.args.get('code'):
+        logger.info("OAuth callback detected - processing...")
+        return handle_oauth_callback()
+    
+    # Normal dashboard logic
+    google_connected = 'credentials' in session
+    logger.info(f"Google connected: {google_connected}")
+    
+    # Check for success message
+    oauth_success = session.pop('oauth_success', False)
+    success_message = "Google Drive connected successfully!" if oauth_success else None
+    
+    if google_connected:
+        try:
+            # Get basic stats (can be expanded later)
+            stats = {
+                'total_clients': 0,
+                'active_clients': 0,
+                'prospects': 0,
+                'total_portfolio_value': 0
+            }
+            return render_template_string(DASHBOARD_TEMPLATE, 
+                                        google_connected=True, 
+                                        stats=stats, 
+                                        error=None,
+                                        success=success_message)
+        except Exception as e:
+            logger.error(f"Dashboard error: {e}")
+            return render_template_string(DASHBOARD_TEMPLATE, 
+                                        google_connected=False, 
+                                        error="Error loading dashboard data")
+    
+    return render_template_string(DASHBOARD_TEMPLATE, 
+                                google_connected=False, 
+                                error=None,
+                                success=success_message)
+
+def handle_oauth_callback():
+    """Handle OAuth callback on the main route"""
     try:
-        credentials = get_stored_credentials()
-        connected = credentials is not None
+        logger.info("=== OAUTH CALLBACK DETECTED ON MAIN ROUTE ===")
+        logger.info(f"Request URL: {request.url}")
+        logger.info(f"Request args: {request.args}")
+        logger.info(f"Session keys: {list(session.keys())}")
         
-        if not connected:
-            return render_template_string(DASHBOARD_TEMPLATE, connected=False, stats={}, error=None)
+        # Check if state exists
+        if 'state' not in session:
+            logger.error("NO STATE IN SESSION")
+            return render_template_string(DASHBOARD_TEMPLATE, 
+                                        google_connected=False, 
+                                        error="Session state missing - please try connecting again")
         
-        data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
-        clients = data_manager.get_clients()
+        # Verify state parameter
+        request_state = request.args.get('state')
+        if request_state != session['state']:
+            logger.error(f"State mismatch: session={session['state']}, request={request_state}")
+            return render_template_string(DASHBOARD_TEMPLATE, 
+                                        google_connected=False, 
+                                        error="Invalid state parameter - please try connecting again")
         
-        stats = {
-            'total_clients': len(clients),
-            'active_clients': len([c for c in clients if c.status == 'active']),
-            'prospects': len([c for c in clients if c.status == 'prospect']),
-            'total_portfolio_value': sum(c.portfolio_value for c in clients)
+        # Check for error in callback
+        if 'error' in request.args:
+            logger.error(f"OAuth error: {request.args.get('error')}")
+            return render_template_string(DASHBOARD_TEMPLATE, 
+                                        google_connected=False, 
+                                        error=f"OAuth error: {request.args.get('error')}")
+        
+        # Get authorization code
+        code = request.args.get('code')
+        if not code:
+            logger.error("No authorization code received")
+            return render_template_string(DASHBOARD_TEMPLATE, 
+                                        google_connected=False, 
+                                        error="No authorization code received")
+        
+        logger.info("Creating OAuth flow for token exchange")
+        flow = Flow.from_client_config(
+            CLIENT_CONFIG,
+            scopes=SCOPES,
+            state=session['state']
+        )
+        flow.redirect_uri = REDIRECT_URI
+        
+        # Exchange code for credentials
+        logger.info("Fetching token...")
+        flow.fetch_token(authorization_response=request.url)
+        
+        credentials = flow.credentials
+        logger.info("Successfully obtained credentials")
+        
+        # Store credentials in session
+        session['credentials'] = {
+            'token': credentials.token,
+            'refresh_token': credentials.refresh_token,
+            'token_uri': credentials.token_uri,
+            'client_id': credentials.client_id,
+            'client_secret': credentials.client_secret,
+            'scopes': credentials.scopes
         }
         
-        return render_template_string(DASHBOARD_TEMPLATE, connected=True, stats=stats, error=None)
+        logger.info("Credentials stored in session successfully")
+        
+        # Test the credentials by making a simple API call
+        try:
+            drive_service = build('drive', 'v3', credentials=credentials)
+            about = drive_service.about().get(fields="user").execute()
+            user_email = about.get('user', {}).get('emailAddress', 'Unknown')
+            logger.info(f"Successfully connected to Google Drive for user: {user_email}")
+        except Exception as api_error:
+            logger.error(f"Error testing Google Drive API: {api_error}")
+        
+        # Clear the state and redirect to clean URL
+        session.pop('state', None)
+        
+        logger.info("OAuth successful - redirecting to clean dashboard")
+        
+        # Add a success message to session
+        session['oauth_success'] = True
+        
+        return redirect(url_for('index'))
     
     except Exception as e:
-        logger.error(f"Dashboard error: {e}")
-        return render_template_string(DASHBOARD_TEMPLATE, connected=False, stats={}, error="Error loading dashboard.")
-
-@app.route('/session-test')
-def session_test():
-    """Test if sessions work on Render"""
-    if 'test_data' not in session:
-        session['test_data'] = 'session_works'
-        session.permanent = True
-        return """
-        <h1>Session Test - Step 1</h1>
-        <p>Session data has been set.</p>
-        <a href='/session-test'>Click here to test if it persists</a>
-        <br><br>
-        <a href='/'>Back to Dashboard</a>
-        """
-    else:
-        return f"""
-        <h1>Session Test - Step 2</h1>
-        <p>✅ Session data found: {session['test_data']}</p>
-        <p>✅ Sessions are working on Render!</p>
-        <br>
-        <a href='/session-clear'>Clear session data</a><br>
-        <a href='/'>Back to Dashboard</a>
-        """
-
-@app.route('/session-clear')
-def session_clear():
-    """Clear session data"""
-    session.clear()
-    return """
-    <h1>Session Cleared</h1>
-    <p>Session data has been cleared.</p>
-    <a href='/session-test'>Test sessions again</a><br>
-    <a href='/'>Back to Dashboard</a>
-    """
+        logger.error(f"OAuth callback error: {e}")
+        return render_template_string(DASHBOARD_TEMPLATE, 
+                                    google_connected=False, 
+                                    error=f"Authentication error: {e}")
 
 @app.route('/authorize')
 def authorize():
@@ -522,112 +474,97 @@ def authorize():
         )
         
         session['state'] = state
-        session.permanent = True
         logger.info(f"Starting OAuth flow - state stored: {state}")
         logger.info(f"Redirect URI: {REDIRECT_URI}")
+        
         return redirect(authorization_url)
     
     except Exception as e:
         logger.error(f"Authorization error: {e}")
-        return f"Authorization error: {e}", 500
+        return f"Authorization setup error: {e}", 500
 
 @app.route('/callback')
 def callback():
-    """Handle OAuth callback - PROPERLY CONFIGURED"""
-    try:
-        logger.info("=== CALLBACK STARTED ===")
-        logger.info(f"Request URL: {request.url}")
-        logger.info(f"Session keys: {list(session.keys())}")
-        
-        if 'state' not in session:
-            logger.error("NO STATE IN SESSION")
-            return """
-            <h1>Session Error</h1>
-            <p>❌ Session state missing - sessions are not working properly.</p>
-            <a href='/session-test'>Test sessions</a><br>
-            <a href='/'>Back to Dashboard</a>
-            """, 400
-        
-        logger.info(f"State from session: {session['state']}")
-        
-        flow = Flow.from_client_config(
-            CLIENT_CONFIG,
-            scopes=SCOPES,
-            state=session['state']
-        )
-        flow.redirect_uri = REDIRECT_URI
-        
-        authorization_response = request.url
-        flow.fetch_token(authorization_response=authorization_response)
-        
-        credentials = flow.credentials
-        logger.info("OAuth token fetched successfully")
-        
-        store_credentials(credentials)
-        logger.info("Credentials stored successfully")
-        
-        # Try to create CRM structure
-        try:
-            drive_service = GoogleDriveService(credentials)
-            data_manager = CRMDataManager(build('sheets', 'v4', credentials=credentials))
-            
-            workflow_folder_id = drive_service.find_workflow_folder()
-            main_folder_id = drive_service.create_main_crm_folder(workflow_folder_id)
-            
-            if not data_manager.spreadsheet_id:
-                spreadsheet_id = data_manager.create_crm_spreadsheet(main_folder_id)
-                logger.info(f"Created CRM spreadsheet: {spreadsheet_id}")
-                    
-        except Exception as e:
-            logger.warning(f"Could not create CRM structure: {e}")
-        
-        logger.info("=== CALLBACK COMPLETED - REDIRECTING TO DASHBOARD ===")
-        return redirect(url_for('index'))
-    
-    except Exception as e:
-        logger.error(f"Callback error: {e}")
-        return f"""
-        <h1>Callback Error</h1>
-        <p>❌ Error: {e}</p>
-        <a href='/'>Try again</a>
-        """, 500
+    """Legacy callback route - redirects to main route"""
+    # In case anything still tries to use /callback, redirect to main route
+    return redirect(url_for('index'))
 
 @app.route('/clients')
 def clients():
     """Clients page"""
-    credentials = get_stored_credentials()
-    if not credentials:
+    if 'credentials' not in session:
         return redirect(url_for('authorize'))
     
-    return "<h1>Clients page - Coming soon!</h1><a href='/'>Back to Dashboard</a>"
+    return "<h1>Clients Management - Coming Soon!</h1><p>This will show your client list with Google Drive folders.</p><a href='/'>Back to Dashboard</a>"
 
-@app.route('/health')
-def health_check():
-    """Health check endpoint"""
-    credentials = get_stored_credentials()
-    return jsonify({
-        'status': 'healthy', 
-        'timestamp': datetime.now().isoformat(),
-        'service': 'WealthPro CRM',
-        'redirect_uri': REDIRECT_URI,
-        'connected': credentials is not None
-    })
+@app.route('/clients/add')
+def add_client():
+    """Add client page"""
+    if 'credentials' not in session:
+        return redirect(url_for('authorize'))
+    
+    return "<h1>Add New Client - Coming Soon!</h1><p>This will create client profiles and Google Drive folders.</p><a href='/'>Back to Dashboard</a>"
+
+@app.route('/session-test')
+def session_test():
+    """Test if sessions work on Render"""
+    if 'test_data' not in session:
+        session['test_data'] = 'session_works'
+        return """
+        <div style="font-family: Arial; padding: 20px;">
+            <h2>Session Test - Step 1</h2>
+            <p>✅ Session data set successfully</p>
+            <a href="/session-test" style="background: #007cba; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Click here to test persistence</a>
+            <br><br>
+            <a href="/">Back to Dashboard</a>
+        </div>
+        """
+    else:
+        return f"""
+        <div style="font-family: Arial; padding: 20px;">
+            <h2>Session Test - Step 2</h2>
+            <p>✅ Session data found: {session['test_data']}</p>
+            <p>✅ Sessions are working on Render!</p>
+            <a href="/session-test-clear" style="background: #dc3545; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Clear session data</a>
+            <br><br>
+            <a href="/">Back to Dashboard</a>
+        </div>
+        """
+
+@app.route('/session-test-clear')
+def session_test_clear():
+    """Clear session test data"""
+    session.pop('test_data', None)
+    return redirect(url_for('session_test'))
 
 @app.route('/test')
 def test():
-    """Test page"""
-    credentials = get_stored_credentials()
+    """Test page to verify deployment and configuration"""
+    google_connected = 'credentials' in session
+    
     return f"""
-    <h1>WealthPro CRM Test Page</h1>
-    <p>✅ Flask is working!</p>
-    <p>✅ Render deployment successful!</p>
-    <p>🔧 Redirect URI: {REDIRECT_URI}</p>
-    <p>🌐 Client ID configured: {'Yes' if os.environ.get('GOOGLE_CLIENT_ID') else 'No'}</p>
-    <p>🔗 Google Drive connected: {'Yes' if credentials else 'No'}</p>
-    <br>
-    <a href='/session-test'>Test Sessions</a><br>
-    <a href='/'>Go to Dashboard</a>
+    <div style="font-family: Arial, sans-serif; padding: 20px; max-width: 600px;">
+        <h1>WealthPro CRM Test Page</h1>
+        <p>✅ Flask is working!</p>
+        <p>✅ Render deployment successful!</p>
+        <p>🔧 Redirect URI: {REDIRECT_URI}</p>
+        <p>🌐 Client ID configured: {'Yes' if CLIENT_CONFIG['web']['client_id'] else 'No'}</p>
+        <p>🔗 Google Drive connected: {'Yes' if google_connected else 'No'}</p>
+        <p><a href="/session-test">Test Sessions</a></p>
+        <p><a href="/">Go to Dashboard</a></p>
+    </div>
     """
 
+@app.route('/health')
+def health_check():
+    """Health check endpoint for Render"""
+    return jsonify({
+        'status': 'healthy', 
+        'timestamp': datetime.now().isoformat(),
+        'service': 'WealthPro CRM'
+    })
+
 if __name__ == '__main__':
+    logger.info(f"Starting WealthPro CRM on {HOST}:{PORT}")
+    logger.info(f"Redirect URI configured as: {REDIRECT_URI}")
     app.run(host=HOST, port=PORT, debug=False)

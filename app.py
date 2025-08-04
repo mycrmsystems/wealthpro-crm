@@ -1,6 +1,6 @@
 """
 Financial Adviser CRM System - Optimized for Render
-FIXED: OAuth callback properly configured
+FIXED: OAuth redirect URI properly configured (NO /callback)
 """
 
 import os
@@ -34,14 +34,14 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 PORT = int(os.environ.get('PORT', 10000))
 HOST = '0.0.0.0'
 
-# Google OAuth 2.0 settings - FIXED REDIRECT URI
+# Google OAuth 2.0 settings - NO /callback to match Google Cloud Console
 SCOPES = [
     'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
 
 RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', 'https://wealthpro-crm.onrender.com')
-REDIRECT_URI = f"{RENDER_URL}/callback"  # FIXED: Now includes /callback
+REDIRECT_URI = RENDER_URL  # NO /callback - exactly matches Google Cloud Console
 
 CLIENT_CONFIG = {
     "web": {
@@ -233,7 +233,7 @@ DASHBOARD_TEMPLATE = """
                 <div class="flex items-center">
                     <div class="p-3 bg-green-100 rounded-lg">
                         <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0Â 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
                         </svg>
                     </div>
                     <div class="ml-4">
@@ -275,7 +275,7 @@ DASHBOARD_TEMPLATE = """
             <div class="card-professional bg-white rounded-xl p-8 text-center">
                 <div class="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
                     <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 515.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
                     </svg>
                 </div>
                 <h3 class="text-xl font-semibold text-gray-900 mb-2">Client Management</h3>
@@ -552,6 +552,7 @@ def test():
         <p>🔗 Google Drive connected: {'Yes' if google_connected else 'No'}</p>
         <p><a href="/session-test">Test Sessions</a></p>
         <p><a href="/">Go to Dashboard</a></p>
+        <p><strong>DEBUG: RENDER_URL = {RENDER_URL}</strong></p>
     </div>
     """
 

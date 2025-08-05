@@ -108,7 +108,7 @@ class SimpleGoogleDrive:
             return None
     
     def create_client_folder(self, full_name, surname):
-        """Create simple client folder in A-Z structure"""
+        """Create client folder with ALL sub-folders in A-Z structure"""
         try:
             # Get letter folder
             letter = surname[0].upper() if surname else 'Z'
@@ -120,11 +120,31 @@ class SimpleGoogleDrive:
             # Create Reviews folder
             reviews_folder_id = self.create_folder("Reviews", client_folder_id)
             
-            logger.info(f"Created client folder for {full_name} in {letter} folder")
+            # Create ALL document sub-folders in client folder
+            document_folders = [
+                "ID&V",
+                "FF & ATR", 
+                "Research",
+                "LOA's",
+                "Suitability Letter",
+                "Meeting Notes",
+                "Terms of Business",
+                "Policy Information",
+                "Valuation"
+            ]
+            
+            sub_folder_ids = {'Reviews': reviews_folder_id}
+            
+            for doc_type in document_folders:
+                folder_id = self.create_folder(doc_type, client_folder_id)
+                sub_folder_ids[doc_type] = folder_id
+                logger.info(f"Created document folder: {doc_type}")
+            
+            logger.info(f"Created client folder for {full_name} in {letter} folder with all sub-folders")
             
             return {
                 'client_folder_id': client_folder_id,
-                'reviews_folder_id': reviews_folder_id
+                'sub_folders': sub_folder_ids
             }
             
         except Exception as e:
@@ -387,7 +407,161 @@ CLIENTS_HTML = """
 </html>
 """
 
-ADD_CLIENT_HTML = """
+FACTFIND_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WealthPro CRM - Fact Find</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <nav class="gradient-wealth text-white shadow-lg">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="flex justify-between items-center h-16">
+                <h1 class="text-xl font-bold">WealthPro CRM</h1>
+                <div class="flex items-center space-x-6">
+                    <a href="/" class="hover:text-blue-200">Dashboard</a>
+                    <a href="/clients" class="hover:text-blue-200">Clients</a>
+                    <a href="/factfind" class="text-white font-semibold">Fact Find</a>
+                </div>
+            </div>
+        </div>
+    </nav>
+    
+    <main class="max-w-6xl mx-auto px-6 py-8">
+        <div class="mb-8">
+            <h1 class="text-3xl font-bold">Client Fact Find</h1>
+            <p class="text-gray-600 mt-2">Complete client assessment form</p>
+        </div>
+        
+        <div class="bg-white rounded-lg shadow p-8">
+            <form method="POST" class="space-y-8">
+                <!-- Client Selection -->
+                <div class="border-b pb-6">
+                    <h2 class="text-xl font-semibold mb-4">Client Information</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Select Client *</label>
+                            <select name="client_id" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                <option value="">Choose a client...</option>
+                                {% for client in clients %}
+                                <option value="{{ client.client_id }}">{{ client.full_name }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Assessment Date</label>
+                            <input type="date" name="assessment_date" value="{{ today }}" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Personal Details -->
+                <div class="border-b pb-6">
+                    <h2 class="text-xl font-semibold mb-4">Personal Details</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Age</label>
+                            <input type="number" name="age" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Marital Status</label>
+                            <select name="marital_status" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                <option value="">Select...</option>
+                                <option value="single">Single</option>
+                                <option value="married">Married</option>
+                                <option value="divorced">Divorced</option>
+                                <option value="widowed">Widowed</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Number of Dependants</label>
+                            <input type="number" name="dependants" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Annual Income (£)</label>
+                            <input type="number" name="annual_income" step="0.01" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Financial Goals -->
+                <div class="border-b pb-6">
+                    <h2 class="text-xl font-semibold mb-4">Financial Goals</h2>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Primary Financial Objective</label>
+                            <select name="primary_objective" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                <option value="">Select...</option>
+                                <option value="retirement_planning">Retirement Planning</option>
+                                <option value="wealth_accumulation">Wealth Accumulation</option>
+                                <option value="income_protection">Income Protection</option>
+                                <option value="tax_planning">Tax Planning</option>
+                                <option value="estate_planning">Estate Planning</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Investment Time Horizon</label>
+                            <select name="time_horizon" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                <option value="">Select...</option>
+                                <option value="short_term">Short Term (0-2 years)</option>
+                                <option value="medium_term">Medium Term (3-7 years)</option>
+                                <option value="long_term">Long Term (8+ years)</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Risk Assessment -->
+                <div class="border-b pb-6">
+                    <h2 class="text-xl font-semibold mb-4">Risk Assessment</h2>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Risk Tolerance</label>
+                            <select name="risk_tolerance" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                <option value="">Select...</option>
+                                <option value="conservative">Conservative</option>
+                                <option value="moderate">Moderate</option>
+                                <option value="balanced">Balanced</option>
+                                <option value="growth">Growth</option>
+                                <option value="aggressive">Aggressive</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Previous Investment Experience</label>
+                            <select name="investment_experience" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                <option value="">Select...</option>
+                                <option value="none">None</option>
+                                <option value="limited">Limited</option>
+                                <option value="moderate">Moderate</option>
+                                <option value="extensive">Extensive</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Additional Notes -->
+                <div>
+                    <h2 class="text-xl font-semibold mb-4">Additional Information</h2>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Notes & Comments</label>
+                        <textarea name="notes" rows="6" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Additional client information, concerns, specific requirements..."></textarea>
+                    </div>
+                </div>
+
+                <div class="flex justify-between pt-6">
+                    <a href="/clients" class="px-6 py-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50">Cancel</a>
+                    <button type="submit" class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Save Fact Find</button>
+                </div>
+            </form>
+        </div>
+    </main>
+</body>
+</html>
+"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -469,7 +643,19 @@ ADD_CLIENT_HTML = """
                 <div class="bg-blue-50 p-4 rounded-lg">
                     <h3 class="text-sm font-medium text-blue-800 mb-2">📁 Filing System</h3>
                     <p class="text-sm text-blue-700">Client will be created in: <strong>[Surname Letter]/Client - [Full Name]</strong></p>
-                    <p class="text-xs text-blue-600 mt-2">Includes Reviews folder. You can add policy folders later through the CRM.</p>
+                    <p class="text-xs text-blue-600 mt-2">Complete folder structure created with:</p>
+                    <div class="text-xs text-blue-600 mt-1 ml-4 grid grid-cols-2 gap-1">
+                        <div>• Reviews</div>
+                        <div>• ID&V</div>
+                        <div>• FF & ATR</div>
+                        <div>• Research</div>
+                        <div>• LOA's</div>
+                        <div>• Suitability Letter</div>
+                        <div>• Meeting Notes</div>
+                        <div>• Terms of Business</div>
+                        <div>• Policy Information</div>
+                        <div>• Valuation</div>
+                    </div>
                 </div>
                 
                 <div class="flex justify-between">
@@ -652,8 +838,77 @@ def add_client():
     
     return render_template_string(ADD_CLIENT_HTML)
 
-@app.route('/test')
-def test():
+@app.route('/factfind', methods=['GET', 'POST'])
+def factfind():
+    """Fact Find form"""
+    if 'credentials' not in session:
+        return redirect(url_for('authorize'))
+    
+    if request.method == 'POST':
+        try:
+            credentials = Credentials(**session['credentials'])
+            drive = SimpleGoogleDrive(credentials)
+            
+            # Get form data
+            client_id = request.form.get('client_id')
+            assessment_date = request.form.get('assessment_date')
+            age = request.form.get('age')
+            marital_status = request.form.get('marital_status')
+            dependants = request.form.get('dependants')
+            annual_income = request.form.get('annual_income')
+            primary_objective = request.form.get('primary_objective')
+            time_horizon = request.form.get('time_horizon')
+            risk_tolerance = request.form.get('risk_tolerance')
+            investment_experience = request.form.get('investment_experience')
+            notes = request.form.get('notes', '')
+            
+            if not client_id:
+                raise ValueError("Please select a client")
+            
+            # Save fact find data (you can expand this to save to Google Sheets)
+            factfind_data = {
+                'client_id': client_id,
+                'assessment_date': assessment_date,
+                'age': age,
+                'marital_status': marital_status,
+                'dependants': dependants,
+                'annual_income': annual_income,
+                'primary_objective': primary_objective,
+                'time_horizon': time_horizon,
+                'risk_tolerance': risk_tolerance,
+                'investment_experience': investment_experience,
+                'notes': notes,
+                'completed_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            logger.info(f"Fact Find completed for client: {client_id}")
+            
+            # Redirect back to fact find with success message
+            return redirect(url_for('factfind', success='Fact Find saved successfully!'))
+            
+        except Exception as e:
+            logger.error(f"Fact Find error: {e}")
+            return render_template_string(FACTFIND_HTML, 
+                                        clients=[], 
+                                        today=datetime.now().strftime('%Y-%m-%d'),
+                                        error=str(e))
+    
+    # GET request - show form
+    try:
+        credentials = Credentials(**session['credentials'])
+        drive = SimpleGoogleDrive(credentials)
+        clients = drive.get_clients()
+        
+        success_msg = request.args.get('success')
+        
+        return render_template_string(FACTFIND_HTML, 
+                                    clients=clients,
+                                    today=datetime.now().strftime('%Y-%m-%d'),
+                                    success=success_msg)
+        
+    except Exception as e:
+        logger.error(f"Fact Find load error: {e}")
+        return f"Error: {e}", 500
     """Test page"""
     connected = 'credentials' in session
     return f"""

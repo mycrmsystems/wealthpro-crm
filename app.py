@@ -12,7 +12,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import logging
 import secrets
-from functools import lru_cache
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -129,6 +128,7 @@ class SimpleGoogleDrive:
             result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
             self.spreadsheet_id = result['spreadsheetId']
 
+            # Updated headers to include display_name and separate first_name/surname
             headers = [
                 'Client ID', 'Display Name', 'First Name', 'Surname', 'Email', 'Phone', 'Status',
                 'Date Added', 'Folder ID', 'Portfolio Value', 'Notes'
@@ -169,6 +169,7 @@ class SimpleGoogleDrive:
             for doc_type in document_folders:
                 folder_id = self.create_folder(doc_type, client_folder_id)
                 sub_folder_ids[doc_type] = folder_id
+                logger.info(f"Created document folder: {doc_type}")
 
             logger.info(f"Created client folder for {display_name} in {letter} folder with all sub-folders")
             
@@ -793,3 +794,4 @@ def health_check():
 if __name__ == '__main__':
     logger.info(f"Starting WealthPro CRM Enhanced on {HOST}:{PORT}")
     app.run(host=HOST, port=PORT, debug=False)
+    

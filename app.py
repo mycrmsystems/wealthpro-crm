@@ -79,7 +79,6 @@ class SimpleGoogleDrive:
         except Exception as e:
             logger.error(f"Setup error: {e}")
 
-    @lru_cache(maxsize=100)
     def create_folder(self, name, parent_id):
         try:
             # Check if folder exists first
@@ -195,7 +194,6 @@ class SimpleGoogleDrive:
             logger.error(f"Error adding client: {e}")
             return False
 
-    @lru_cache(maxsize=1)
     def get_clients(self):
         try:
             result = self.sheets_service.spreadsheets().values().get(
@@ -233,15 +231,14 @@ class SimpleGoogleDrive:
     def get_folder_url(self, folder_id):
         return f"https://drive.google.com/drive/folders/{folder_id}"
 
-# Performance optimization: Cache credentials service
-@lru_cache(maxsize=1)
-def get_drive_service(token, refresh_token, token_uri, client_id, client_secret):
+# Performance optimization: Create credentials and drive service
+def get_drive_service(creds_dict):
     credentials = Credentials(
-        token=token,
-        refresh_token=refresh_token,
-        token_uri=token_uri,
-        client_id=client_id,
-        client_secret=client_secret,
+        token=creds_dict['token'],
+        refresh_token=creds_dict['refresh_token'],
+        token_uri=creds_dict['token_uri'],
+        client_id=creds_dict['client_id'],
+        client_secret=creds_dict['client_secret'],
         scopes=SCOPES
     )
     return SimpleGoogleDrive(credentials)
@@ -258,10 +255,7 @@ def index():
     if connected:
         try:
             creds = session['credentials']
-            drive = get_drive_service(
-                creds['token'], creds['refresh_token'], creds['token_uri'],
-                creds['client_id'], creds['client_secret']
-            )
+            drive = get_drive_service(creds)
             clients = drive.get_clients()
             
             stats = {
@@ -430,10 +424,7 @@ def clients():
 
     try:
         creds = session['credentials']
-        drive = get_drive_service(
-            creds['token'], creds['refresh_token'], creds['token_uri'],
-            creds['client_id'], creds['client_secret']
-        )
+        drive = get_drive_service(creds)
         clients = drive.get_clients()
         
         folder_urls = {}
@@ -537,10 +528,7 @@ def add_client():
     if request.method == 'POST':
         try:
             creds = session['credentials']
-            drive = get_drive_service(
-                creds['token'], creds['refresh_token'], creds['token_uri'],
-                creds['client_id'], creds['client_secret']
-            )
+            drive = get_drive_service(creds)
 
             first_name = request.form.get('first_name', '').strip()
             surname = request.form.get('surname', '').strip()
@@ -678,10 +666,7 @@ def factfind(client_id=None):
 
     try:
         creds = session['credentials']
-        drive = get_drive_service(
-            creds['token'], creds['refresh_token'], creds['token_uri'],
-            creds['client_id'], creds['client_secret']
-        )
+        drive = get_drive_service(creds)
         clients = drive.get_clients()
         
         selected_client = None

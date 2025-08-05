@@ -13,8 +13,8 @@ from googleapiclient.errors import HttpError
 import logging
 import secrets
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging - reduce verbosity for faster startup
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
@@ -62,21 +62,30 @@ class SimpleGoogleDrive:
     def setup(self):
         global SPREADSHEET_ID
         try:
-            self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
-            self.client_files_folder_id = self.create_folder('Client Files', self.main_folder_id)
-            
-            # Create A-Z folders in batch for better performance
-            for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-                folder_id = self.create_folder(letter, self.client_files_folder_id)
-                self._folder_cache[letter] = folder_id
-
+            # Only find/create spreadsheet on startup - defer folder creation
             if not self.spreadsheet_id:
                 self.find_or_create_spreadsheet()
             SPREADSHEET_ID = self.spreadsheet_id
             
-            logger.info(f"Setup complete - spreadsheet: {self.spreadsheet_id}")
+            logger.info(f"Quick setup complete - spreadsheet: {self.spreadsheet_id}")
         except Exception as e:
             logger.error(f"Setup error: {e}")
+    
+    def ensure_folder_structure(self):
+        """Create folder structure only when needed"""
+        try:
+            if not self.main_folder_id:
+                self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
+                self.client_files_folder_id = self.create_folder('Client Files', self.main_folder_id)
+                
+                # Create A-Z folders only when first client is added
+                for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+                    folder_id = self.create_folder(letter, self.client_files_folder_id)
+                    self._folder_cache[letter] = folder_id
+                    
+                logger.info("Folder structure created")
+        except Exception as e:
+            logger.error(f"Folder structure error: {e}")
 
     def create_folder(self, name, parent_id):
         try:
@@ -147,6 +156,9 @@ class SimpleGoogleDrive:
 
     def create_client_folder(self, first_name, surname):
         try:
+            # Ensure folder structure exists before creating client folder
+            self.ensure_folder_structure()
+            
             letter = surname[0].upper() if surname else 'Z'
             
             # Use cached folder ID if available
@@ -169,7 +181,6 @@ class SimpleGoogleDrive:
             for doc_type in document_folders:
                 folder_id = self.create_folder(doc_type, client_folder_id)
                 sub_folder_ids[doc_type] = folder_id
-                logger.info(f"Created document folder: {doc_type}")
 
             logger.info(f"Created client folder for {display_name} in {letter} folder with all sub-folders")
             
@@ -792,6 +803,5 @@ def health_check():
     })
 
 if __name__ == '__main__':
-    logger.info(f"Starting WealthPro CRM Enhanced on {HOST}:{PORT}")
-    app.run(host=HOST, port=PORT, debug=False)
-    
+    print(f"🚀 Starting WealthPro CRM on {HOST}:{PORT}")
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)

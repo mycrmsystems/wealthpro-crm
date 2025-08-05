@@ -57,39 +57,46 @@ class SimpleGoogleDrive:
         self.client_files_folder_id = None
         self.spreadsheet_id = SPREADSHEET_ID
         self._folder_cache = {}  # Cache for folder IDs
-        self.setup()
+        self._setup_done = False
+        # Only setup spreadsheet immediately, defer folders
+        self.quick_setup()
 
-    def setup(self):
+    def quick_setup(self):
+        """Quick setup - only spreadsheet, defer folder creation"""
         global SPREADSHEET_ID
         try:
-            # Only find/create spreadsheet on startup - defer folder creation
             if not self.spreadsheet_id:
                 self.find_or_create_spreadsheet()
             SPREADSHEET_ID = self.spreadsheet_id
+            logger.warning(f"Quick setup complete - spreadsheet: {self.spreadsheet_id}")
+        except Exception as e:
+            logger.error(f"Quick setup error: {e}")
+
+    def ensure_full_setup(self):
+        """Ensure full folder structure exists - called when first needed"""
+        if self._setup_done:
+            return
             
-            logger.info(f"Quick setup complete - spreadsheet: {self.spreadsheet_id}")
-        except Exception as e:
-            logger.error(f"Setup error: {e}")
-    
-    def ensure_folder_structure(self):
-        """Create folder structure only when needed"""
         try:
-            if not self.main_folder_id:
-                self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
-                self.client_files_folder_id = self.create_folder('Client Files', self.main_folder_id)
+            logger.warning("Creating folder structure...")
+            self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
+            self.client_files_folder_id = self.create_folder('Client Files', self.main_folder_id)
+            
+            # Create A-Z folders
+            for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+                folder_id = self.create_folder(letter, self.client_files_folder_id)
+                self._folder_cache[letter] = folder_id
                 
-                # Create A-Z folders only when first client is added
-                for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-                    folder_id = self.create_folder(letter, self.client_files_folder_id)
-                    self._folder_cache[letter] = folder_id
-                    
-                logger.info("Folder structure created")
+            self._setup_done = True
+            logger.warning("Folder structure created successfully")
         except Exception as e:
-            logger.error(f"Folder structure error: {e}")
+            logger.error(f"Full setup error: {e}")
+            raise e
 
     def create_folder(self, name, parent_id):
+        """Create folder in Google Drive with proper error handling"""
         try:
-            # Check if folder exists first
+            # Check if folder exists first to avoid duplicates
             if parent_id:
                 query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed=false"
             else:
@@ -99,8 +106,10 @@ class SimpleGoogleDrive:
             folders = results.get('files', [])
             
             if folders:
+                logger.warning(f"Found existing folder: {name}")
                 return folders[0]['id']
 
+            # Create new folder
             folder_metadata = {
                 'name': name,
                 'mimeType': 'application/vnd.google-apps.folder'
@@ -109,9 +118,12 @@ class SimpleGoogleDrive:
                 folder_metadata['parents'] = [parent_id]
 
             folder = self.service.files().create(body=folder_metadata, fields='id').execute()
-            return folder.get('id')
+            folder_id = folder.get('id')
+            logger.warning(f"Created new folder: {name} (ID: {folder_id})")
+            return folder_id
+            
         except Exception as e:
-            logger.error(f"Error creating folder {name}: {e}")
+            logger.error(f"CRITICAL: Error creating folder {name}: {e}")
             return None
 
     def find_or_create_spreadsheet(self):
@@ -155,21 +167,34 @@ class SimpleGoogleDrive:
             logger.error(f"Error creating spreadsheet: {e}")
 
     def create_client_folder(self, first_name, surname):
+        """Create client folder with surname-first naming"""
         try:
-            # Ensure folder structure exists before creating client folder
-            self.ensure_folder_structure()
+            # CRITICAL: Ensure folder structure exists before creating client folder
+            self.ensure_full_setup()
             
             letter = surname[0].upper() if surname else 'Z'
             
-            # Use cached folder ID if available
-            letter_folder_id = self._folder_cache.get(letter) or self.create_folder(letter, self.client_files_folder_id)
+            # Get letter folder ID from cache or create it
+            letter_folder_id = self._folder_cache.get(letter)
+            if not letter_folder_id:
+                logger.error(f"Letter folder {letter} not found in cache")
+                letter_folder_id = self.create_folder(letter, self.client_files_folder_id)
+                self._folder_cache[letter] = letter_folder_id
             
             # Create display name: "Surname, First Name"
             display_name = f"{surname}, {first_name}"
-            client_folder_id = self.create_folder(f"Client - {display_name}", letter_folder_id)
+            client_folder_name = f"Client - {display_name}"
             
+            logger.warning(f"Creating client folder: {client_folder_name}")
+            client_folder_id = self.create_folder(client_folder_name, letter_folder_id)
+            
+            if not client_folder_id:
+                raise Exception(f"Failed to create client folder: {client_folder_name}")
+            
+            # Create Reviews folder
             reviews_folder_id = self.create_folder("Reviews", client_folder_id)
             
+            # Create document folders
             document_folders = [
                 "ID&V", "FF & ATR", "Research", "LOA's", "Suitability Letter",
                 "Meeting Notes", "Terms of Business", "Policy Information", "Valuation"
@@ -177,19 +202,19 @@ class SimpleGoogleDrive:
 
             sub_folder_ids = {'Reviews': reviews_folder_id}
             
-            # Create folders in batch for better performance
+            # Create all document folders
             for doc_type in document_folders:
                 folder_id = self.create_folder(doc_type, client_folder_id)
                 sub_folder_ids[doc_type] = folder_id
 
-            logger.info(f"Created client folder for {display_name} in {letter} folder with all sub-folders")
+            logger.warning(f"SUCCESS: Created complete folder structure for {display_name}")
             
             return {
                 'client_folder_id': client_folder_id,
                 'sub_folders': sub_folder_ids
             }
         except Exception as e:
-            logger.error(f"Error creating client folder: {e}")
+            logger.error(f"CRITICAL ERROR creating client folder: {e}")
             return None
 
     def add_client(self, client_data):

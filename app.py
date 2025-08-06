@@ -178,9 +178,9 @@ class SimpleGoogleDrive:
             status_folder_id = self.get_status_folder_id(status)
             letter_folder_id = self.create_folder(letter, status_folder_id)
             
-            # Create display name: "Surname, First Name"
+            # Create display name without "Client -": just "Surname, First Name"
             display_name = f"{surname}, {first_name}"
-            client_folder_id = self.create_folder(f"Client - {display_name}", letter_folder_id)
+            client_folder_id = self.create_folder(display_name, letter_folder_id)
             
             reviews_folder_id = self.create_folder("Reviews", client_folder_id)
             
@@ -329,33 +329,51 @@ class SimpleGoogleDrive:
                 logger.error("Client has no folder ID")
                 return False
             
+            logger.info(f"Starting folder move for {client['display_name']} to {new_status}")
+            
             # Ensure status folders exist
             self.ensure_status_folders()
             
             # Get the new status folder
             new_status_folder_id = self.get_status_folder_id(new_status)
+            if not new_status_folder_id:
+                logger.error(f"Could not get status folder for {new_status}")
+                return False
+                
             letter = client['surname'][0].upper() if client['surname'] else 'Z'
             
             # Create letter folder in new status section if needed
             new_letter_folder_id = self.create_folder(letter, new_status_folder_id)
+            if not new_letter_folder_id:
+                logger.error(f"Could not create/find letter folder {letter}")
+                return False
+            
+            logger.info(f"Moving folder {old_folder_id} to {new_letter_folder_id}")
             
             # Get current parents to remove
-            file = self.service.files().get(fileId=old_folder_id, fields='parents').execute()
-            previous_parents = ",".join(file.get('parents', []))
-            
-            # Move the folder by updating its parents
-            self.service.files().update(
-                fileId=old_folder_id,
-                addParents=new_letter_folder_id,
-                removeParents=previous_parents,
-                fields='id, parents'
-            ).execute()
-            
-            logger.info(f"Moved client folder {client['display_name']} to {new_status} section")
-            return True
+            try:
+                file = self.service.files().get(fileId=old_folder_id, fields='parents').execute()
+                previous_parents = ",".join(file.get('parents', []))
+                
+                # Move the folder by updating its parents
+                self.service.files().update(
+                    fileId=old_folder_id,
+                    addParents=new_letter_folder_id,
+                    removeParents=previous_parents,
+                    fields='id, parents'
+                ).execute()
+                
+                logger.info(f"Successfully moved client folder {client['display_name']} to {new_status} section")
+                return True
+                
+            except HttpError as e:
+                logger.error(f"Google Drive API error moving folder: {e}")
+                return False
             
         except Exception as e:
             logger.error(f"Error moving client folder: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
 
     def delete_client(self, client_id):
@@ -893,12 +911,15 @@ def edit_client(client_id):
         if request.method == 'POST':
             # Update client status
             new_status = request.form.get('status')
+            logger.info(f"Attempting to update client {client_id} to status: {new_status}")
+            
             success = drive.update_client_status(client_id, new_status)
             
             if success:
                 logger.info(f"Successfully updated client {client_id} to status: {new_status}")
                 return redirect(url_for('clients'))
             else:
+                logger.error(f"Failed to update client {client_id} status")
                 return f"Error updating client status", 500
         
         # Get client data for editing

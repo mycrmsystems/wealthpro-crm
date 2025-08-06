@@ -440,8 +440,11 @@ def index():
             
             stats = {
                 'total_clients': len(clients),
+                'prospects': len([c for c in clients if c.get('status') == 'prospect']),
                 'active_clients': len([c for c in clients if c.get('status') == 'active']),
-                'total_portfolio': sum(c.get('portfolio_value', 0) for c in clients)
+                'former_clients': len([c for c in clients if c.get('status') == 'no_longer_client']),
+                'deceased': len([c for c in clients if c.get('status') == 'deceased']),
+                'active_portfolio': sum(c.get('portfolio_value', 0) for c in clients if c.get('status') == 'active')
             }
 
             return render_template_string('''
@@ -476,19 +479,29 @@ def index():
             <p class="text-blue-100">Your CRM is ready with A-Z filing system (Surname first) - {{ stats.total_clients }} clients</p>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
             <div class="bg-white rounded-lg p-6 shadow">
-                <h3 class="text-lg font-semibold text-gray-900">Total Clients</h3>
-                <p class="text-3xl font-bold text-blue-600">{{ stats.total_clients }}</p>
+                <h3 class="text-lg font-semibold text-gray-900">Prospects</h3>
+                <p class="text-3xl font-bold text-yellow-600">{{ stats.prospects }}</p>
             </div>
             <div class="bg-white rounded-lg p-6 shadow">
                 <h3 class="text-lg font-semibold text-gray-900">Active Clients</h3>
                 <p class="text-3xl font-bold text-green-600">{{ stats.active_clients }}</p>
             </div>
             <div class="bg-white rounded-lg p-6 shadow">
-                <h3 class="text-lg font-semibold text-gray-900">Total Portfolio</h3>
-                <p class="text-3xl font-bold text-purple-600">£{{ "{:,.0f}".format(stats.total_portfolio) }}</p>
+                <h3 class="text-lg font-semibold text-gray-900">Former Clients</h3>
+                <p class="text-3xl font-bold text-orange-600">{{ stats.former_clients }}</p>
             </div>
+            <div class="bg-white rounded-lg p-6 shadow">
+                <h3 class="text-lg font-semibold text-gray-900">Deceased</h3>
+                <p class="text-3xl font-bold text-gray-600">{{ stats.deceased }}</p>
+            </div>
+        </div>
+
+        <div class="bg-white rounded-lg p-6 shadow mb-8 text-center">
+            <h3 class="text-lg font-semibold text-gray-900 mb-2">Active Clients Portfolio Value</h3>
+            <p class="text-4xl font-bold text-purple-600">£{{ "{:,.0f}".format(stats.active_portfolio) }}</p>
+            <p class="text-sm text-gray-500 mt-1">Total value of active client portfolios only</p>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">

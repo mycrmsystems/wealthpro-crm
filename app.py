@@ -218,21 +218,62 @@ class SimpleGoogleDrive:
             return None
 
     def add_client(self, client_data):
+        """Add client to spreadsheet with detailed error handling and verification"""
         try:
-            values = [list(client_data.values())]
-            self.sheets_service.spreadsheets().values().append(
+            logger.warning(f"ADDING CLIENT TO SPREADSHEET:")
+            logger.warning(f"  - Spreadsheet ID: {self.spreadsheet_id}")
+            logger.warning(f"  - Client: {client_data.get('display_name')}")
+            logger.warning(f"  - Data: {client_data}")
+            
+            # Prepare values in correct order
+            values = [[
+                client_data['client_id'],
+                client_data['display_name'], 
+                client_data['first_name'],
+                client_data['surname'],
+                client_data['email'],
+                client_data['phone'],
+                client_data['status'],
+                client_data['date_added'],
+                client_data['folder_id'],
+                str(client_data['portfolio_value']),
+                client_data['notes']
+            ]]
+            
+            logger.warning(f"VALUES TO ADD: {values}")
+            
+            # Add to spreadsheet
+            result = self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A:K',
                 valueInputOption='RAW',
                 body={'values': values}
             ).execute()
+            
+            logger.warning(f"SPREADSHEET RESULT: {result}")
+            logger.warning(f"SUCCESS: Client {client_data.get('display_name')} added to CRM spreadsheet!")
+            
+            # Verify it was added by checking the spreadsheet
+            verify_result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range='Sheet1!A:K'
+            ).execute()
+            
+            verify_values = verify_result.get('values', [])
+            logger.warning(f"VERIFICATION: Spreadsheet now has {len(verify_values)} total rows")
+            
             return True
+            
         except Exception as e:
-            logger.error(f"Error adding client: {e}")
+            logger.error(f"CRITICAL ERROR adding client to spreadsheet: {e}")
+            logger.error(f"Client data was: {client_data}")
             return False
 
     def get_clients(self):
+        """Get all clients from spreadsheet - NO CACHING to ensure fresh data"""
         try:
+            logger.warning(f"Fetching clients from spreadsheet: {self.spreadsheet_id}")
+            
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A2:K'
@@ -241,12 +282,15 @@ class SimpleGoogleDrive:
             values = result.get('values', [])
             clients = []
             
-            for row in values:
-                if len(row) >= 9:  # Updated for new column structure
-                    while len(row) < 11:  # Updated for new total columns
+            logger.warning(f"Found {len(values)} rows in spreadsheet")
+            
+            for i, row in enumerate(values):
+                if len(row) >= 9:  # Need at least 9 columns for basic data
+                    # Pad row to 11 columns if needed
+                    while len(row) < 11:
                         row.append('')
                     
-                    clients.append({
+                    client = {
                         'client_id': row[0],
                         'display_name': row[1],  # "Surname, First Name"
                         'first_name': row[2],
@@ -258,9 +302,15 @@ class SimpleGoogleDrive:
                         'folder_id': row[8],
                         'portfolio_value': float(row[9]) if row[9] else 0.0,
                         'notes': row[10]
-                    })
+                    }
+                    clients.append(client)
+                    logger.warning(f"Loaded client: {client['display_name']}")
             
-            return sorted(clients, key=lambda x: x['display_name'])  # Sort by surname first
+            # Sort by surname first (display_name already in "Surname, First Name" format)
+            sorted_clients = sorted(clients, key=lambda x: x['display_name'])
+            logger.warning(f"Returning {len(sorted_clients)} clients sorted by surname")
+            return sorted_clients
+            
         except Exception as e:
             logger.error(f"Error getting clients: {e}")
             return []
@@ -330,7 +380,7 @@ def index():
     <main class="max-w-7xl mx-auto px-6 py-8">
         <div class="gradient-wealth text-white rounded-lg p-6 mb-8">
             <h1 class="text-3xl font-bold mb-2">Dashboard</h1>
-            <p class="text-blue-100">Your CRM is ready with A-Z filing system (Surname first)</p>
+            <p class="text-blue-100">Your CRM is ready with A-Z filing system (Surname first) - {{ stats.total_clients }} clients loaded</p>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
@@ -496,7 +546,10 @@ def clients():
 
     <main class="max-w-7xl mx-auto px-6 py-8">
         <div class="flex justify-between items-center mb-8">
-            <h1 class="text-3xl font-bold">Clients (Sorted by Surname)</h1>
+            <div>
+                <h1 class="text-3xl font-bold">Clients (Sorted by Surname)</h1>
+                <p class="text-gray-600 mt-1">Total clients: {{ clients|length }}</p>
+            </div>
             <a href="/clients/add" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700">
                 Add New Client
             </a>
@@ -581,10 +634,16 @@ def add_client():
             client_id = f"WP{datetime.now().strftime('%Y%m%d%H%M%S')}"
             display_name = f"{surname}, {first_name}"
             
+            logger.warning(f"STARTING CLIENT CREATION: {display_name}")
+            
+            # STEP 1: Create Google Drive folders
+            logger.warning("STEP 1: Creating Google Drive folders...")
             folder_info = drive.create_client_folder(first_name, surname)
             if not folder_info:
-                raise Exception("Failed to create folders")
+                raise Exception("FAILED: Could not create Google Drive folders")
+            logger.warning(f"SUCCESS: Google Drive folders created for {display_name}")
 
+            # STEP 2: Prepare client data for spreadsheet
             client_data = {
                 'client_id': client_id,
                 'display_name': display_name,
@@ -598,16 +657,22 @@ def add_client():
                 'portfolio_value': float(portfolio_value) if portfolio_value else 0.0,
                 'notes': notes
             }
+            
+            logger.warning(f"STEP 2: Client data prepared: {client_data}")
 
+            # STEP 3: Save to CRM spreadsheet
+            logger.warning("STEP 3: Saving to CRM spreadsheet...")
             success = drive.add_client(client_data)
-            if success:
-                logger.info(f"Added client: {display_name}")
-                return redirect(url_for('clients'))
-            else:
-                raise Exception("Failed to save client")
+            if not success:
+                raise Exception("FAILED: Could not save client to CRM spreadsheet")
+            
+            logger.warning(f"SUCCESS: Client {display_name} saved to BOTH Google Drive AND CRM!")
+            return redirect(url_for('clients'))
+            
         except Exception as e:
-            logger.error(f"Add client error: {e}")
-            return f"Error adding client: {e}", 500
+            error_msg = f"CRITICAL ERROR creating client: {str(e)}"
+            logger.error(error_msg)
+            return f"Error adding client: {error_msg}", 500
 
     return render_template_string('''
 <!DOCTYPE html>

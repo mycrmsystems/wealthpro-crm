@@ -152,7 +152,7 @@ class SimpleGoogleDrive:
             reviews_folder_id = self.create_folder("Reviews", client_folder_id)
             
             document_folders = [
-                "ID&V", "FF & ATR", "Research", "LOA's", "Suitability Letter",
+                "ID&V", "FF & ATR", "Research", "LOAs", "Suitability Letter",
                 "Meeting Notes", "Terms of Business", "Policy Information", "Valuation"
             ]
 
@@ -261,6 +261,13 @@ class SimpleGoogleDrive:
                     while len(row) < 11:
                         row.append('')
                     
+                    # SAFE PORTFOLIO VALUE CONVERSION
+                    try:
+                        portfolio_value = float(row[9]) if row[9] and str(row[9]).replace('.','').replace('-','').isdigit() else 0.0
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid portfolio value '{row[9]}' in row {i+1}, using 0.0")
+                        portfolio_value = 0.0
+                    
                     client = {
                         'client_id': row[0],
                         'display_name': row[1],  # "Surname, First Name"
@@ -271,7 +278,7 @@ class SimpleGoogleDrive:
                         'status': row[6],
                         'date_added': row[7],
                         'folder_id': row[8],
-                        'portfolio_value': float(row[9]) if row[9] else 0.0,
+                        'portfolio_value': portfolio_value,
                         'notes': row[10]
                     }
                     clients.append(client)

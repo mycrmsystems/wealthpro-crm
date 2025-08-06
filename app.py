@@ -63,25 +63,30 @@ class SimpleGoogleDrive:
     def setup(self):
         global SPREADSHEET_ID
         try:
-            self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
-            
-            # Create status-based main folders
-            self.active_clients_folder_id = self.create_folder('Active Clients', self.main_folder_id)
-            self.former_clients_folder_id = self.create_folder('Former Clients', self.main_folder_id)
-            self.deceased_clients_folder_id = self.create_folder('Deceased Clients', self.main_folder_id)
-            
-            # Create A-Z folders under each status folder
-            for status_folder_id in [self.active_clients_folder_id, self.former_clients_folder_id, self.deceased_clients_folder_id]:
-                for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-                    self.create_folder(letter, status_folder_id)
-
+            # Simple setup - only create spreadsheet, defer complex folder structure
             if not self.spreadsheet_id:
                 self.find_or_create_spreadsheet()
             SPREADSHEET_ID = self.spreadsheet_id
             
-            logger.info(f"Setup complete - spreadsheet: {self.spreadsheet_id}")
+            logger.info(f"Quick setup complete - spreadsheet: {self.spreadsheet_id}")
         except Exception as e:
             logger.error(f"Setup error: {e}")
+
+    def ensure_status_folders(self):
+        """Create status folders only when needed - called lazily"""
+        try:
+            if not hasattr(self, '_status_folders_created'):
+                self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
+                
+                # Create status-based main folders
+                self.active_clients_folder_id = self.create_folder('Active Clients', self.main_folder_id)
+                self.former_clients_folder_id = self.create_folder('Former Clients', self.main_folder_id)
+                self.deceased_clients_folder_id = self.create_folder('Deceased Clients', self.main_folder_id)
+                
+                self._status_folders_created = True
+                logger.info("Status folders created")
+        except Exception as e:
+            logger.error(f"Error creating status folders: {e}")
 
     def create_folder(self, name, parent_id):
         try:
@@ -132,17 +137,15 @@ class SimpleGoogleDrive:
             result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
             self.spreadsheet_id = result['spreadsheetId']
 
-            # Expanded headers to include fact find data
+            # Keep original headers to maintain compatibility
             headers = [
                 'Client ID', 'Display Name', 'First Name', 'Surname', 'Email', 'Phone', 'Status',
-                'Date Added', 'Folder ID', 'Portfolio Value', 'Notes',
-                'Age', 'Marital Status', 'Dependents', 'Employment', 'Annual Income', 
-                'Financial Objectives', 'Risk Tolerance', 'Investment Experience', 'Fact Find Date'
+                'Date Added', 'Folder ID', 'Portfolio Value', 'Notes'
             ]
             
             self.sheets_service.spreadsheets().values().update(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A1:S1',
+                range='Sheet1!A1:K1',
                 valueInputOption='RAW',
                 body={'values': [headers]}
             ).execute()
@@ -153,20 +156,25 @@ class SimpleGoogleDrive:
 
     def get_status_folder_id(self, status):
         """Get the appropriate main folder based on client status"""
+        self.ensure_status_folders()  # Create folders if they don't exist
+        
         if status == 'active':
-            return getattr(self, 'active_clients_folder_id', None) or self.create_folder('Active Clients', self.main_folder_id)
+            return getattr(self, 'active_clients_folder_id', None)
         elif status in ['no_longer_client', 'former']:
-            return getattr(self, 'former_clients_folder_id', None) or self.create_folder('Former Clients', self.main_folder_id)
+            return getattr(self, 'former_clients_folder_id', None)
         elif status in ['deceased', 'death']:
-            return getattr(self, 'deceased_clients_folder_id', None) or self.create_folder('Deceased Clients', self.main_folder_id)
+            return getattr(self, 'deceased_clients_folder_id', None)
         else:  # prospect or other
-            return getattr(self, 'active_clients_folder_id', None) or self.create_folder('Active Clients', self.main_folder_id)
+            return getattr(self, 'active_clients_folder_id', None)
 
     def create_client_folder(self, first_name, surname, status='prospect'):
         try:
+            # Ensure status folders exist
+            self.ensure_status_folders()
+            
             letter = surname[0].upper() if surname else 'Z'
             
-            # Get appropriate status folder
+            # Get appropriate status folder and create letter folder
             status_folder_id = self.get_status_folder_id(status)
             letter_folder_id = self.create_folder(letter, status_folder_id)
             
@@ -176,7 +184,7 @@ class SimpleGoogleDrive:
             
             reviews_folder_id = self.create_folder("Reviews", client_folder_id)
             
-            # Fixed: Changed "LOA's" to "LOAs" to avoid apostrophe issue
+            # Create document folders
             document_folders = [
                 "ID&V", "FF & ATR", "Research", "LOAs", "Suitability Letter",
                 "Meeting Notes", "Terms of Business", "Policy Information", "Valuation"
@@ -188,7 +196,7 @@ class SimpleGoogleDrive:
                 folder_id = self.create_folder(doc_type, client_folder_id)
                 sub_folder_ids[doc_type] = folder_id
 
-            logger.info(f"Created client folder for {display_name} in {letter} folder with all sub-folders")
+            logger.info(f"Created client folder for {display_name} in {status} section")
             
             return {
                 'client_folder_id': client_folder_id,
@@ -218,7 +226,7 @@ class SimpleGoogleDrive:
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A2:S'  # Extended range for new columns
+                range='Sheet1!A2:K'  # Keep original range
             ).execute()
             
             values = result.get('values', [])
@@ -226,8 +234,7 @@ class SimpleGoogleDrive:
             
             for row in values:
                 if len(row) >= 9:
-                    # Pad row to 19 columns for new fact find data
-                    while len(row) < 19:
+                    while len(row) < 11:
                         row.append('')
                     
                     # Fixed: Safe portfolio value conversion to handle corrupt data
@@ -249,16 +256,16 @@ class SimpleGoogleDrive:
                         'folder_id': row[8],
                         'portfolio_value': portfolio_value,
                         'notes': row[10],
-                        # New fact find fields
-                        'age': row[11],
-                        'marital_status': row[12],
-                        'dependents': row[13],
-                        'employment': row[14],
-                        'annual_income': row[15],
-                        'financial_objectives': row[16],
-                        'risk_tolerance': row[17],
-                        'investment_experience': row[18],
-                        'fact_find_date': row[18] if len(row) > 18 else ''
+                        # Placeholder values for fact find data
+                        'age': '',
+                        'marital_status': '',
+                        'dependents': '',
+                        'employment': '',
+                        'annual_income': '',
+                        'financial_objectives': '',
+                        'risk_tolerance': '',
+                        'investment_experience': '',
+                        'fact_find_date': ''
                     })
             
             return sorted(clients, key=lambda x: x['display_name'])
@@ -267,20 +274,11 @@ class SimpleGoogleDrive:
             return []
 
     def update_client_status(self, client_id, new_status):
-        """Update client status in spreadsheet and move folder if needed"""
+        """Simple status update - just update the spreadsheet for now"""
         try:
-            # First get all clients to find the one to update
-            clients = self.get_clients()
-            client = next((c for c in clients if c['client_id'] == client_id), None)
-            
-            if not client:
-                logger.error(f"Client {client_id} not found")
-                return False
-            
-            # Update spreadsheet
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A:S'
+                range='Sheet1!A:K'
             ).execute()
             
             values = result.get('values', [])
@@ -295,17 +293,12 @@ class SimpleGoogleDrive:
                     # Update the spreadsheet
                     self.sheets_service.spreadsheets().values().update(
                         spreadsheetId=self.spreadsheet_id,
-                        range=f'Sheet1!A{i+1}:S{i+1}',
+                        range=f'Sheet1!A{i+1}:K{i+1}',
                         valueInputOption='RAW',
                         body={'values': [row]}
                     ).execute()
                     
-                    logger.info(f"Updated client {client_id} status to {new_status} in spreadsheet")
-                    
-                    # Move folder to new status location
-                    if client.get('folder_id'):
-                        self.move_client_folder(client, new_status)
-                    
+                    logger.info(f"Updated client {client_id} status to {new_status}")
                     return True
             
             return False
@@ -314,42 +307,6 @@ class SimpleGoogleDrive:
             logger.error(f"Error updating client status: {e}")
             return False
 
-    def move_client_folder(self, client, new_status):
-        """Move client folder to appropriate status folder"""
-        try:
-            old_folder_id = client['folder_id']
-            if not old_folder_id:
-                return False
-            
-            # Get the new status folder
-            new_status_folder_id = self.get_status_folder_id(new_status)
-            letter = client['surname'][0].upper() if client['surname'] else 'Z'
-            new_letter_folder_id = self.create_folder(letter, new_status_folder_id)
-            
-            # Move the folder by updating its parents
-            self.service.files().update(
-                fileId=old_folder_id,
-                addParents=new_letter_folder_id,
-                removeParents=','.join(self.get_folder_parents(old_folder_id)),
-                fields='id, parents'
-            ).execute()
-            
-            logger.info(f"Moved client folder {client['display_name']} to {new_status} section")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error moving client folder: {e}")
-            return False
-
-    def get_folder_parents(self, folder_id):
-        """Get current parents of a folder"""
-        try:
-            file = self.service.files().get(fileId=folder_id, fields='parents').execute()
-            return file.get('parents', [])
-        except Exception as e:
-            logger.error(f"Error getting folder parents: {e}")
-            return []
-
     def save_fact_find_to_drive(self, client, fact_find_data):
         """Save fact find document to client's FF & ATR folder"""
         try:
@@ -357,11 +314,8 @@ class SimpleGoogleDrive:
                 logger.error("Client has no folder ID")
                 return False
             
-            # Get client's folder structure
-            client_folder_id = client['folder_id']
-            
             # Find the FF & ATR folder
-            query = f"name='FF & ATR' and '{client_folder_id}' in parents and trashed=false"
+            query = f"name='FF & ATR' and '{client['folder_id']}' in parents and trashed=false"
             results = self.service.files().list(q=query, fields="files(id)").execute()
             folders = results.get('files', [])
             
@@ -371,32 +325,23 @@ class SimpleGoogleDrive:
             
             ff_atr_folder_id = folders[0]['id']
             
-            # Create fact find document content
-            fact_find_content = f"""
-FACT FIND - {client['display_name']}
+            # Create simple fact find content
+            fact_find_content = f"""FACT FIND - {client['display_name']}
 Date: {fact_find_data.get('fact_find_date', '')}
 
-PERSONAL INFORMATION:
 Age: {fact_find_data.get('age', 'N/A')}
 Marital Status: {fact_find_data.get('marital_status', 'N/A')}
 Dependents: {fact_find_data.get('dependents', 'N/A')}
-
-EMPLOYMENT & INCOME:
 Employment: {fact_find_data.get('employment', 'N/A')}
 Annual Income: £{fact_find_data.get('annual_income', 'N/A')}
-
-FINANCIAL PROFILE:
 Financial Objectives: {fact_find_data.get('financial_objectives', 'N/A')}
 Risk Tolerance: {fact_find_data.get('risk_tolerance', 'N/A')}
 Investment Experience: {fact_find_data.get('investment_experience', 'N/A')}
-
-Portfolio Value: £{client.get('portfolio_value', 0)}
-Client Status: {client.get('status', 'N/A')}
 """
             
-            # Create the document in Google Drive
+            # Create the document
             file_metadata = {
-                'name': f"Fact Find - {client['display_name']} - {fact_find_data.get('fact_find_date', 'Unknown Date')}.txt",
+                'name': f"Fact Find - {client['display_name']} - {fact_find_data.get('fact_find_date', 'Unknown')}.txt",
                 'parents': [ff_atr_folder_id]
             }
             
@@ -405,61 +350,17 @@ Client Status: {client.get('status', 'N/A')}
                 mimetype='text/plain'
             )
             
-            file = self.service.files().create(
+            self.service.files().create(
                 body=file_metadata,
                 media_body=media,
                 fields='id'
             ).execute()
             
-            logger.info(f"Saved fact find document for {client['display_name']} to Google Drive")
+            logger.info(f"Saved fact find document for {client['display_name']}")
             return True
             
         except Exception as e:
             logger.error(f"Error saving fact find to Google Drive: {e}")
-            return False
-
-    def update_client_fact_find(self, client_id, fact_find_data):
-        """Update client's fact find data in spreadsheet"""
-        try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A:S'
-            ).execute()
-            
-            values = result.get('values', [])
-            
-            # Find and update the client row
-            for i, row in enumerate(values):
-                if len(row) > 0 and row[0] == client_id:
-                    # Ensure row has enough columns
-                    while len(row) < 19:
-                        row.append('')
-                    
-                    # Update fact find columns (11-18)
-                    row[11] = fact_find_data.get('age', '')
-                    row[12] = fact_find_data.get('marital_status', '')
-                    row[13] = fact_find_data.get('dependents', '')
-                    row[14] = fact_find_data.get('employment', '')
-                    row[15] = fact_find_data.get('annual_income', '')
-                    row[16] = fact_find_data.get('financial_objectives', '')
-                    row[17] = fact_find_data.get('risk_tolerance', '')
-                    row[18] = fact_find_data.get('investment_experience', '')
-                    
-                    # Update the spreadsheet
-                    self.sheets_service.spreadsheets().values().update(
-                        spreadsheetId=self.spreadsheet_id,
-                        range=f'Sheet1!A{i+1}:S{i+1}',
-                        valueInputOption='RAW',
-                        body={'values': [row]}
-                    ).execute()
-                    
-                    logger.info(f"Updated fact find data for client {client_id}")
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error updating fact find data: {e}")
             return False
 
 # Routes
@@ -1007,17 +908,14 @@ def edit_client(client_id):
                 'fact_find_date': datetime.now().strftime('%Y-%m-%d')
             }
             
-            # Update spreadsheet with fact find data
-            spreadsheet_success = drive.update_client_fact_find(client_id, fact_find_data)
-            
             # Save fact find document to Google Drive FF & ATR folder
             drive_success = drive.save_fact_find_to_drive(selected_client, fact_find_data)
             
-            if spreadsheet_success and drive_success:
-                logger.info(f"Successfully saved complete fact find for {selected_client['display_name']}")
+            if drive_success:
+                logger.info(f"Successfully saved fact find document for {selected_client['display_name']}")
                 return redirect(url_for('clients'))
             else:
-                logger.error(f"Error saving fact find - Spreadsheet: {spreadsheet_success}, Drive: {drive_success}")
+                logger.error(f"Error saving fact find document")
                 return f"Error saving fact find data", 500
 
         return render_template_string('''

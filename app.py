@@ -4,12 +4,14 @@ WealthPro CRM - Working Version
 
 import os
 import json
+import io
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import googleapiclient.http
 import logging
 import secrets
 
@@ -62,10 +64,16 @@ class SimpleGoogleDrive:
         global SPREADSHEET_ID
         try:
             self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
-            self.client_files_folder_id = self.create_folder('Client Files', self.main_folder_id)
             
-            for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-                self.create_folder(letter, self.client_files_folder_id)
+            # Create status-based main folders
+            self.active_clients_folder_id = self.create_folder('Active Clients', self.main_folder_id)
+            self.former_clients_folder_id = self.create_folder('Former Clients', self.main_folder_id)
+            self.deceased_clients_folder_id = self.create_folder('Deceased Clients', self.main_folder_id)
+            
+            # Create A-Z folders under each status folder
+            for status_folder_id in [self.active_clients_folder_id, self.former_clients_folder_id, self.deceased_clients_folder_id]:
+                for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+                    self.create_folder(letter, status_folder_id)
 
             if not self.spreadsheet_id:
                 self.find_or_create_spreadsheet()
@@ -124,14 +132,17 @@ class SimpleGoogleDrive:
             result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
             self.spreadsheet_id = result['spreadsheetId']
 
+            # Expanded headers to include fact find data
             headers = [
                 'Client ID', 'Display Name', 'First Name', 'Surname', 'Email', 'Phone', 'Status',
-                'Date Added', 'Folder ID', 'Portfolio Value', 'Notes'
+                'Date Added', 'Folder ID', 'Portfolio Value', 'Notes',
+                'Age', 'Marital Status', 'Dependents', 'Employment', 'Annual Income', 
+                'Financial Objectives', 'Risk Tolerance', 'Investment Experience', 'Fact Find Date'
             ]
             
             self.sheets_service.spreadsheets().values().update(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A1:K1',
+                range='Sheet1!A1:S1',
                 valueInputOption='RAW',
                 body={'values': [headers]}
             ).execute()
@@ -140,10 +151,24 @@ class SimpleGoogleDrive:
         except Exception as e:
             logger.error(f"Error creating spreadsheet: {e}")
 
-    def create_client_folder(self, first_name, surname):
+    def get_status_folder_id(self, status):
+        """Get the appropriate main folder based on client status"""
+        if status == 'active':
+            return getattr(self, 'active_clients_folder_id', None) or self.create_folder('Active Clients', self.main_folder_id)
+        elif status in ['no_longer_client', 'former']:
+            return getattr(self, 'former_clients_folder_id', None) or self.create_folder('Former Clients', self.main_folder_id)
+        elif status in ['deceased', 'death']:
+            return getattr(self, 'deceased_clients_folder_id', None) or self.create_folder('Deceased Clients', self.main_folder_id)
+        else:  # prospect or other
+            return getattr(self, 'active_clients_folder_id', None) or self.create_folder('Active Clients', self.main_folder_id)
+
+    def create_client_folder(self, first_name, surname, status='prospect'):
         try:
             letter = surname[0].upper() if surname else 'Z'
-            letter_folder_id = self.create_folder(letter, self.client_files_folder_id)
+            
+            # Get appropriate status folder
+            status_folder_id = self.get_status_folder_id(status)
+            letter_folder_id = self.create_folder(letter, status_folder_id)
             
             # Create display name: "Surname, First Name"
             display_name = f"{surname}, {first_name}"
@@ -186,13 +211,14 @@ class SimpleGoogleDrive:
             return True
         except Exception as e:
             logger.error(f"Error adding client: {e}")
-            return False
+    def get_folder_url(self, folder_id):
+        return f"https://drive.google.com/drive/folders/{folder_id}"
 
     def get_clients(self):
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A2:K'
+                range='Sheet1!A2:S'  # Extended range for new columns
             ).execute()
             
             values = result.get('values', [])
@@ -200,7 +226,8 @@ class SimpleGoogleDrive:
             
             for row in values:
                 if len(row) >= 9:
-                    while len(row) < 11:
+                    # Pad row to 19 columns for new fact find data
+                    while len(row) < 19:
                         row.append('')
                     
                     # Fixed: Safe portfolio value conversion to handle corrupt data
@@ -221,7 +248,17 @@ class SimpleGoogleDrive:
                         'date_added': row[7],
                         'folder_id': row[8],
                         'portfolio_value': portfolio_value,
-                        'notes': row[10]
+                        'notes': row[10],
+                        # New fact find fields
+                        'age': row[11],
+                        'marital_status': row[12],
+                        'dependents': row[13],
+                        'employment': row[14],
+                        'annual_income': row[15],
+                        'financial_objectives': row[16],
+                        'risk_tolerance': row[17],
+                        'investment_experience': row[18],
+                        'fact_find_date': row[18] if len(row) > 18 else ''
                     })
             
             return sorted(clients, key=lambda x: x['display_name'])
@@ -229,8 +266,201 @@ class SimpleGoogleDrive:
             logger.error(f"Error getting clients: {e}")
             return []
 
-    def get_folder_url(self, folder_id):
-        return f"https://drive.google.com/drive/folders/{folder_id}"
+    def update_client_status(self, client_id, new_status):
+        """Update client status in spreadsheet and move folder if needed"""
+        try:
+            # First get all clients to find the one to update
+            clients = self.get_clients()
+            client = next((c for c in clients if c['client_id'] == client_id), None)
+            
+            if not client:
+                logger.error(f"Client {client_id} not found")
+                return False
+            
+            # Update spreadsheet
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range='Sheet1!A:S'
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            # Find and update the client row
+            for i, row in enumerate(values):
+                if len(row) > 0 and row[0] == client_id:
+                    # Update status in row
+                    if len(row) > 6:
+                        row[6] = new_status
+                    
+                    # Update the spreadsheet
+                    self.sheets_service.spreadsheets().values().update(
+                        spreadsheetId=self.spreadsheet_id,
+                        range=f'Sheet1!A{i+1}:S{i+1}',
+                        valueInputOption='RAW',
+                        body={'values': [row]}
+                    ).execute()
+                    
+                    logger.info(f"Updated client {client_id} status to {new_status} in spreadsheet")
+                    
+                    # Move folder to new status location
+                    if client.get('folder_id'):
+                        self.move_client_folder(client, new_status)
+                    
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error updating client status: {e}")
+            return False
+
+    def move_client_folder(self, client, new_status):
+        """Move client folder to appropriate status folder"""
+        try:
+            old_folder_id = client['folder_id']
+            if not old_folder_id:
+                return False
+            
+            # Get the new status folder
+            new_status_folder_id = self.get_status_folder_id(new_status)
+            letter = client['surname'][0].upper() if client['surname'] else 'Z'
+            new_letter_folder_id = self.create_folder(letter, new_status_folder_id)
+            
+            # Move the folder by updating its parents
+            self.service.files().update(
+                fileId=old_folder_id,
+                addParents=new_letter_folder_id,
+                removeParents=','.join(self.get_folder_parents(old_folder_id)),
+                fields='id, parents'
+            ).execute()
+            
+            logger.info(f"Moved client folder {client['display_name']} to {new_status} section")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error moving client folder: {e}")
+            return False
+
+    def get_folder_parents(self, folder_id):
+        """Get current parents of a folder"""
+        try:
+            file = self.service.files().get(fileId=folder_id, fields='parents').execute()
+            return file.get('parents', [])
+        except Exception as e:
+            logger.error(f"Error getting folder parents: {e}")
+            return []
+
+    def save_fact_find_to_drive(self, client, fact_find_data):
+        """Save fact find document to client's FF & ATR folder"""
+        try:
+            if not client.get('folder_id'):
+                logger.error("Client has no folder ID")
+                return False
+            
+            # Get client's folder structure
+            client_folder_id = client['folder_id']
+            
+            # Find the FF & ATR folder
+            query = f"name='FF & ATR' and '{client_folder_id}' in parents and trashed=false"
+            results = self.service.files().list(q=query, fields="files(id)").execute()
+            folders = results.get('files', [])
+            
+            if not folders:
+                logger.error("FF & ATR folder not found for client")
+                return False
+            
+            ff_atr_folder_id = folders[0]['id']
+            
+            # Create fact find document content
+            fact_find_content = f"""
+FACT FIND - {client['display_name']}
+Date: {fact_find_data.get('fact_find_date', '')}
+
+PERSONAL INFORMATION:
+Age: {fact_find_data.get('age', 'N/A')}
+Marital Status: {fact_find_data.get('marital_status', 'N/A')}
+Dependents: {fact_find_data.get('dependents', 'N/A')}
+
+EMPLOYMENT & INCOME:
+Employment: {fact_find_data.get('employment', 'N/A')}
+Annual Income: £{fact_find_data.get('annual_income', 'N/A')}
+
+FINANCIAL PROFILE:
+Financial Objectives: {fact_find_data.get('financial_objectives', 'N/A')}
+Risk Tolerance: {fact_find_data.get('risk_tolerance', 'N/A')}
+Investment Experience: {fact_find_data.get('investment_experience', 'N/A')}
+
+Portfolio Value: £{client.get('portfolio_value', 0)}
+Client Status: {client.get('status', 'N/A')}
+"""
+            
+            # Create the document in Google Drive
+            file_metadata = {
+                'name': f"Fact Find - {client['display_name']} - {fact_find_data.get('fact_find_date', 'Unknown Date')}.txt",
+                'parents': [ff_atr_folder_id]
+            }
+            
+            media = googleapiclient.http.MediaIoBaseUpload(
+                io.BytesIO(fact_find_content.encode('utf-8')),
+                mimetype='text/plain'
+            )
+            
+            file = self.service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+            
+            logger.info(f"Saved fact find document for {client['display_name']} to Google Drive")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving fact find to Google Drive: {e}")
+            return False
+
+    def update_client_fact_find(self, client_id, fact_find_data):
+        """Update client's fact find data in spreadsheet"""
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range='Sheet1!A:S'
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            # Find and update the client row
+            for i, row in enumerate(values):
+                if len(row) > 0 and row[0] == client_id:
+                    # Ensure row has enough columns
+                    while len(row) < 19:
+                        row.append('')
+                    
+                    # Update fact find columns (11-18)
+                    row[11] = fact_find_data.get('age', '')
+                    row[12] = fact_find_data.get('marital_status', '')
+                    row[13] = fact_find_data.get('dependents', '')
+                    row[14] = fact_find_data.get('employment', '')
+                    row[15] = fact_find_data.get('annual_income', '')
+                    row[16] = fact_find_data.get('financial_objectives', '')
+                    row[17] = fact_find_data.get('risk_tolerance', '')
+                    row[18] = fact_find_data.get('investment_experience', '')
+                    
+                    # Update the spreadsheet
+                    self.sheets_service.spreadsheets().values().update(
+                        spreadsheetId=self.spreadsheet_id,
+                        range=f'Sheet1!A{i+1}:S{i+1}',
+                        valueInputOption='RAW',
+                        body={'values': [row]}
+                    ).execute()
+                    
+                    logger.info(f"Updated fact find data for client {client_id}")
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error updating fact find data: {e}")
+            return False
 
 # Routes
 @app.route('/')
@@ -491,6 +721,7 @@ def clients():
                                 <a href="{{ folder_urls[client.folder_id] }}" target="_blank" class="text-blue-600 hover:text-blue-800 text-sm">📁 Folder</a>
                                 {% endif %}
                                 <a href="/factfind/{{ client.client_id }}" class="text-green-600 hover:text-green-800 text-sm">📋 Fact Find</a>
+                                <a href="/clients/edit/{{ client.client_id }}" class="text-orange-600 hover:text-orange-800 text-sm">✏️ Edit</a>
                             </div>
                         </td>
                     </tr>
@@ -536,7 +767,7 @@ def add_client():
             client_id = f"WP{datetime.now().strftime('%Y%m%d%H%M%S')}"
             display_name = f"{surname}, {first_name}"
             
-            folder_info = drive.create_client_folder(first_name, surname)
+            folder_info = drive.create_client_folder(first_name, surname, status)
             if not folder_info:
                 raise Exception("Failed to create folders")
 
@@ -620,7 +851,8 @@ def add_client():
                         <select name="status" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
                             <option value="prospect">Prospect</option>
                             <option value="active">Active Client</option>
-                            <option value="inactive">Inactive</option>
+                            <option value="no_longer_client">No Longer Client</option>
+                            <option value="deceased">Deceased</option>
                         </select>
                     </div>
                     <div>
@@ -650,9 +882,105 @@ def add_client():
 </html>
     ''')
 
-@app.route('/factfind')
-@app.route('/factfind/<client_id>')
-def factfind(client_id=None):
+@app.route('/clients/edit/<client_id>', methods=['GET', 'POST'])
+def edit_client(client_id):
+    if 'credentials' not in session:
+        return redirect(url_for('authorize'))
+
+    try:
+        credentials = Credentials(**session['credentials'])
+        drive = SimpleGoogleDrive(credentials)
+        
+        if request.method == 'POST':
+            # Update client status
+            new_status = request.form.get('status')
+            success = drive.update_client_status(client_id, new_status)
+            
+            if success:
+                logger.info(f"Successfully updated client {client_id} to status: {new_status}")
+                return redirect(url_for('clients'))
+            else:
+                return f"Error updating client status", 500
+        
+        # Get client data for editing
+        clients = drive.get_clients()
+        client = next((c for c in clients if c['client_id'] == client_id), None)
+        
+        if not client:
+            return "Client not found", 404
+
+        return render_template_string('''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WealthPro CRM - Edit Client</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: "Inter", sans-serif; }
+        .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <nav class="gradient-wealth text-white shadow-lg">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="flex justify-between items-center h-16">
+                <h1 class="text-xl font-bold">WealthPro CRM</h1>
+                <div class="flex items-center space-x-6">
+                    <a href="/" class="hover:text-blue-200">Dashboard</a>
+                    <a href="/clients" class="hover:text-blue-200">Clients</a>
+                    <a href="/factfind" class="hover:text-blue-200">Fact Find</a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-4xl mx-auto px-6 py-8">
+        <div class="mb-8">
+            <h1 class="text-3xl font-bold">Edit Client: {{ client.display_name }}</h1>
+            <p class="text-gray-600 mt-2">Change client status and update records</p>
+        </div>
+
+        <div class="bg-white rounded-lg shadow p-8">
+            <form method="POST" class="space-y-6">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Current Status</label>
+                        <p class="text-lg font-semibold text-gray-900 capitalize">{{ client.status.replace('_', ' ') }}</p>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">New Status</label>
+                        <select name="status" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="prospect" {% if client.status == 'prospect' %}selected{% endif %}>Prospect</option>
+                            <option value="active" {% if client.status == 'active' %}selected{% endif %}>Active Client</option>
+                            <option value="no_longer_client" {% if client.status == 'no_longer_client' %}selected{% endif %}>No Longer Client</option>
+                            <option value="deceased" {% if client.status == 'deceased' %}selected{% endif %}>Deceased</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="bg-blue-50 p-4 rounded-lg">
+                    <h3 class="text-sm font-medium text-blue-800 mb-2">📁 Folder Organization</h3>
+                    <p class="text-sm text-blue-700">Changing status will move the client's Google Drive folder to the appropriate section:</p>
+                    <ul class="text-sm text-blue-700 mt-1">
+                        <li>• Active Client → Active Clients folder</li>
+                        <li>• No Longer Client → Former Clients folder</li>
+                        <li>• Deceased → Deceased Clients folder</li>
+                    </ul>
+                </div>
+
+                <div class="flex justify-between">
+                    <a href="/clients" class="px-6 py-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50">Cancel</a>
+                    <button type="submit" class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Update Client Status</button>
+                </div>
+            </form>
+        </div>
+    </main>
+</body>
+</html>
+        ''', client=client)
+    except Exception as e:
+        logger.error(f"Edit client error: {e}")
+        return f"Error: {e}", 500
     if 'credentials' not in session:
         return redirect(url_for('authorize'))
 
@@ -664,6 +992,33 @@ def factfind(client_id=None):
         selected_client = None
         if client_id:
             selected_client = next((c for c in clients if c['client_id'] == client_id), None)
+        
+        if request.method == 'POST' and selected_client:
+            # Save fact find data
+            fact_find_data = {
+                'age': request.form.get('age', ''),
+                'marital_status': request.form.get('marital_status', ''),
+                'dependents': request.form.get('dependents', ''),
+                'employment': request.form.get('employment', ''),
+                'annual_income': request.form.get('annual_income', ''),
+                'financial_objectives': request.form.get('financial_objectives', ''),
+                'risk_tolerance': request.form.get('risk_tolerance', ''),
+                'investment_experience': request.form.get('investment_experience', ''),
+                'fact_find_date': datetime.now().strftime('%Y-%m-%d')
+            }
+            
+            # Update spreadsheet with fact find data
+            spreadsheet_success = drive.update_client_fact_find(client_id, fact_find_data)
+            
+            # Save fact find document to Google Drive FF & ATR folder
+            drive_success = drive.save_fact_find_to_drive(selected_client, fact_find_data)
+            
+            if spreadsheet_success and drive_success:
+                logger.info(f"Successfully saved complete fact find for {selected_client['display_name']}")
+                return redirect(url_for('clients'))
+            else:
+                logger.error(f"Error saving fact find - Spreadsheet: {spreadsheet_success}, Drive: {drive_success}")
+                return f"Error saving fact find data", 500
 
         return render_template_string('''
 <!DOCTYPE html>
@@ -716,36 +1071,87 @@ def factfind(client_id=None):
                 </div>
 
                 {% if selected_client %}
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    <div class="bg-gray-50 p-4 rounded-lg">
-                        <h3 class="font-semibold text-gray-800 mb-2">Client Information</h3>
-                        <div class="space-y-2 text-sm">
-                            <p><strong>Name:</strong> {{ selected_client.display_name }}</p>
-                            <p><strong>Email:</strong> {{ selected_client.email or 'N/A' }}</p>
-                            <p><strong>Phone:</strong> {{ selected_client.phone or 'N/A' }}</p>
-                            <p><strong>Status:</strong> {{ selected_client.status.title() }}</p>
-                            <p><strong>Portfolio:</strong> £{{ "{:,.0f}".format(selected_client.portfolio_value) }}</p>
+                <form method="POST" class="space-y-6">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div class="bg-gray-50 p-4 rounded-lg">
+                            <h3 class="font-semibold text-gray-800 mb-2">Client Information</h3>
+                            <div class="space-y-2 text-sm">
+                                <p><strong>Name:</strong> {{ selected_client.display_name }}</p>
+                                <p><strong>Email:</strong> {{ selected_client.email or 'N/A' }}</p>
+                                <p><strong>Phone:</strong> {{ selected_client.phone or 'N/A' }}</p>
+                                <p><strong>Status:</strong> {{ selected_client.status.title() }}</p>
+                                <p><strong>Portfolio:</strong> £{{ "{:,.0f}".format(selected_client.portfolio_value) }}</p>
+                            </div>
+                        </div>
+                        
+                        <div class="bg-blue-50 p-4 rounded-lg">
+                            <h3 class="font-semibold text-blue-800 mb-2">📋 Personal Details</h3>
+                            <div class="space-y-3">
+                                <div>
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Age</label>
+                                    <input type="number" name="age" value="{{ selected_client.age or '' }}" class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Marital Status</label>
+                                    <select name="marital_status" class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+                                        <option value="">Select...</option>
+                                        <option value="single" {% if selected_client.marital_status == 'single' %}selected{% endif %}>Single</option>
+                                        <option value="married" {% if selected_client.marital_status == 'married' %}selected{% endif %}>Married</option>
+                                        <option value="divorced" {% if selected_client.marital_status == 'divorced' %}selected{% endif %}>Divorced</option>
+                                        <option value="widowed" {% if selected_client.marital_status == 'widowed' %}selected{% endif %}>Widowed</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Dependents</label>
+                                    <input type="number" name="dependents" value="{{ selected_client.dependents or '' }}" class="w-full px-2 py-1 border border-gray-300 rounded text-sm">
+                                </div>
+                            </div>
                         </div>
                     </div>
-                    
-                    <div class="bg-yellow-50 p-4 rounded-lg">
-                        <h3 class="font-semibold text-yellow-800 mb-2">🚧 Coming Soon</h3>
-                        <p class="text-sm text-yellow-700">The complete fact find form will be implemented here. This will include:</p>
-                        <ul class="text-sm text-yellow-700 mt-2 space-y-1">
-                            <li>• Personal & Family Details</li>
-                            <li>• Financial Objectives</li>
-                            <li>• Income & Expenditure</li>
-                            <li>• Assets & Liabilities</li>
-                            <li>• Risk Assessment</li>
-                            <li>• Investment Experience</li>
-                        </ul>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Employment Status</label>
+                            <input type="text" name="employment" value="{{ selected_client.employment or '' }}" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Annual Income (£)</label>
+                            <input type="number" name="annual_income" value="{{ selected_client.annual_income or '' }}" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                        </div>
                     </div>
-                </div>
-                
-                <div class="text-center pt-6">
-                    <p class="text-gray-600 mb-4">Fact Find form framework is ready for {{ selected_client.display_name }}</p>
-                    <a href="/clients" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700">Back to Clients</a>
-                </div>
+
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Financial Objectives</label>
+                        <textarea name="financial_objectives" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-md">{{ selected_client.financial_objectives or '' }}</textarea>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Risk Tolerance</label>
+                            <select name="risk_tolerance" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                <option value="">Select...</option>
+                                <option value="low" {% if selected_client.risk_tolerance == 'low' %}selected{% endif %}>Low</option>
+                                <option value="medium" {% if selected_client.risk_tolerance == 'medium' %}selected{% endif %}>Medium</option>
+                                <option value="high" {% if selected_client.risk_tolerance == 'high' %}selected{% endif %}>High</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Investment Experience</label>
+                            <select name="investment_experience" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                <option value="">Select...</option>
+                                <option value="none" {% if selected_client.investment_experience == 'none' %}selected{% endif %}>None</option>
+                                <option value="limited" {% if selected_client.investment_experience == 'limited' %}selected{% endif %}>Limited</option>
+                                <option value="some" {% if selected_client.investment_experience == 'some' %}selected{% endif %}>Some</option>
+                                <option value="extensive" {% if selected_client.investment_experience == 'extensive' %}selected{% endif %}>Extensive</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="text-center pt-6">
+                        <button type="submit" class="bg-green-600 text-white px-8 py-3 rounded-lg hover:bg-green-700 mr-4">Save Fact Find</button>
+                        <a href="/clients" class="bg-gray-600 text-white px-6 py-3 rounded-lg hover:bg-gray-700">Cancel</a>
+                    </div>
+                </form>
                 {% else %}
                 <div class="text-center">
                     <p class="text-gray-600">Select a client above to begin assessment</p>

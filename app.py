@@ -1,5 +1,5 @@
 """
-WealthPro CRM - Enhanced Version with Performance Improvements
+WealthPro CRM - Working Version with Surname First
 """
 
 import os
@@ -13,8 +13,8 @@ from googleapiclient.errors import HttpError
 import logging
 import secrets
 
-# Configure logging - reduce verbosity for faster startup
-logging.basicConfig(level=logging.WARNING)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
@@ -56,47 +56,27 @@ class SimpleGoogleDrive:
         self.main_folder_id = None
         self.client_files_folder_id = None
         self.spreadsheet_id = SPREADSHEET_ID
-        self._folder_cache = {}  # Cache for folder IDs
-        self._setup_done = False
-        # Only setup spreadsheet immediately, defer folders
-        self.quick_setup()
+        self.setup()
 
-    def quick_setup(self):
-        """Quick setup - only spreadsheet, defer folder creation"""
+    def setup(self):
         global SPREADSHEET_ID
         try:
-            if not self.spreadsheet_id:
-                self.find_or_create_spreadsheet()
-            SPREADSHEET_ID = self.spreadsheet_id
-            logger.warning(f"Quick setup complete - spreadsheet: {self.spreadsheet_id}")
-        except Exception as e:
-            logger.error(f"Quick setup error: {e}")
-
-    def ensure_full_setup(self):
-        """Ensure full folder structure exists - called when first needed"""
-        if self._setup_done:
-            return
-            
-        try:
-            logger.warning("Creating folder structure...")
             self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
             self.client_files_folder_id = self.create_folder('Client Files', self.main_folder_id)
             
-            # Create A-Z folders
             for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-                folder_id = self.create_folder(letter, self.client_files_folder_id)
-                self._folder_cache[letter] = folder_id
-                
-            self._setup_done = True
-            logger.warning("Folder structure created successfully")
+                self.create_folder(letter, self.client_files_folder_id)
+
+            if not self.spreadsheet_id:
+                self.find_or_create_spreadsheet()
+            SPREADSHEET_ID = self.spreadsheet_id
+            
+            logger.info(f"Setup complete - spreadsheet: {self.spreadsheet_id}")
         except Exception as e:
-            logger.error(f"Full setup error: {e}")
-            raise e
+            logger.error(f"Setup error: {e}")
 
     def create_folder(self, name, parent_id):
-        """Create folder in Google Drive with proper error handling"""
         try:
-            # Check if folder exists first to avoid duplicates
             if parent_id:
                 query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed=false"
             else:
@@ -106,10 +86,8 @@ class SimpleGoogleDrive:
             folders = results.get('files', [])
             
             if folders:
-                logger.warning(f"Found existing folder: {name}")
                 return folders[0]['id']
 
-            # Create new folder
             folder_metadata = {
                 'name': name,
                 'mimeType': 'application/vnd.google-apps.folder'
@@ -118,12 +96,9 @@ class SimpleGoogleDrive:
                 folder_metadata['parents'] = [parent_id]
 
             folder = self.service.files().create(body=folder_metadata, fields='id').execute()
-            folder_id = folder.get('id')
-            logger.warning(f"Created new folder: {name} (ID: {folder_id})")
-            return folder_id
-            
+            return folder.get('id')
         except Exception as e:
-            logger.error(f"CRITICAL: Error creating folder {name}: {e}")
+            logger.error(f"Error creating folder {name}: {e}")
             return None
 
     def find_or_create_spreadsheet(self):
@@ -149,7 +124,6 @@ class SimpleGoogleDrive:
             result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
             self.spreadsheet_id = result['spreadsheetId']
 
-            # Updated headers to include display_name and separate first_name/surname
             headers = [
                 'Client ID', 'Display Name', 'First Name', 'Surname', 'Email', 'Phone', 'Status',
                 'Date Added', 'Folder ID', 'Portfolio Value', 'Notes'
@@ -167,34 +141,16 @@ class SimpleGoogleDrive:
             logger.error(f"Error creating spreadsheet: {e}")
 
     def create_client_folder(self, first_name, surname):
-        """Create client folder with surname-first naming"""
         try:
-            # CRITICAL: Ensure folder structure exists before creating client folder
-            self.ensure_full_setup()
-            
             letter = surname[0].upper() if surname else 'Z'
-            
-            # Get letter folder ID from cache or create it
-            letter_folder_id = self._folder_cache.get(letter)
-            if not letter_folder_id:
-                logger.error(f"Letter folder {letter} not found in cache")
-                letter_folder_id = self.create_folder(letter, self.client_files_folder_id)
-                self._folder_cache[letter] = letter_folder_id
+            letter_folder_id = self.create_folder(letter, self.client_files_folder_id)
             
             # Create display name: "Surname, First Name"
             display_name = f"{surname}, {first_name}"
-            client_folder_name = f"Client - {display_name}"
+            client_folder_id = self.create_folder(f"Client - {display_name}", letter_folder_id)
             
-            logger.warning(f"Creating client folder: {client_folder_name}")
-            client_folder_id = self.create_folder(client_folder_name, letter_folder_id)
-            
-            if not client_folder_id:
-                raise Exception(f"Failed to create client folder: {client_folder_name}")
-            
-            # Create Reviews folder
             reviews_folder_id = self.create_folder("Reviews", client_folder_id)
             
-            # Create document folders
             document_folders = [
                 "ID&V", "FF & ATR", "Research", "LOA's", "Suitability Letter",
                 "Meeting Notes", "Terms of Business", "Policy Information", "Valuation"
@@ -202,78 +158,37 @@ class SimpleGoogleDrive:
 
             sub_folder_ids = {'Reviews': reviews_folder_id}
             
-            # Create all document folders
             for doc_type in document_folders:
                 folder_id = self.create_folder(doc_type, client_folder_id)
                 sub_folder_ids[doc_type] = folder_id
 
-            logger.warning(f"SUCCESS: Created complete folder structure for {display_name}")
+            logger.info(f"Created client folder for {display_name} in {letter} folder with all sub-folders")
             
             return {
                 'client_folder_id': client_folder_id,
                 'sub_folders': sub_folder_ids
             }
         except Exception as e:
-            logger.error(f"CRITICAL ERROR creating client folder: {e}")
+            logger.error(f"Error creating client folder: {e}")
             return None
 
     def add_client(self, client_data):
-        """Add client to spreadsheet with detailed error handling and verification"""
         try:
-            logger.warning(f"ADDING CLIENT TO SPREADSHEET:")
-            logger.warning(f"  - Spreadsheet ID: {self.spreadsheet_id}")
-            logger.warning(f"  - Client: {client_data.get('display_name')}")
-            logger.warning(f"  - Data: {client_data}")
-            
-            # Prepare values in correct order
-            values = [[
-                client_data['client_id'],
-                client_data['display_name'], 
-                client_data['first_name'],
-                client_data['surname'],
-                client_data['email'],
-                client_data['phone'],
-                client_data['status'],
-                client_data['date_added'],
-                client_data['folder_id'],
-                str(client_data['portfolio_value']),
-                client_data['notes']
-            ]]
-            
-            logger.warning(f"VALUES TO ADD: {values}")
-            
-            # Add to spreadsheet
-            result = self.sheets_service.spreadsheets().values().append(
+            values = [list(client_data.values())]
+            self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A:K',
                 valueInputOption='RAW',
                 body={'values': values}
             ).execute()
-            
-            logger.warning(f"SPREADSHEET RESULT: {result}")
-            logger.warning(f"SUCCESS: Client {client_data.get('display_name')} added to CRM spreadsheet!")
-            
-            # Verify it was added by checking the spreadsheet
-            verify_result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A:K'
-            ).execute()
-            
-            verify_values = verify_result.get('values', [])
-            logger.warning(f"VERIFICATION: Spreadsheet now has {len(verify_values)} total rows")
-            
+            logger.info(f"Added client to spreadsheet: {client_data.get('display_name')}")
             return True
-            
         except Exception as e:
-            logger.error(f"CRITICAL ERROR adding client to spreadsheet: {e}")
-            logger.error(f"Client data was: {client_data}")
+            logger.error(f"Error adding client: {e}")
             return False
 
     def get_clients(self):
-        """Get all clients from spreadsheet - NO CACHING to ensure fresh data"""
         try:
-            logger.warning(f"Fetching clients from spreadsheet: {self.spreadsheet_id}")
-            
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A2:K'
@@ -282,15 +197,12 @@ class SimpleGoogleDrive:
             values = result.get('values', [])
             clients = []
             
-            logger.warning(f"Found {len(values)} rows in spreadsheet")
-            
-            for i, row in enumerate(values):
-                if len(row) >= 9:  # Need at least 9 columns for basic data
-                    # Pad row to 11 columns if needed
+            for row in values:
+                if len(row) >= 9:
                     while len(row) < 11:
                         row.append('')
                     
-                    client = {
+                    clients.append({
                         'client_id': row[0],
                         'display_name': row[1],  # "Surname, First Name"
                         'first_name': row[2],
@@ -302,33 +214,15 @@ class SimpleGoogleDrive:
                         'folder_id': row[8],
                         'portfolio_value': float(row[9]) if row[9] else 0.0,
                         'notes': row[10]
-                    }
-                    clients.append(client)
-                    logger.warning(f"Loaded client: {client['display_name']}")
+                    })
             
-            # Sort by surname first (display_name already in "Surname, First Name" format)
-            sorted_clients = sorted(clients, key=lambda x: x['display_name'])
-            logger.warning(f"Returning {len(sorted_clients)} clients sorted by surname")
-            return sorted_clients
-            
+            return sorted(clients, key=lambda x: x['display_name'])
         except Exception as e:
             logger.error(f"Error getting clients: {e}")
             return []
 
     def get_folder_url(self, folder_id):
         return f"https://drive.google.com/drive/folders/{folder_id}"
-
-# Performance optimization: Create credentials and drive service
-def get_drive_service(creds_dict):
-    credentials = Credentials(
-        token=creds_dict['token'],
-        refresh_token=creds_dict['refresh_token'],
-        token_uri=creds_dict['token_uri'],
-        client_id=creds_dict['client_id'],
-        client_secret=creds_dict['client_secret'],
-        scopes=SCOPES
-    )
-    return SimpleGoogleDrive(credentials)
 
 # Routes
 @app.route('/')
@@ -341,8 +235,8 @@ def index():
     
     if connected:
         try:
-            creds = session['credentials']
-            drive = get_drive_service(creds)
+            credentials = Credentials(**session['credentials'])
+            drive = SimpleGoogleDrive(credentials)
             clients = drive.get_clients()
             
             stats = {
@@ -380,7 +274,7 @@ def index():
     <main class="max-w-7xl mx-auto px-6 py-8">
         <div class="gradient-wealth text-white rounded-lg p-6 mb-8">
             <h1 class="text-3xl font-bold mb-2">Dashboard</h1>
-            <p class="text-blue-100">Your CRM is ready with A-Z filing system (Surname first) - {{ stats.total_clients }} clients loaded</p>
+            <p class="text-blue-100">Your CRM is ready with A-Z filing system (Surname first) - {{ stats.total_clients }} clients</p>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
@@ -510,8 +404,8 @@ def clients():
         return redirect(url_for('authorize'))
 
     try:
-        creds = session['credentials']
-        drive = get_drive_service(creds)
+        credentials = Credentials(**session['credentials'])
+        drive = SimpleGoogleDrive(credentials)
         clients = drive.get_clients()
         
         folder_urls = {}
@@ -617,8 +511,8 @@ def add_client():
 
     if request.method == 'POST':
         try:
-            creds = session['credentials']
-            drive = get_drive_service(creds)
+            credentials = Credentials(**session['credentials'])
+            drive = SimpleGoogleDrive(credentials)
 
             first_name = request.form.get('first_name', '').strip()
             surname = request.form.get('surname', '').strip()
@@ -634,16 +528,10 @@ def add_client():
             client_id = f"WP{datetime.now().strftime('%Y%m%d%H%M%S')}"
             display_name = f"{surname}, {first_name}"
             
-            logger.warning(f"STARTING CLIENT CREATION: {display_name}")
-            
-            # STEP 1: Create Google Drive folders
-            logger.warning("STEP 1: Creating Google Drive folders...")
             folder_info = drive.create_client_folder(first_name, surname)
             if not folder_info:
-                raise Exception("FAILED: Could not create Google Drive folders")
-            logger.warning(f"SUCCESS: Google Drive folders created for {display_name}")
+                raise Exception("Failed to create folders")
 
-            # STEP 2: Prepare client data for spreadsheet
             client_data = {
                 'client_id': client_id,
                 'display_name': display_name,
@@ -657,22 +545,16 @@ def add_client():
                 'portfolio_value': float(portfolio_value) if portfolio_value else 0.0,
                 'notes': notes
             }
-            
-            logger.warning(f"STEP 2: Client data prepared: {client_data}")
 
-            # STEP 3: Save to CRM spreadsheet
-            logger.warning("STEP 3: Saving to CRM spreadsheet...")
             success = drive.add_client(client_data)
-            if not success:
-                raise Exception("FAILED: Could not save client to CRM spreadsheet")
-            
-            logger.warning(f"SUCCESS: Client {display_name} saved to BOTH Google Drive AND CRM!")
-            return redirect(url_for('clients'))
-            
+            if success:
+                logger.info(f"Added client: {display_name}")
+                return redirect(url_for('clients'))
+            else:
+                raise Exception("Failed to save client")
         except Exception as e:
-            error_msg = f"CRITICAL ERROR creating client: {str(e)}"
-            logger.error(error_msg)
-            return f"Error adding client: {error_msg}", 500
+            logger.error(f"Add client error: {e}")
+            return f"Error adding client: {e}", 500
 
     return render_template_string('''
 <!DOCTYPE html>
@@ -767,8 +649,8 @@ def factfind(client_id=None):
         return redirect(url_for('authorize'))
 
     try:
-        creds = session['credentials']
-        drive = get_drive_service(creds)
+        credentials = Credentials(**session['credentials'])
+        drive = SimpleGoogleDrive(credentials)
         clients = drive.get_clients()
         
         selected_client = None
@@ -889,9 +771,9 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'service': 'WealthPro CRM Enhanced'
+        'service': 'WealthPro CRM'
     })
 
 if __name__ == '__main__':
-    print(f"🚀 Starting WealthPro CRM on {HOST}:{PORT}")
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    logger.info(f"Starting WealthPro CRM on {HOST}:{PORT}")
+    app.run(host=HOST, port=PORT, debug=False)

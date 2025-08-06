@@ -174,35 +174,94 @@ class SimpleGoogleDrive:
 
     def add_client(self, client_data):
         try:
-            values = [list(client_data.values())]
-            self.sheets_service.spreadsheets().values().append(
+            logger.info(f"=== ADDING CLIENT TO SPREADSHEET ===")
+            logger.info(f"Spreadsheet ID: {self.spreadsheet_id}")
+            logger.info(f"Client data: {client_data}")
+            
+            # Prepare data in exact order matching headers
+            row_data = [
+                client_data['client_id'],
+                client_data['display_name'],
+                client_data['first_name'], 
+                client_data['surname'],
+                client_data['email'],
+                client_data['phone'],
+                client_data['status'],
+                client_data['date_added'],
+                client_data['folder_id'],
+                str(client_data['portfolio_value']),
+                client_data['notes']
+            ]
+            
+            logger.info(f"Row data to add: {row_data}")
+            
+            values = [row_data]
+            
+            result = self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A:K',
                 valueInputOption='RAW',
                 body={'values': values}
             ).execute()
-            logger.info(f"Added client to spreadsheet: {client_data.get('display_name')}")
-            return True
+            
+            logger.info(f"Spreadsheet append result: {result}")
+            
+            # Immediately verify the data was added
+            verify_result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range='Sheet1!A:K'
+            ).execute()
+            
+            all_values = verify_result.get('values', [])
+            logger.info(f"VERIFICATION: Spreadsheet now has {len(all_values)} total rows (including header)")
+            logger.info(f"Last row added: {all_values[-1] if all_values else 'NONE'}")
+            
+            if len(all_values) > 1:  # Header + at least one data row
+                logger.info(f"SUCCESS: Client {client_data.get('display_name')} added to spreadsheet!")
+                return True
+            else:
+                logger.error(f"FAILED: No data rows found after adding client")
+                return False
+                
         except Exception as e:
-            logger.error(f"Error adding client: {e}")
+            logger.error(f"CRITICAL ERROR adding client to spreadsheet: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
 
     def get_clients(self):
         try:
+            logger.info(f"=== GETTING CLIENTS FROM SPREADSHEET ===")
+            logger.info(f"Spreadsheet ID: {self.spreadsheet_id}")
+            
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A2:K'
+                range='Sheet1!A:K'
             ).execute()
             
-            values = result.get('values', [])
+            all_values = result.get('values', [])
+            logger.info(f"Raw spreadsheet data: {all_values}")
+            logger.info(f"Total rows (including header): {len(all_values)}")
+            
+            if len(all_values) <= 1:
+                logger.warning("No client data found - only header row or empty spreadsheet")
+                return []
+            
+            # Skip header row (first row)
+            data_rows = all_values[1:]
+            logger.info(f"Data rows: {len(data_rows)}")
+            
             clients = []
             
-            for row in values:
-                if len(row) >= 9:
+            for i, row in enumerate(data_rows):
+                logger.info(f"Processing row {i+1}: {row}")
+                
+                if len(row) >= 9:  # Need minimum columns
+                    # Pad row to 11 columns if needed
                     while len(row) < 11:
                         row.append('')
                     
-                    clients.append({
+                    client = {
                         'client_id': row[0],
                         'display_name': row[1],  # "Surname, First Name"
                         'first_name': row[2],
@@ -214,11 +273,21 @@ class SimpleGoogleDrive:
                         'folder_id': row[8],
                         'portfolio_value': float(row[9]) if row[9] else 0.0,
                         'notes': row[10]
-                    })
+                    }
+                    clients.append(client)
+                    logger.info(f"Added client to list: {client['display_name']}")
+                else:
+                    logger.warning(f"Skipping row {i+1} - insufficient columns: {row}")
             
-            return sorted(clients, key=lambda x: x['display_name'])
+            sorted_clients = sorted(clients, key=lambda x: x['display_name'])
+            logger.info(f"FINAL RESULT: Returning {len(sorted_clients)} clients")
+            
+            return sorted_clients
+            
         except Exception as e:
-            logger.error(f"Error getting clients: {e}")
+            logger.error(f"CRITICAL ERROR getting clients: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return []
 
     def get_folder_url(self, folder_id):
@@ -548,10 +617,16 @@ def add_client():
 
             success = drive.add_client(client_data)
             if success:
-                logger.info(f"Added client: {display_name}")
+                logger.info(f"=== CLIENT CREATION SUCCESS ===")
+                logger.info(f"Client {display_name} saved to BOTH Google Drive AND CRM spreadsheet")
+                
+                # Force a fresh check of clients to verify it's there
+                verification_clients = drive.get_clients()
+                logger.info(f"Verification: CRM now shows {len(verification_clients)} total clients")
+                
                 return redirect(url_for('clients'))
             else:
-                raise Exception("Failed to save client")
+                raise Exception("Failed to save client to CRM spreadsheet - check logs above for details")
         except Exception as e:
             logger.error(f"Add client error: {e}")
             return f"Error adding client: {e}", 500

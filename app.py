@@ -274,8 +274,17 @@ class SimpleGoogleDrive:
             return []
 
     def update_client_status(self, client_id, new_status):
-        """Simple status update - just update the spreadsheet for now"""
+        """Update client status in spreadsheet and move folder"""
         try:
+            # First get the client data
+            clients = self.get_clients()
+            client = next((c for c in clients if c['client_id'] == client_id), None)
+            
+            if not client:
+                logger.error(f"Client {client_id} not found")
+                return False
+            
+            # Update spreadsheet
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A:K'
@@ -299,12 +308,100 @@ class SimpleGoogleDrive:
                     ).execute()
                     
                     logger.info(f"Updated client {client_id} status to {new_status}")
+                    
+                    # Move folder to new status location
+                    if client.get('folder_id'):
+                        self.move_client_folder(client, new_status)
+                    
                     return True
             
             return False
             
         except Exception as e:
             logger.error(f"Error updating client status: {e}")
+            return False
+
+    def move_client_folder(self, client, new_status):
+        """Move client folder to appropriate status folder"""
+        try:
+            old_folder_id = client['folder_id']
+            if not old_folder_id:
+                logger.error("Client has no folder ID")
+                return False
+            
+            # Ensure status folders exist
+            self.ensure_status_folders()
+            
+            # Get the new status folder
+            new_status_folder_id = self.get_status_folder_id(new_status)
+            letter = client['surname'][0].upper() if client['surname'] else 'Z'
+            
+            # Create letter folder in new status section if needed
+            new_letter_folder_id = self.create_folder(letter, new_status_folder_id)
+            
+            # Get current parents to remove
+            file = self.service.files().get(fileId=old_folder_id, fields='parents').execute()
+            previous_parents = ",".join(file.get('parents', []))
+            
+            # Move the folder by updating its parents
+            self.service.files().update(
+                fileId=old_folder_id,
+                addParents=new_letter_folder_id,
+                removeParents=previous_parents,
+                fields='id, parents'
+            ).execute()
+            
+            logger.info(f"Moved client folder {client['display_name']} to {new_status} section")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error moving client folder: {e}")
+            return False
+
+    def delete_client(self, client_id):
+        """Delete client from CRM and move folder to trash in Google Drive"""
+        try:
+            # Get client data first
+            clients = self.get_clients()
+            client = next((c for c in clients if c['client_id'] == client_id), None)
+            
+            if not client:
+                logger.error(f"Client {client_id} not found")
+                return False
+            
+            # Delete from spreadsheet
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range='Sheet1!A:K'
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            # Find and remove the client row
+            for i, row in enumerate(values):
+                if len(row) > 0 and row[0] == client_id:
+                    # Delete the row by clearing it
+                    self.sheets_service.spreadsheets().values().clear(
+                        spreadsheetId=self.spreadsheet_id,
+                        range=f'Sheet1!A{i+1}:K{i+1}'
+                    ).execute()
+                    
+                    logger.info(f"Deleted client {client_id} from spreadsheet")
+                    
+                    # Move Google Drive folder to trash
+                    if client.get('folder_id'):
+                        self.service.files().update(
+                            fileId=client['folder_id'],
+                            body={'trashed': True}
+                        ).execute()
+                        logger.info(f"Moved client folder {client['display_name']} to Google Drive trash")
+                    
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error deleting client: {e}")
             return False
 
     def save_fact_find_to_drive(self, client, fact_find_data):
@@ -623,6 +720,7 @@ def clients():
                                 {% endif %}
                                 <a href="/factfind/{{ client.client_id }}" class="text-green-600 hover:text-green-800 text-sm">📋 Fact Find</a>
                                 <a href="/clients/edit/{{ client.client_id }}" class="text-orange-600 hover:text-orange-800 text-sm">✏️ Edit</a>
+                                <a href="/clients/delete/{{ client.client_id }}" onclick="return confirm('Are you sure you want to delete this client? This will move their folder to Google Drive trash.')" class="text-red-600 hover:text-red-800 text-sm">🗑️ Delete</a>
                             </div>
                         </td>
                     </tr>

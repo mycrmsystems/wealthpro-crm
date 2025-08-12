@@ -1,6 +1,6 @@
 """
 WealthPro CRM - Google Drive Integration Model
-FILE 3 of 8 - Upload this as models/google_drive.py
+FIXED VERSION - Uses single spreadsheet with multiple sheets
 """
 
 import os
@@ -15,43 +15,23 @@ logger = logging.getLogger(__name__)
 
 # Global variables to store spreadsheet IDs
 SPREADSHEET_ID = None
-PROFILES_SPREADSHEET_ID = None
-COMMUNICATIONS_SPREADSHEET_ID = None
-TASKS_SPREADSHEET_ID = None
 
 class SimpleGoogleDrive:
     def __init__(self, credentials):
-        global SPREADSHEET_ID, PROFILES_SPREADSHEET_ID, COMMUNICATIONS_SPREADSHEET_ID, TASKS_SPREADSHEET_ID
+        global SPREADSHEET_ID
         self.service = build('drive', 'v3', credentials=credentials)
         self.sheets_service = build('sheets', 'v4', credentials=credentials)
         self.main_folder_id = None
         self.client_files_folder_id = None
         self.spreadsheet_id = SPREADSHEET_ID
-        # Enhanced: Additional spreadsheet IDs for new features
-        self.profiles_spreadsheet_id = PROFILES_SPREADSHEET_ID
-        self.communications_spreadsheet_id = COMMUNICATIONS_SPREADSHEET_ID
-        self.tasks_spreadsheet_id = TASKS_SPREADSHEET_ID
         self.setup()
 
     def setup(self):
-        global SPREADSHEET_ID, PROFILES_SPREADSHEET_ID, COMMUNICATIONS_SPREADSHEET_ID, TASKS_SPREADSHEET_ID
+        global SPREADSHEET_ID
         try:
             if not self.spreadsheet_id:
                 self.find_or_create_spreadsheet()
                 SPREADSHEET_ID = self.spreadsheet_id
-                
-            # Enhanced: Create additional spreadsheets for new features
-            if not self.profiles_spreadsheet_id:
-                self.find_or_create_profiles_spreadsheet()
-                PROFILES_SPREADSHEET_ID = self.profiles_spreadsheet_id
-                
-            if not self.communications_spreadsheet_id:
-                self.find_or_create_communications_spreadsheet()
-                COMMUNICATIONS_SPREADSHEET_ID = self.communications_spreadsheet_id
-                
-            if not self.tasks_spreadsheet_id:
-                self.find_or_create_tasks_spreadsheet()
-                TASKS_SPREADSHEET_ID = self.tasks_spreadsheet_id
                 
             logger.info(f"Setup complete - spreadsheet: {self.spreadsheet_id}")
         except Exception as e:
@@ -98,115 +78,133 @@ class SimpleGoogleDrive:
         except Exception as e:
             logger.error(f"Error creating spreadsheet: {e}")
 
-    def find_or_create_profiles_spreadsheet(self):
-        """Create spreadsheet for extended client profiles"""
+    def ensure_tasks_sheet(self):
+        """Make sure Tasks sheet exists in main spreadsheet"""
         try:
-            query = "name='WealthPro CRM - Client Profiles' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            spreadsheets = results.get('files', [])
+            # Check if Tasks sheet exists
+            spreadsheet = self.sheets_service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
+            sheets = spreadsheet.get('sheets', [])
             
-            if spreadsheets:
-                self.profiles_spreadsheet_id = spreadsheets[0]['id']
-                logger.info(f"Found existing profiles spreadsheet: {self.profiles_spreadsheet_id}")
-            else:
-                self.create_new_profiles_spreadsheet()
-        except Exception as e:
-            logger.error(f"Error finding profiles spreadsheet: {e}")
-            self.create_new_profiles_spreadsheet()
-
-    def create_new_profiles_spreadsheet(self):
-        """Create new spreadsheet for client profiles"""
-        try:
-            spreadsheet = {'properties': {'title': 'WealthPro CRM - Client Profiles'}}
-            result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
-            self.profiles_spreadsheet_id = result['spreadsheetId']
-
-            headers = [
-                'Client ID', 'Address Line 1', 'Address Line 2', 'City', 'County', 'Postcode', 'Country',
-                'Date of Birth', 'Occupation', 'Employer', 'Emergency Contact Name', 'Emergency Contact Phone',
-                'Emergency Contact Relationship', 'Investment Goals', 'Risk Profile', 'Preferred Contact Method',
-                'Next Review Date', 'Created Date', 'Last Updated'
-            ]
-
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=self.profiles_spreadsheet_id, range='Sheet1!A1:S1',
-                valueInputOption='RAW', body={'values': [headers]}).execute()
-
-            logger.info(f"Created new profiles spreadsheet: {self.profiles_spreadsheet_id}")
-        except Exception as e:
-            logger.error(f"Error creating profiles spreadsheet: {e}")
-
-    def find_or_create_communications_spreadsheet(self):
-        """Create spreadsheet for communication tracking"""
-        try:
-            query = "name='WealthPro CRM - Communications' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            spreadsheets = results.get('files', [])
+            tasks_sheet_exists = any(sheet['properties']['title'] == 'Tasks' for sheet in sheets)
             
-            if spreadsheets:
-                self.communications_spreadsheet_id = spreadsheets[0]['id']
-                logger.info(f"Found existing communications spreadsheet: {self.communications_spreadsheet_id}")
-            else:
-                self.create_new_communications_spreadsheet()
+            if not tasks_sheet_exists:
+                # Create Tasks sheet
+                request = {
+                    'addSheet': {
+                        'properties': {
+                            'title': 'Tasks'
+                        }
+                    }
+                }
+                
+                self.sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={'requests': [request]}
+                ).execute()
+                
+                # Add headers
+                headers = [
+                    'Task ID', 'Client ID', 'Client Name', 'Task Type', 'Title', 
+                    'Description', 'Due Date', 'Priority', 'Status', 'Created Date'
+                ]
+                
+                self.sheets_service.spreadsheets().values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range='Tasks!A1:J1',
+                    valueInputOption='RAW',
+                    body={'values': [headers]}
+                ).execute()
+                
+                logger.info("Tasks sheet created successfully")
+                
         except Exception as e:
-            logger.error(f"Error finding communications spreadsheet: {e}")
-            self.create_new_communications_spreadsheet()
+            logger.error(f"Error ensuring tasks sheet: {e}")
 
-    def create_new_communications_spreadsheet(self):
-        """Create new spreadsheet for communications"""
+    def ensure_profiles_sheet(self):
+        """Make sure Profiles sheet exists in main spreadsheet"""
         try:
-            spreadsheet = {'properties': {'title': 'WealthPro CRM - Communications'}}
-            result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
-            self.communications_spreadsheet_id = result['spreadsheetId']
-
-            headers = [
-                'Communication ID', 'Client ID', 'Date', 'Type', 'Subject', 'Details', 
-                'Outcome', 'Follow Up Required', 'Follow Up Date', 'Created By'
-            ]
-
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=self.communications_spreadsheet_id, range='Sheet1!A1:J1',
-                valueInputOption='RAW', body={'values': [headers]}).execute()
-
-            logger.info(f"Created new communications spreadsheet: {self.communications_spreadsheet_id}")
-        except Exception as e:
-            logger.error(f"Error creating communications spreadsheet: {e}")
-
-    def find_or_create_tasks_spreadsheet(self):
-        """Create spreadsheet for tasks and reminders"""
-        try:
-            query = "name='WealthPro CRM - Tasks & Reminders' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            spreadsheets = results.get('files', [])
+            # Check if Profiles sheet exists
+            spreadsheet = self.sheets_service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
+            sheets = spreadsheet.get('sheets', [])
             
-            if spreadsheets:
-                self.tasks_spreadsheet_id = spreadsheets[0]['id']
-                logger.info(f"Found existing tasks spreadsheet: {self.tasks_spreadsheet_id}")
-            else:
-                self.create_new_tasks_spreadsheet()
+            profiles_sheet_exists = any(sheet['properties']['title'] == 'Profiles' for sheet in sheets)
+            
+            if not profiles_sheet_exists:
+                # Create Profiles sheet
+                request = {
+                    'addSheet': {
+                        'properties': {
+                            'title': 'Profiles'
+                        }
+                    }
+                }
+                
+                self.sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={'requests': [request]}
+                ).execute()
+                
+                # Add headers
+                headers = [
+                    'Client ID', 'Address Line 1', 'Address Line 2', 'City', 'County', 'Postcode', 'Country',
+                    'Date of Birth', 'Occupation', 'Employer', 'Emergency Contact Name', 'Emergency Contact Phone',
+                    'Emergency Contact Relationship', 'Investment Goals', 'Risk Profile', 'Preferred Contact Method',
+                    'Next Review Date', 'Created Date', 'Last Updated'
+                ]
+                
+                self.sheets_service.spreadsheets().values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range='Profiles!A1:S1',
+                    valueInputOption='RAW',
+                    body={'values': [headers]}
+                ).execute()
+                
+                logger.info("Profiles sheet created successfully")
+                
         except Exception as e:
-            logger.error(f"Error finding tasks spreadsheet: {e}")
-            self.create_new_tasks_spreadsheet()
+            logger.error(f"Error ensuring profiles sheet: {e}")
 
-    def create_new_tasks_spreadsheet(self):
-        """Create new spreadsheet for tasks"""
+    def ensure_communications_sheet(self):
+        """Make sure Communications sheet exists in main spreadsheet"""
         try:
-            spreadsheet = {'properties': {'title': 'WealthPro CRM - Tasks & Reminders'}}
-            result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
-            self.tasks_spreadsheet_id = result['spreadsheetId']
-
-            headers = [
-                'Task ID', 'Client ID', 'Task Type', 'Title', 'Description', 'Due Date', 
-                'Priority', 'Status', 'Created Date', 'Completed Date'
-            ]
-
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=self.tasks_spreadsheet_id, range='Sheet1!A1:J1',
-                valueInputOption='RAW', body={'values': [headers]}).execute()
-
-            logger.info(f"Created new tasks spreadsheet: {self.tasks_spreadsheet_id}")
+            # Check if Communications sheet exists
+            spreadsheet = self.sheets_service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
+            sheets = spreadsheet.get('sheets', [])
+            
+            comms_sheet_exists = any(sheet['properties']['title'] == 'Communications' for sheet in sheets)
+            
+            if not comms_sheet_exists:
+                # Create Communications sheet
+                request = {
+                    'addSheet': {
+                        'properties': {
+                            'title': 'Communications'
+                        }
+                    }
+                }
+                
+                self.sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=self.spreadsheet_id,
+                    body={'requests': [request]}
+                ).execute()
+                
+                # Add headers
+                headers = [
+                    'Communication ID', 'Client ID', 'Date', 'Type', 'Subject', 'Details', 
+                    'Outcome', 'Follow Up Required', 'Follow Up Date', 'Created By'
+                ]
+                
+                self.sheets_service.spreadsheets().values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range='Communications!A1:J1',
+                    valueInputOption='RAW',
+                    body={'values': [headers]}
+                ).execute()
+                
+                logger.info("Communications sheet created successfully")
+                
         except Exception as e:
-            logger.error(f"Error creating tasks spreadsheet: {e}")
+            logger.error(f"Error ensuring communications sheet: {e}")
 
     # ==================== FOLDER MANAGEMENT FUNCTIONS ====================
 
@@ -484,12 +482,14 @@ class SimpleGoogleDrive:
     # ==================== PROFILE MANAGEMENT FUNCTIONS ====================
 
     def add_client_profile(self, profile_data):
-        """Add extended client profile data"""
+        """Add extended client profile data to Profiles sheet"""
         try:
+            self.ensure_profiles_sheet()
+            
             values = [list(profile_data.values())]
             self.sheets_service.spreadsheets().values().append(
-                spreadsheetId=self.profiles_spreadsheet_id,
-                range='Sheet1!A:S',
+                spreadsheetId=self.spreadsheet_id,
+                range='Profiles!A:S',
                 valueInputOption='RAW',
                 body={'values': values}
             ).execute()
@@ -502,9 +502,11 @@ class SimpleGoogleDrive:
     def get_client_profile(self, client_id):
         """Get extended profile for a specific client"""
         try:
+            self.ensure_profiles_sheet()
+            
             result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.profiles_spreadsheet_id,
-                range='Sheet1!A2:S'
+                spreadsheetId=self.spreadsheet_id,
+                range='Profiles!A2:S'
             ).execute()
             values = result.get('values', [])
 
@@ -542,9 +544,11 @@ class SimpleGoogleDrive:
     def update_client_profile(self, client_id, profile_data):
         """Update existing client profile"""
         try:
+            self.ensure_profiles_sheet()
+            
             result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.profiles_spreadsheet_id,
-                range='Sheet1!A:S'
+                spreadsheetId=self.spreadsheet_id,
+                range='Profiles!A:S'
             ).execute()
             values = result.get('values', [])
 
@@ -553,8 +557,8 @@ class SimpleGoogleDrive:
                     # Update existing row
                     updated_row = list(profile_data.values())
                     self.sheets_service.spreadsheets().values().update(
-                        spreadsheetId=self.profiles_spreadsheet_id,
-                        range=f'Sheet1!A{i+1}:S{i+1}',
+                        spreadsheetId=self.spreadsheet_id,
+                        range=f'Profiles!A{i+1}:S{i+1}',
                         valueInputOption='RAW',
                         body={'values': [updated_row]}
                     ).execute()
@@ -570,13 +574,15 @@ class SimpleGoogleDrive:
     # ==================== COMMUNICATION FUNCTIONS ====================
 
     def add_communication_enhanced(self, comm_data, client_data):
-        """Add communication and save to both spreadsheet and Google Drive"""
+        """Add communication to Communications sheet and save to Google Drive"""
         try:
+            self.ensure_communications_sheet()
+            
             # Save to spreadsheet
             values = [list(comm_data.values())]
             self.sheets_service.spreadsheets().values().append(
-                spreadsheetId=self.communications_spreadsheet_id,
-                range='Sheet1!A:J',
+                spreadsheetId=self.spreadsheet_id,
+                range='Communications!A:J',
                 valueInputOption='RAW',
                 body={'values': values}
             ).execute()
@@ -593,9 +599,11 @@ class SimpleGoogleDrive:
     def get_client_communications(self, client_id):
         """Get all communications for a specific client"""
         try:
+            self.ensure_communications_sheet()
+            
             result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.communications_spreadsheet_id,
-                range='Sheet1!A2:J'
+                spreadsheetId=self.spreadsheet_id,
+                range='Communications!A2:J'
             ).execute()
             values = result.get('values', [])
 
@@ -679,32 +687,50 @@ Created By: {comm_data.get('created_by', 'System User')}
     # ==================== TASK MANAGEMENT FUNCTIONS - FIXED ====================
 
     def add_task_enhanced(self, task_data, client_data):
-        """Add task and save to both spreadsheet and Google Drive"""
+        """Add task to Tasks sheet and save to Google Drive"""
         try:
-            # Save to spreadsheet
-            values = [list(task_data.values())]
+            self.ensure_tasks_sheet()
+            
+            # Prepare task data for spreadsheet
+            task_row = [
+                task_data.get('task_id', ''),
+                task_data.get('client_id', ''),
+                client_data.get('display_name', ''),
+                task_data.get('task_type', ''),
+                task_data.get('title', ''),
+                task_data.get('description', ''),
+                task_data.get('due_date', ''),
+                task_data.get('priority', 'Medium'),
+                task_data.get('status', 'Pending'),
+                task_data.get('created_date', datetime.now().strftime('%Y-%m-%d'))
+            ]
+            
+            # Add to Tasks sheet in main spreadsheet
             self.sheets_service.spreadsheets().values().append(
-                spreadsheetId=self.tasks_spreadsheet_id,
-                range='Sheet1!A:J',
+                spreadsheetId=self.spreadsheet_id,
+                range='Tasks!A:J',
                 valueInputOption='RAW',
-                body={'values': values}
+                body={'values': [task_row]}
             ).execute()
             
             # Save to Google Drive
             self.save_task_to_drive(client_data, task_data)
             
-            logger.info(f"Added enhanced task for client: {task_data.get('client_id')}")
+            logger.info(f"Added task for client: {client_data.get('display_name')}")
             return True
+            
         except Exception as e:
-            logger.error(f"Error adding enhanced task: {e}")
+            logger.error(f"Error adding task: {e}")
             return False
 
     def get_client_tasks(self, client_id):
         """Get all tasks for a specific client"""
         try:
+            self.ensure_tasks_sheet()
+            
             result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.tasks_spreadsheet_id,
-                range='Sheet1!A2:J'
+                spreadsheetId=self.spreadsheet_id,
+                range='Tasks!A2:J'
             ).execute()
             values = result.get('values', [])
 
@@ -717,14 +743,15 @@ Created By: {comm_data.get('created_by', 'System User')}
                     tasks.append({
                         'task_id': row[0],
                         'client_id': row[1],
-                        'task_type': row[2],
-                        'title': row[3],
-                        'description': row[4],
-                        'due_date': row[5],
-                        'priority': row[6],
-                        'status': row[7],
-                        'created_date': row[8],
-                        'completed_date': row[9]
+                        'client_name': row[2],
+                        'task_type': row[3],
+                        'title': row[4],
+                        'description': row[5],
+                        'due_date': row[6],
+                        'priority': row[7],
+                        'status': row[8],
+                        'created_date': row[9],
+                        'completed_date': ''
                     })
 
             return sorted(tasks, key=lambda x: x['due_date'])
@@ -733,21 +760,18 @@ Created By: {comm_data.get('created_by', 'System User')}
             return []
 
     def get_upcoming_tasks(self, days_ahead=30):
-        """Get all upcoming tasks within specified days - FIXED VERSION"""
+        """Get all upcoming tasks within specified days"""
         try:
-            # Use the correct spreadsheet ID
-            if not self.tasks_spreadsheet_id:
-                logger.error("Tasks spreadsheet ID not found")
-                return []
-                
+            self.ensure_tasks_sheet()
+            
             result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.tasks_spreadsheet_id,
-                range='Sheet1!A2:J'
+                spreadsheetId=self.spreadsheet_id,
+                range='Tasks!A2:J'
             ).execute()
             values = result.get('values', [])
 
             if not values:
-                logger.info("No tasks found in spreadsheet")
+                logger.info("No tasks found")
                 return []
 
             upcoming_tasks = []
@@ -756,15 +780,15 @@ Created By: {comm_data.get('created_by', 'System User')}
 
             logger.info(f"Looking for tasks between {today} and {future_date}")
 
-            for i, row in enumerate(values, start=2):
-                if len(row) >= 6 and row[5]:  # Check if due_date exists (column F)
+            for row in values:
+                if len(row) >= 7 and row[6]:  # Check if due_date exists
                     try:
                         # Try multiple date formats
-                        due_date_str = row[5].strip()
+                        due_date_str = row[6].strip()
                         due_date = None
                         
                         # Try different date formats
-                        for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d']:
+                        for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y']:
                             try:
                                 due_date = datetime.strptime(due_date_str, fmt).date()
                                 break
@@ -772,34 +796,26 @@ Created By: {comm_data.get('created_by', 'System User')}
                                 continue
                         
                         if due_date and today <= due_date <= future_date:
-                            # Check if task is not completed
-                            status = row[7] if len(row) > 7 else 'Pending'
+                            status = row[8] if len(row) > 8 else 'Pending'
                             if status.lower() != 'completed':
-                                while len(row) < 10:
-                                    row.append('')
-                                
-                                # Get client name from main clients spreadsheet
-                                client_name = self.get_client_name_by_id(row[1]) if len(row) > 1 else 'Unknown Client'
-                                
                                 task = {
                                     'task_id': row[0],
                                     'client_id': row[1],
-                                    'client_name': client_name,
-                                    'task_type': row[2],
-                                    'title': row[3],
-                                    'description': row[4],
+                                    'client_name': row[2] if len(row) > 2 else 'Unknown',
+                                    'task_type': row[3] if len(row) > 3 else '',
+                                    'title': row[4] if len(row) > 4 else '',
+                                    'description': row[5] if len(row) > 5 else '',
                                     'due_date': due_date_str,
                                     'due_date_obj': due_date,
-                                    'priority': row[6],
+                                    'priority': row[7] if len(row) > 7 else 'Medium',
                                     'status': status,
-                                    'created_date': row[8],
-                                    'completed_date': row[9]
+                                    'created_date': row[9] if len(row) > 9 else ''
                                 }
                                 upcoming_tasks.append(task)
-                                logger.info(f"Found upcoming task: {task['title']} for {client_name}")
+                                logger.info(f"Found upcoming task: {task['title']}")
                                 
                     except Exception as e:
-                        logger.error(f"Error processing task row {i}: {e}")
+                        logger.error(f"Error processing task: {e}")
                         continue
 
             logger.info(f"Found {len(upcoming_tasks)} upcoming tasks")
@@ -809,45 +825,30 @@ Created By: {comm_data.get('created_by', 'System User')}
             logger.error(f"Error getting upcoming tasks: {e}")
             return []
 
-    def get_client_name_by_id(self, client_id):
-        """Helper function to get client name by ID"""
+    def complete_task(self, task_id):
+        """Mark task as completed in Tasks sheet"""
         try:
+            self.ensure_tasks_sheet()
+            
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A2:K'
-            ).execute()
-            values = result.get('values', [])
-            
-            for row in values:
-                if len(row) > 0 and row[0] == client_id:
-                    return row[1] if len(row) > 1 else 'Unknown Client'
-            
-            return 'Unknown Client'
-        except Exception as e:
-            logger.error(f"Error getting client name: {e}")
-            return 'Unknown Client'
-
-    def complete_task(self, task_id):
-        """Mark task as completed"""
-        try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.tasks_spreadsheet_id,
-                range='Sheet1!A:J'
+                range='Tasks!A:J'
             ).execute()
             values = result.get('values', [])
 
             for i, row in enumerate(values):
                 if len(row) > 0 and row[0] == task_id:
-                    if len(row) > 7:
-                        row[7] = 'Completed'  # Status
-                    if len(row) > 9:
-                        row[9] = datetime.now().strftime('%Y-%m-%d')  # Completed date
+                    # Update status to Completed (column 9 = index 8)
+                    if len(row) >= 9:
+                        row[8] = 'Completed'
                     else:
-                        row.append(datetime.now().strftime('%Y-%m-%d'))
+                        while len(row) < 9:
+                            row.append('')
+                        row[8] = 'Completed'
 
                     self.sheets_service.spreadsheets().values().update(
-                        spreadsheetId=self.tasks_spreadsheet_id,
-                        range=f'Sheet1!A{i+1}:J{i+1}',
+                        spreadsheetId=self.spreadsheet_id,
+                        range=f'Tasks!A{i+1}:J{i+1}',
                         valueInputOption='RAW',
                         body={'values': [row]}
                     ).execute()

@@ -676,7 +676,7 @@ Created By: {comm_data.get('created_by', 'System User')}
             logger.error(f"Error saving communication to drive: {e}")
             return False
 
-    # ==================== TASK MANAGEMENT FUNCTIONS ====================
+    # ==================== TASK MANAGEMENT FUNCTIONS - FIXED ====================
 
     def add_task_enhanced(self, task_data, client_data):
         """Add task and save to both spreadsheet and Google Drive"""
@@ -732,46 +732,100 @@ Created By: {comm_data.get('created_by', 'System User')}
             logger.error(f"Error getting tasks: {e}")
             return []
 
-    def get_upcoming_tasks(self, days_ahead=7):
-        """Get all upcoming tasks within specified days"""
+    def get_upcoming_tasks(self, days_ahead=30):
+        """Get all upcoming tasks within specified days - FIXED VERSION"""
         try:
+            # Use the correct spreadsheet ID
+            if not self.tasks_spreadsheet_id:
+                logger.error("Tasks spreadsheet ID not found")
+                return []
+                
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.tasks_spreadsheet_id,
                 range='Sheet1!A2:J'
             ).execute()
             values = result.get('values', [])
 
+            if not values:
+                logger.info("No tasks found in spreadsheet")
+                return []
+
             upcoming_tasks = []
-            today = datetime.now()
+            today = datetime.now().date()
             future_date = today + timedelta(days=days_ahead)
 
-            for row in values:
-                if len(row) >= 6 and row[5]:  # Check if due_date exists
-                    try:
-                        due_date = datetime.strptime(row[5], '%Y-%m-%d')
-                        if today <= due_date <= future_date and row[7] != 'Completed':
-                            while len(row) < 10:
-                                row.append('')
-                            
-                            upcoming_tasks.append({
-                                'task_id': row[0],
-                                'client_id': row[1],
-                                'task_type': row[2],
-                                'title': row[3],
-                                'description': row[4],
-                                'due_date': row[5],
-                                'priority': row[6],
-                                'status': row[7],
-                                'created_date': row[8],
-                                'completed_date': row[9]
-                            })
-                    except ValueError:
-                        continue  # Skip invalid dates
+            logger.info(f"Looking for tasks between {today} and {future_date}")
 
-            return sorted(upcoming_tasks, key=lambda x: x['due_date'])
+            for i, row in enumerate(values, start=2):
+                if len(row) >= 6 and row[5]:  # Check if due_date exists (column F)
+                    try:
+                        # Try multiple date formats
+                        due_date_str = row[5].strip()
+                        due_date = None
+                        
+                        # Try different date formats
+                        for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d']:
+                            try:
+                                due_date = datetime.strptime(due_date_str, fmt).date()
+                                break
+                            except ValueError:
+                                continue
+                        
+                        if due_date and today <= due_date <= future_date:
+                            # Check if task is not completed
+                            status = row[7] if len(row) > 7 else 'Pending'
+                            if status.lower() != 'completed':
+                                while len(row) < 10:
+                                    row.append('')
+                                
+                                # Get client name from main clients spreadsheet
+                                client_name = self.get_client_name_by_id(row[1]) if len(row) > 1 else 'Unknown Client'
+                                
+                                task = {
+                                    'task_id': row[0],
+                                    'client_id': row[1],
+                                    'client_name': client_name,
+                                    'task_type': row[2],
+                                    'title': row[3],
+                                    'description': row[4],
+                                    'due_date': due_date_str,
+                                    'due_date_obj': due_date,
+                                    'priority': row[6],
+                                    'status': status,
+                                    'created_date': row[8],
+                                    'completed_date': row[9]
+                                }
+                                upcoming_tasks.append(task)
+                                logger.info(f"Found upcoming task: {task['title']} for {client_name}")
+                                
+                    except Exception as e:
+                        logger.error(f"Error processing task row {i}: {e}")
+                        continue
+
+            logger.info(f"Found {len(upcoming_tasks)} upcoming tasks")
+            return sorted(upcoming_tasks, key=lambda x: x['due_date_obj'])
+            
         except Exception as e:
             logger.error(f"Error getting upcoming tasks: {e}")
             return []
+
+    def get_client_name_by_id(self, client_id):
+        """Helper function to get client name by ID"""
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range='Sheet1!A2:K'
+            ).execute()
+            values = result.get('values', [])
+            
+            for row in values:
+                if len(row) > 0 and row[0] == client_id:
+                    return row[1] if len(row) > 1 else 'Unknown Client'
+            
+            return 'Unknown Client'
+        except Exception as e:
+            logger.error(f"Error getting client name: {e}")
+            return 'Unknown Client'
 
     def complete_task(self, task_id):
         """Mark task as completed"""

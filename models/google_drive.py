@@ -1,6 +1,6 @@
 """
 WealthPro CRM - Google Drive Integration Model
-RESTORED TO YOUR ORIGINAL WORKING VERSION + MINIMAL TASK FIX
+FINAL FIXED VERSION - Fixes spreadsheet data format and folder links
 """
 
 import os
@@ -208,6 +208,171 @@ class SimpleGoogleDrive:
         except Exception as e:
             logger.error(f"Error creating tasks spreadsheet: {e}")
 
+    # ==================== DATA CLEANUP FUNCTIONS ====================
+
+    def parse_client_data_from_string(self, data_string):
+        """Parse the jumbled client data string into proper fields"""
+        try:
+            # Split by client ID pattern (WP followed by 14 digits)
+            import re
+            
+            # Find all client entries
+            pattern = r'(WP\d{14})'
+            matches = list(re.finditer(pattern, data_string))
+            
+            clients = []
+            for i, match in enumerate(matches):
+                start_pos = match.start()
+                end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(data_string)
+                client_string = data_string[start_pos:end_pos]
+                
+                # Parse individual client data
+                client = self.parse_single_client_string(client_string)
+                if client:
+                    clients.append(client)
+            
+            return clients
+        except Exception as e:
+            logger.error(f"Error parsing client data: {e}")
+            return []
+
+    def parse_single_client_string(self, client_string):
+        """Parse a single client's data from the string"""
+        try:
+            # Expected pattern: ClientID, DisplayName, FirstName, Surname, Email, Phone, Status, DateAdded, FolderID, Portfolio, Notes
+            parts = client_string.split(',')
+            
+            if len(parts) < 9:
+                return None
+                
+            # Extract known patterns
+            client_id = parts[0] if parts[0].startswith('WP') else None
+            if not client_id:
+                return None
+                
+            # Try to identify email (contains @)
+            email = None
+            email_index = None
+            for i, part in enumerate(parts):
+                if '@' in part:
+                    email = part
+                    email_index = i
+                    break
+            
+            if email_index is None:
+                return None
+                
+            # Display name is typically after client_id
+            display_name = parts[1] if len(parts) > 1 else ''
+            
+            # Extract other fields based on position relative to email
+            try:
+                phone = parts[email_index + 1] if email_index + 1 < len(parts) else ''
+                status = parts[email_index + 2] if email_index + 2 < len(parts) else 'prospect'
+                date_added = parts[email_index + 3] if email_index + 3 < len(parts) else ''
+                folder_id = parts[email_index + 4] if email_index + 4 < len(parts) else ''
+                portfolio_value = parts[email_index + 5] if email_index + 5 < len(parts) else '0'
+                notes = ','.join(parts[email_index + 6:]) if email_index + 6 < len(parts) else ''
+                
+                # Extract first and last name from display name
+                name_parts = display_name.split(',')
+                surname = name_parts[0].strip() if len(name_parts) > 0 else ''
+                first_name = name_parts[1].strip() if len(name_parts) > 1 else ''
+                
+                return {
+                    'client_id': client_id,
+                    'display_name': display_name,
+                    'first_name': first_name,
+                    'surname': surname,
+                    'email': email,
+                    'phone': phone,
+                    'status': status,
+                    'date_added': date_added,
+                    'folder_id': folder_id,
+                    'portfolio_value': float(portfolio_value) if portfolio_value.replace('.', '').isdigit() else 0.0,
+                    'notes': notes
+                }
+            except Exception as e:
+                logger.error(f"Error parsing client fields: {e}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error parsing single client: {e}")
+            return None
+
+    def fix_existing_spreadsheet_data(self):
+        """Fix the existing jumbled spreadsheet data"""
+        try:
+            # Get all data from the spreadsheet
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range='Sheet1!A:K'
+            ).execute()
+            values = result.get('values', [])
+            
+            if not values:
+                return False
+                
+            # Get the raw data string from the first row after headers
+            if len(values) < 2:
+                return False
+                
+            # Combine all data into one string
+            raw_data = ''
+            for row in values[1:]:  # Skip headers
+                if row:  # Skip empty rows
+                    raw_data += ''.join(row)
+            
+            if not raw_data:
+                return False
+                
+            # Parse the jumbled data
+            parsed_clients = self.parse_client_data_from_string(raw_data)
+            
+            if not parsed_clients:
+                logger.error("Could not parse any client data")
+                return False
+                
+            # Clear existing data (except headers)
+            self.sheets_service.spreadsheets().values().clear(
+                spreadsheetId=self.spreadsheet_id,
+                range='Sheet1!A2:K'
+            ).execute()
+            
+            # Insert parsed data properly
+            formatted_data = []
+            for client in parsed_clients:
+                row = [
+                    client['client_id'],
+                    client['display_name'],
+                    client['first_name'],
+                    client['surname'],
+                    client['email'],
+                    client['phone'],
+                    client['status'],
+                    client['date_added'],
+                    client['folder_id'],
+                    client['portfolio_value'],
+                    client['notes']
+                ]
+                formatted_data.append(row)
+            
+            # Insert all data at once
+            if formatted_data:
+                self.sheets_service.spreadsheets().values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range='Sheet1!A2:K',
+                    valueInputOption='RAW',
+                    body={'values': formatted_data}
+                ).execute()
+                
+                logger.info(f"Fixed spreadsheet data for {len(formatted_data)} clients")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error fixing spreadsheet data: {e}")
+            return False
+
     # ==================== FOLDER MANAGEMENT FUNCTIONS ====================
 
     def ensure_status_folders(self):
@@ -347,8 +512,23 @@ class SimpleGoogleDrive:
     # ==================== CLIENT MANAGEMENT FUNCTIONS ====================
 
     def add_client(self, client_data):
+        """Fixed client data insertion"""
         try:
-            values = [list(client_data.values())]
+            # Convert client_data to a properly formatted list
+            values = [[
+                client_data.get('client_id', ''),
+                client_data.get('display_name', ''),
+                client_data.get('first_name', ''),
+                client_data.get('surname', ''),
+                client_data.get('email', ''),
+                client_data.get('phone', ''),
+                client_data.get('status', ''),
+                client_data.get('date_added', ''),
+                client_data.get('folder_id', ''),
+                client_data.get('portfolio_value', 0),
+                client_data.get('notes', '')
+            ]]
+            
             self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A:K',
@@ -362,8 +542,11 @@ class SimpleGoogleDrive:
             return False
 
     def get_clients_enhanced(self):
-        """Enhanced client retrieval with proper folder URLs"""
+        """Enhanced client retrieval with proper folder URLs - FIXED"""
         try:
+            # First, try to fix any existing jumbled data
+            self.fix_existing_spreadsheet_data()
+            
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A2:K'
@@ -396,9 +579,11 @@ class SimpleGoogleDrive:
                         'notes': row[10]
                     }
                     
-                    # Add folder URL for easy access
-                    if client_data['folder_id']:
-                        client_data['folder_url'] = self.get_folder_url(client_data['folder_id'])
+                    # FIXED: Add folder URL for easy access
+                    if client_data['folder_id'] and client_data['folder_id'].strip():
+                        client_data['folder_url'] = f"https://drive.google.com/drive/folders/{client_data['folder_id']}"
+                    else:
+                        client_data['folder_url'] = None
                     
                     clients.append(client_data)
 
@@ -676,18 +861,30 @@ Created By: {comm_data.get('created_by', 'System User')}
             logger.error(f"Error saving communication to drive: {e}")
             return False
 
-    # ==================== TASK MANAGEMENT FUNCTIONS - MINIMAL FIX ====================
+    # ==================== TASK MANAGEMENT FUNCTIONS - FIXED ====================
 
     def add_task_enhanced(self, task_data, client_data):
-        """Add task and save to both spreadsheet and Google Drive - MINIMAL FIX"""
+        """Add task and save to both spreadsheet and Google Drive - FIXED"""
         try:
-            # Save to spreadsheet
-            values = [list(task_data.values())]
+            # Save to spreadsheet with proper formatting
+            task_row = [
+                task_data.get('task_id', ''),
+                task_data.get('client_id', ''),
+                task_data.get('task_type', ''),
+                task_data.get('title', ''),
+                task_data.get('description', ''),
+                task_data.get('due_date', ''),
+                task_data.get('priority', 'Medium'),
+                task_data.get('status', 'Pending'),
+                task_data.get('created_date', datetime.now().strftime('%Y-%m-%d')),
+                task_data.get('completed_date', '')
+            ]
+            
             result = self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.tasks_spreadsheet_id,
                 range='Sheet1!A:J',
                 valueInputOption='RAW',
-                body={'values': values}
+                body={'values': [task_row]}
             ).execute()
             
             logger.info(f"Task saved to spreadsheet: {result}")

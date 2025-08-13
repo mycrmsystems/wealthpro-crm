@@ -1,6 +1,6 @@
 """
 WealthPro CRM - Google Drive Integration Model
-FINAL FIXED VERSION - Fixes spreadsheet data format and folder links
+EMERGENCY FIX - Extract folder IDs from jumbled data
 """
 
 import os
@@ -208,171 +208,6 @@ class SimpleGoogleDrive:
         except Exception as e:
             logger.error(f"Error creating tasks spreadsheet: {e}")
 
-    # ==================== DATA CLEANUP FUNCTIONS ====================
-
-    def parse_client_data_from_string(self, data_string):
-        """Parse the jumbled client data string into proper fields"""
-        try:
-            # Split by client ID pattern (WP followed by 14 digits)
-            import re
-            
-            # Find all client entries
-            pattern = r'(WP\d{14})'
-            matches = list(re.finditer(pattern, data_string))
-            
-            clients = []
-            for i, match in enumerate(matches):
-                start_pos = match.start()
-                end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(data_string)
-                client_string = data_string[start_pos:end_pos]
-                
-                # Parse individual client data
-                client = self.parse_single_client_string(client_string)
-                if client:
-                    clients.append(client)
-            
-            return clients
-        except Exception as e:
-            logger.error(f"Error parsing client data: {e}")
-            return []
-
-    def parse_single_client_string(self, client_string):
-        """Parse a single client's data from the string"""
-        try:
-            # Expected pattern: ClientID, DisplayName, FirstName, Surname, Email, Phone, Status, DateAdded, FolderID, Portfolio, Notes
-            parts = client_string.split(',')
-            
-            if len(parts) < 9:
-                return None
-                
-            # Extract known patterns
-            client_id = parts[0] if parts[0].startswith('WP') else None
-            if not client_id:
-                return None
-                
-            # Try to identify email (contains @)
-            email = None
-            email_index = None
-            for i, part in enumerate(parts):
-                if '@' in part:
-                    email = part
-                    email_index = i
-                    break
-            
-            if email_index is None:
-                return None
-                
-            # Display name is typically after client_id
-            display_name = parts[1] if len(parts) > 1 else ''
-            
-            # Extract other fields based on position relative to email
-            try:
-                phone = parts[email_index + 1] if email_index + 1 < len(parts) else ''
-                status = parts[email_index + 2] if email_index + 2 < len(parts) else 'prospect'
-                date_added = parts[email_index + 3] if email_index + 3 < len(parts) else ''
-                folder_id = parts[email_index + 4] if email_index + 4 < len(parts) else ''
-                portfolio_value = parts[email_index + 5] if email_index + 5 < len(parts) else '0'
-                notes = ','.join(parts[email_index + 6:]) if email_index + 6 < len(parts) else ''
-                
-                # Extract first and last name from display name
-                name_parts = display_name.split(',')
-                surname = name_parts[0].strip() if len(name_parts) > 0 else ''
-                first_name = name_parts[1].strip() if len(name_parts) > 1 else ''
-                
-                return {
-                    'client_id': client_id,
-                    'display_name': display_name,
-                    'first_name': first_name,
-                    'surname': surname,
-                    'email': email,
-                    'phone': phone,
-                    'status': status,
-                    'date_added': date_added,
-                    'folder_id': folder_id,
-                    'portfolio_value': float(portfolio_value) if portfolio_value.replace('.', '').isdigit() else 0.0,
-                    'notes': notes
-                }
-            except Exception as e:
-                logger.error(f"Error parsing client fields: {e}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error parsing single client: {e}")
-            return None
-
-    def fix_existing_spreadsheet_data(self):
-        """Fix the existing jumbled spreadsheet data"""
-        try:
-            # Get all data from the spreadsheet
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A:K'
-            ).execute()
-            values = result.get('values', [])
-            
-            if not values:
-                return False
-                
-            # Get the raw data string from the first row after headers
-            if len(values) < 2:
-                return False
-                
-            # Combine all data into one string
-            raw_data = ''
-            for row in values[1:]:  # Skip headers
-                if row:  # Skip empty rows
-                    raw_data += ''.join(row)
-            
-            if not raw_data:
-                return False
-                
-            # Parse the jumbled data
-            parsed_clients = self.parse_client_data_from_string(raw_data)
-            
-            if not parsed_clients:
-                logger.error("Could not parse any client data")
-                return False
-                
-            # Clear existing data (except headers)
-            self.sheets_service.spreadsheets().values().clear(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A2:K'
-            ).execute()
-            
-            # Insert parsed data properly
-            formatted_data = []
-            for client in parsed_clients:
-                row = [
-                    client['client_id'],
-                    client['display_name'],
-                    client['first_name'],
-                    client['surname'],
-                    client['email'],
-                    client['phone'],
-                    client['status'],
-                    client['date_added'],
-                    client['folder_id'],
-                    client['portfolio_value'],
-                    client['notes']
-                ]
-                formatted_data.append(row)
-            
-            # Insert all data at once
-            if formatted_data:
-                self.sheets_service.spreadsheets().values().update(
-                    spreadsheetId=self.spreadsheet_id,
-                    range='Sheet1!A2:K',
-                    valueInputOption='RAW',
-                    body={'values': formatted_data}
-                ).execute()
-                
-                logger.info(f"Fixed spreadsheet data for {len(formatted_data)} clients")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Error fixing spreadsheet data: {e}")
-            return False
-
     # ==================== FOLDER MANAGEMENT FUNCTIONS ====================
 
     def ensure_status_folders(self):
@@ -542,54 +377,88 @@ class SimpleGoogleDrive:
             return False
 
     def get_clients_enhanced(self):
-        """Enhanced client retrieval with proper folder URLs - FIXED"""
+        """EMERGENCY FIX - Extract folder IDs from jumbled data"""
         try:
-            # First, try to fix any existing jumbled data
-            self.fix_existing_spreadsheet_data()
-            
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A2:K'
+                range='Sheet1!A2:A'
             ).execute()
             values = result.get('values', [])
 
             clients = []
             for row in values:
-                if len(row) >= 9:
-                    while len(row) < 11:
-                        row.append('')
-
-                    try:
-                        portfolio_value = float(row[9]) if row[9] and str(row[9]).replace('.', '').replace('-', '').isdigit() else 0.0
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid portfolio value '{row[9]}', using 0.0")
-                        portfolio_value = 0.0
-
+                if row and row[0]:
+                    data_string = row[0]
+                    
+                    # Extract client data using simple pattern matching
+                    import re
+                    
+                    # Find client ID
+                    client_id_match = re.search(r'(WP\d{14})', data_string)
+                    if not client_id_match:
+                        continue
+                        
+                    client_id = client_id_match.group(1)
+                    
+                    # Find folder ID (pattern: 1 followed by letters/numbers/underscores/dashes)
+                    folder_id_match = re.search(r'(1[A-Za-z0-9_-]{33})', data_string)
+                    folder_id = folder_id_match.group(1) if folder_id_match else None
+                    
+                    # Find email to help parse name
+                    email_match = re.search(r'([^@\s]+@[^@\s]+\.[^@\s]+)', data_string)
+                    if not email_match:
+                        continue
+                        
+                    # Extract name (should be before email)
+                    email_pos = data_string.find(email_match.group(1))
+                    before_email = data_string[:email_pos]
+                    
+                    # Get display name (last part before email, after client ID)
+                    name_part = before_email.replace(client_id, '', 1).strip()
+                    if name_part:
+                        if ',' in name_part:
+                            name_parts = name_part.split(',')
+                            display_name = name_parts[0].strip() + ', ' + name_parts[1].strip()
+                        else:
+                            display_name = name_part
+                    else:
+                        display_name = "Unknown Client"
+                    
+                    # Extract status and portfolio value
+                    status_match = re.search(r'(prospect|active|no_longer_client|deceased)', data_string)
+                    status = status_match.group(1) if status_match else 'prospect'
+                    
+                    # Extract portfolio value (number followed by optional text)
+                    portfolio_match = re.search(r'(\d+)(?=\D*$)', data_string)
+                    portfolio_value = float(portfolio_match.group(1)) if portfolio_match else 0.0
+                    
                     client_data = {
-                        'client_id': row[0],
-                        'display_name': row[1],
-                        'first_name': row[2],
-                        'surname': row[3],
-                        'email': row[4],
-                        'phone': row[5],
-                        'status': row[6],
-                        'date_added': row[7],
-                        'folder_id': row[8],
+                        'client_id': client_id,
+                        'display_name': display_name,
+                        'first_name': '',
+                        'surname': '',
+                        'email': email_match.group(1),
+                        'phone': '',
+                        'status': status,
+                        'date_added': '',
+                        'folder_id': folder_id,
                         'portfolio_value': portfolio_value,
-                        'notes': row[10]
+                        'notes': ''
                     }
                     
-                    # FIXED: Add folder URL for easy access
-                    if client_data['folder_id'] and client_data['folder_id'].strip():
-                        client_data['folder_url'] = f"https://drive.google.com/drive/folders/{client_data['folder_id']}"
+                    # Create folder URL
+                    if folder_id:
+                        client_data['folder_url'] = f"https://drive.google.com/drive/folders/{folder_id}"
                     else:
                         client_data['folder_url'] = None
                     
                     clients.append(client_data)
 
+            logger.info(f"Extracted {len(clients)} clients with folder URLs")
             return sorted(clients, key=lambda x: x['display_name'])
+            
         except Exception as e:
-            logger.error(f"Error getting enhanced clients: {e}")
+            logger.error(f"Error getting clients: {e}")
             return []
 
     def update_client_status(self, client_id, new_status):
@@ -1010,16 +879,10 @@ Created By: {comm_data.get('created_by', 'System User')}
     def get_client_name_by_id(self, client_id):
         """Helper function to get client name by ID"""
         try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A2:K'
-            ).execute()
-            values = result.get('values', [])
-            
-            for row in values:
-                if len(row) > 0 and row[0] == client_id:
-                    return row[1] if len(row) > 1 else 'Unknown Client'
-            
+            clients = self.get_clients_enhanced()
+            for client in clients:
+                if client['client_id'] == client_id:
+                    return client['display_name']
             return 'Unknown Client'
         except Exception as e:
             logger.error(f"Error getting client name: {e}")

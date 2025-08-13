@@ -1,6 +1,6 @@
 """
 WealthPro CRM - Google Drive Integration Model
-FINAL EMERGENCY FIX - RESTORE ALL CLIENTS AND FIX FOLDER LINKS
+CLEAN WORKING VERSION - RESTORE CLIENTS AND FIX FOLDERS
 """
 
 import os
@@ -10,10 +10,8 @@ from datetime import datetime, timedelta
 from googleapiclient.discovery import build
 import googleapiclient.http
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
-# Global variables to store spreadsheet IDs
 SPREADSHEET_ID = None
 PROFILES_SPREADSHEET_ID = None
 COMMUNICATIONS_SPREADSHEET_ID = None
@@ -27,7 +25,6 @@ class SimpleGoogleDrive:
         self.main_folder_id = None
         self.client_files_folder_id = None
         self.spreadsheet_id = SPREADSHEET_ID
-        # Enhanced: Additional spreadsheet IDs for new features
         self.profiles_spreadsheet_id = PROFILES_SPREADSHEET_ID
         self.communications_spreadsheet_id = COMMUNICATIONS_SPREADSHEET_ID
         self.tasks_spreadsheet_id = TASKS_SPREADSHEET_ID
@@ -40,7 +37,6 @@ class SimpleGoogleDrive:
                 self.find_or_create_spreadsheet()
                 SPREADSHEET_ID = self.spreadsheet_id
                 
-            # Enhanced: Create additional spreadsheets for new features
             if not self.profiles_spreadsheet_id:
                 self.find_or_create_profiles_spreadsheet()
                 PROFILES_SPREADSHEET_ID = self.profiles_spreadsheet_id
@@ -56,8 +52,6 @@ class SimpleGoogleDrive:
             logger.info(f"Setup complete - spreadsheet: {self.spreadsheet_id}")
         except Exception as e:
             logger.error(f"Setup error: {e}")
-
-    # ==================== SPREADSHEET CREATION FUNCTIONS ====================
 
     def find_or_create_spreadsheet(self):
         try:
@@ -99,7 +93,6 @@ class SimpleGoogleDrive:
             logger.error(f"Error creating spreadsheet: {e}")
 
     def find_or_create_profiles_spreadsheet(self):
-        """Create spreadsheet for extended client profiles"""
         try:
             query = "name='WealthPro CRM - Client Profiles' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
             results = self.service.files().list(q=query, fields="files(id, name)").execute()
@@ -115,7 +108,6 @@ class SimpleGoogleDrive:
             self.create_new_profiles_spreadsheet()
 
     def create_new_profiles_spreadsheet(self):
-        """Create new spreadsheet for client profiles"""
         try:
             spreadsheet = {'properties': {'title': 'WealthPro CRM - Client Profiles'}}
             result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
@@ -137,7 +129,6 @@ class SimpleGoogleDrive:
             logger.error(f"Error creating profiles spreadsheet: {e}")
 
     def find_or_create_communications_spreadsheet(self):
-        """Create spreadsheet for communication tracking"""
         try:
             query = "name='WealthPro CRM - Communications' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
             results = self.service.files().list(q=query, fields="files(id, name)").execute()
@@ -153,7 +144,6 @@ class SimpleGoogleDrive:
             self.create_new_communications_spreadsheet()
 
     def create_new_communications_spreadsheet(self):
-        """Create new spreadsheet for communications"""
         try:
             spreadsheet = {'properties': {'title': 'WealthPro CRM - Communications'}}
             result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
@@ -173,7 +163,6 @@ class SimpleGoogleDrive:
             logger.error(f"Error creating communications spreadsheet: {e}")
 
     def find_or_create_tasks_spreadsheet(self):
-        """Create spreadsheet for tasks and reminders"""
         try:
             query = "name='WealthPro CRM - Tasks & Reminders' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
             results = self.service.files().list(q=query, fields="files(id, name)").execute()
@@ -189,7 +178,6 @@ class SimpleGoogleDrive:
             self.create_new_tasks_spreadsheet()
 
     def create_new_tasks_spreadsheet(self):
-        """Create new spreadsheet for tasks"""
         try:
             spreadsheet = {'properties': {'title': 'WealthPro CRM - Tasks & Reminders'}}
             result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
@@ -208,10 +196,7 @@ class SimpleGoogleDrive:
         except Exception as e:
             logger.error(f"Error creating tasks spreadsheet: {e}")
 
-    # ==================== FOLDER MANAGEMENT FUNCTIONS ====================
-
     def ensure_status_folders(self):
-        """Create status folders only when needed"""
         try:
             if not hasattr(self, '_status_folders_created'):
                 self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
@@ -224,7 +209,6 @@ class SimpleGoogleDrive:
             logger.error(f"Error creating status folders: {e}")
 
     def get_status_folder_id(self, status):
-        """Get the appropriate main folder based on client status"""
         self.ensure_status_folders()
         if status == 'active':
             return getattr(self, 'active_clients_folder_id', None)
@@ -232,7 +216,7 @@ class SimpleGoogleDrive:
             return getattr(self, 'former_clients_folder_id', None)
         elif status in ['deceased', 'death']:
             return getattr(self, 'deceased_clients_folder_id', None)
-        else:  # prospect or other
+        else:
             return getattr(self, 'active_clients_folder_id', None)
 
     def create_folder(self, name, parent_id):
@@ -262,7 +246,6 @@ class SimpleGoogleDrive:
             return None
 
     def create_client_folder_enhanced(self, first_name, surname, status='prospect'):
-        """Enhanced folder creation with Tasks and Communications folders + Reviews sub-folders"""
         try:
             self.ensure_status_folders()
             letter = surname[0].upper() if surname else 'Z'
@@ -272,10 +255,8 @@ class SimpleGoogleDrive:
             display_name = f"{surname}, {first_name}"
             client_folder_id = self.create_folder(display_name, letter_folder_id)
             
-            # Create main Reviews folder
             reviews_folder_id = self.create_folder("Reviews", client_folder_id)
 
-            # Original document folders
             document_folders = [
                 "ID&V", "FF & ATR", "Research", "LOAs", "Suitability Letter",
                 "Meeting Notes", "Terms of Business", "Policy Information", "Valuation"
@@ -283,17 +264,14 @@ class SimpleGoogleDrive:
 
             sub_folder_ids = {'Reviews': reviews_folder_id}
             
-            # Create main document folders
             for doc_type in document_folders:
                 folder_id = self.create_folder(doc_type, client_folder_id)
                 sub_folder_ids[doc_type] = folder_id
 
-            # ENHANCED: Create the same sub-folders inside Reviews folder
             for doc_type in document_folders:
                 review_subfolder_id = self.create_folder(doc_type, reviews_folder_id)
                 sub_folder_ids[f'Reviews_{doc_type}'] = review_subfolder_id
 
-            # ENHANCED: Create Tasks and Communications folders
             tasks_folder_id = self.create_folder("Tasks", client_folder_id)
             communications_folder_id = self.create_folder("Communications", client_folder_id)
             
@@ -313,7 +291,6 @@ class SimpleGoogleDrive:
         return f"https://drive.google.com/drive/folders/{folder_id}"
 
     def move_client_folder(self, client, new_status):
-        """Move client folder to appropriate status folder"""
         try:
             old_folder_id = client['folder_id']
             if not old_folder_id:
@@ -326,11 +303,9 @@ class SimpleGoogleDrive:
             letter = client['surname'][0].upper() if client['surname'] else 'Z'
             new_letter_folder_id = self.create_folder(letter, new_status_folder_id)
 
-            # Get current parents
             file = self.service.files().get(fileId=old_folder_id, fields='parents').execute()
             previous_parents = ",".join(file.get('parents', []))
 
-            # Move the folder
             self.service.files().update(
                 fileId=old_folder_id,
                 addParents=new_letter_folder_id,
@@ -344,12 +319,8 @@ class SimpleGoogleDrive:
             logger.error(f"Error moving client folder: {e}")
             return False
 
-    # ==================== CLIENT MANAGEMENT FUNCTIONS ====================
-
     def add_client(self, client_data):
-        """Fixed client data insertion"""
         try:
-            # Convert client_data to a properly formatted list
             values = [[
                 client_data.get('client_id', ''),
                 client_data.get('display_name', ''),
@@ -377,7 +348,6 @@ class SimpleGoogleDrive:
             return False
 
     def get_clients_enhanced(self):
-        """EMERGENCY RESTORE - Read all data from spreadsheet properly"""
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
@@ -387,12 +357,11 @@ class SimpleGoogleDrive:
 
             clients = []
             for i, row in enumerate(values):
-                if i == 0:  # Skip header row
+                if i == 0:
                     continue
                     
                 if row and len(row) > 0:
-                    # Handle both normal rows and jumbled data
-                    if len(row) >= 9 and not row[0].startswith('WP2025'):  # Normal formatted row
+                    if len(row) >= 9:
                         while len(row) < 11:
                             row.append('')
                         
@@ -414,50 +383,40 @@ class SimpleGoogleDrive:
                             'portfolio_value': portfolio_value,
                             'notes': row[10]
                         }
-                    else:  # Jumbled data in first column OR single column data
+                    else:
                         data_string = str(row[0])
                         import re
                         
-                        # Extract client ID
                         client_id_match = re.search(r'(WP\d{14})', data_string)
                         if not client_id_match:
                             continue
                         client_id = client_id_match.group(1)
                         
-                        # Extract folder ID (pattern starts with 1 followed by 33 characters)
                         folder_id_matches = re.findall(r'(1[A-Za-z0-9_-]{33})', data_string)
                         folder_id = folder_id_matches[0] if folder_id_matches else None
                         
-                        # Extract email
                         email_match = re.search(r'([^@\s]+@[^@\s]+\.[^@\s]+)', data_string)
                         email = email_match.group(1) if email_match else ''
                         
-                        # Extract display name (between client ID and email)
                         if email:
                             email_pos = data_string.find(email)
                             name_section = data_string[len(client_id):email_pos]
-                            # Clean up the name
                             display_name = name_section.strip()
-                            # Remove any trailing numbers or unwanted characters
                             display_name = re.sub(r'\d+$', '', display_name).strip()
                         else:
                             display_name = "Unknown Client"
                         
-                        # Extract status
                         status_match = re.search(r'(prospect|active|no_longer_client|deceased)', data_string, re.IGNORECASE)
                         status = status_match.group(1).lower() if status_match else 'prospect'
                         
-                        # Extract portfolio value (number at the end before any text)
                         portfolio_matches = re.findall(r'(\d+)', data_string)
                         portfolio_value = 0.0
                         if portfolio_matches:
-                            # Get the last reasonable number (not phone, not client ID)
                             for match in reversed(portfolio_matches):
-                                if len(match) <= 8 and not match.startswith('2025'):  # Reasonable portfolio value
+                                if len(match) <= 8 and not match.startswith('2025'):
                                     portfolio_value = float(match)
                                     break
                         
-                        # Extract phone (sequence of digits, but not client ID or year)
                         phone_matches = re.findall(r'(\d{8,15})', data_string)
                         phone = ''
                         if phone_matches:
@@ -474,13 +433,12 @@ class SimpleGoogleDrive:
                             'email': email,
                             'phone': phone,
                             'status': status,
-                            'date_added': '2025-08-06',  # Default date
+                            'date_added': '2025-08-06',
                             'folder_id': folder_id,
                             'portfolio_value': portfolio_value,
                             'notes': ''
                         }
                     
-                    # Add folder URL if folder ID exists
                     if client_data['folder_id']:
                         client_data['folder_url'] = f"https://drive.google.com/drive/folders/{client_data['folder_id']}"
                     else:
@@ -496,7 +454,6 @@ class SimpleGoogleDrive:
             return []
 
     def update_client_status(self, client_id, new_status):
-        """Update client status and move folder"""
         try:
             clients = self.get_clients_enhanced()
             client = next((c for c in clients if c['client_id'] == client_id), None)
@@ -504,7 +461,6 @@ class SimpleGoogleDrive:
                 logger.error(f"Client {client_id} not found")
                 return False
 
-            # Update spreadsheet
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A:K'
@@ -525,7 +481,6 @@ class SimpleGoogleDrive:
 
                     logger.info(f"Updated client {client_id} status to {new_status}")
 
-            # Move folder
             if client.get('folder_id'):
                 self.move_client_folder(client, new_status)
 
@@ -535,14 +490,12 @@ class SimpleGoogleDrive:
             return False
 
     def delete_client(self, client_id):
-        """Delete client from CRM and trash folder"""
         try:
             clients = self.get_clients_enhanced()
             client = next((c for c in clients if c['client_id'] == client_id), None)
             if not client:
                 return False
 
-            # Delete from spreadsheet
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A:K'
@@ -556,7 +509,6 @@ class SimpleGoogleDrive:
                         range=f'Sheet1!A{i+1}:K{i+1}'
                     ).execute()
 
-            # Trash Google Drive folder
             if client.get('folder_id'):
                 self.service.files().update(
                     fileId=client['folder_id'],
@@ -569,10 +521,7 @@ class SimpleGoogleDrive:
             logger.error(f"Error deleting client: {e}")
             return False
 
-    # ==================== PROFILE MANAGEMENT FUNCTIONS ====================
-
     def add_client_profile(self, profile_data):
-        """Add extended client profile data"""
         try:
             values = [list(profile_data.values())]
             self.sheets_service.spreadsheets().values().append(
@@ -588,7 +537,6 @@ class SimpleGoogleDrive:
             return False
 
     def get_client_profile(self, client_id):
-        """Get extended profile for a specific client"""
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.profiles_spreadsheet_id,
@@ -598,7 +546,7 @@ class SimpleGoogleDrive:
 
             for row in values:
                 if len(row) > 0 and row[0] == client_id:
-                    while len(row) < 19:  # Ensure all columns are present
+                    while len(row) < 19:
                         row.append('')
                     
                     return {
@@ -628,7 +576,6 @@ class SimpleGoogleDrive:
             return None
 
     def update_client_profile(self, client_id, profile_data):
-        """Update existing client profile"""
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.profiles_spreadsheet_id,
@@ -638,7 +585,6 @@ class SimpleGoogleDrive:
 
             for i, row in enumerate(values):
                 if len(row) > 0 and row[0] == client_id:
-                    # Update existing row
                     updated_row = list(profile_data.values())
                     self.sheets_service.spreadsheets().values().update(
                         spreadsheetId=self.profiles_spreadsheet_id,
@@ -649,18 +595,13 @@ class SimpleGoogleDrive:
                     logger.info(f"Updated client profile: {client_id}")
                     return True
 
-            # If not found, add new profile
             return self.add_client_profile(profile_data)
         except Exception as e:
             logger.error(f"Error updating client profile: {e}")
             return False
 
-    # ==================== COMMUNICATION FUNCTIONS ====================
-
     def add_communication_enhanced(self, comm_data, client_data):
-        """Add communication and save to both spreadsheet and Google Drive"""
         try:
-            # Save to spreadsheet
             values = [list(comm_data.values())]
             self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.communications_spreadsheet_id,
@@ -669,7 +610,6 @@ class SimpleGoogleDrive:
                 body={'values': values}
             ).execute()
             
-            # Save to Google Drive
             self.save_communication_to_drive(client_data, comm_data)
             
             logger.info(f"Added enhanced communication for client: {comm_data.get('client_id')}")
@@ -679,7 +619,6 @@ class SimpleGoogleDrive:
             return False
 
     def get_client_communications(self, client_id):
-        """Get all communications for a specific client"""
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.communications_spreadsheet_id,
@@ -689,7 +628,7 @@ class SimpleGoogleDrive:
 
             communications = []
             for row in values:
-                if len(row) > 1 and row[1] == client_id:  # row[1] is client_id
+                if len(row) > 1 and row[1] == client_id:
                     while len(row) < 10:
                         row.append('')
                     
@@ -712,7 +651,6 @@ class SimpleGoogleDrive:
             return []
 
     def save_communication_to_drive(self, client, comm_data):
-        """Save communication document to client's Communications folder"""
         try:
             if not client.get('folder_id'):
                 return False
@@ -727,7 +665,6 @@ class SimpleGoogleDrive:
 
             comms_folder_id = folders[0]['id']
 
-            # Create communication content with time tracking
             comm_content = f"""COMMUNICATION - {client['display_name']}
 Communication ID: {comm_data.get('communication_id', '')}
 Date: {comm_data.get('date', '')}
@@ -764,12 +701,8 @@ Created By: {comm_data.get('created_by', 'System User')}
             logger.error(f"Error saving communication to drive: {e}")
             return False
 
-    # ==================== TASK MANAGEMENT FUNCTIONS - FIXED ====================
-
     def add_task_enhanced(self, task_data, client_data):
-        """Add task and save to both spreadsheet and Google Drive - FIXED"""
         try:
-            # Save to spreadsheet with proper formatting
             task_row = [
                 task_data.get('task_id', ''),
                 task_data.get('client_id', ''),
@@ -792,7 +725,6 @@ Created By: {comm_data.get('created_by', 'System User')}
             
             logger.info(f"Task saved to spreadsheet: {result}")
             
-            # Save to Google Drive
             self.save_task_to_drive(client_data, task_data)
             
             logger.info(f"Added enhanced task for client: {task_data.get('client_id')}")
@@ -802,7 +734,6 @@ Created By: {comm_data.get('created_by', 'System User')}
             return False
 
     def get_client_tasks(self, client_id):
-        """Get all tasks for a specific client"""
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.tasks_spreadsheet_id,
@@ -812,7 +743,7 @@ Created By: {comm_data.get('created_by', 'System User')}
 
             tasks = []
             for row in values:
-                if len(row) > 1 and row[1] == client_id:  # row[1] is client_id
+                if len(row) > 1 and row[1] == client_id:
                     while len(row) < 10:
                         row.append('')
                     
@@ -835,7 +766,6 @@ Created By: {comm_data.get('created_by', 'System User')}
             return []
 
     def get_upcoming_tasks(self, days_ahead=30):
-        """Get all upcoming tasks within specified days - FIXED"""
         try:
             if not self.tasks_spreadsheet_id:
                 logger.error("Tasks spreadsheet ID not found")
@@ -858,13 +788,11 @@ Created By: {comm_data.get('created_by', 'System User')}
             logger.info(f"Looking for tasks between {today} and {future_date}")
 
             for i, row in enumerate(values, start=2):
-                if len(row) >= 6 and row[5]:  # Check if due_date exists (column F)
+                if len(row) >= 6 and row[5]:
                     try:
-                        # Try multiple date formats
                         due_date_str = row[5].strip()
                         due_date = None
                         
-                        # Try different date formats
                         for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d']:
                             try:
                                 due_date = datetime.strptime(due_date_str, fmt).date()
@@ -873,13 +801,11 @@ Created By: {comm_data.get('created_by', 'System User')}
                                 continue
                         
                         if due_date and today <= due_date <= future_date:
-                            # Check if task is not completed
                             status = row[7] if len(row) > 7 else 'Pending'
                             if status.lower() != 'completed':
                                 while len(row) < 10:
                                     row.append('')
                                 
-                                # Get client name from main clients spreadsheet
                                 client_name = self.get_client_name_by_id(row[1]) if len(row) > 1 else 'Unknown Client'
                                 
                                 task = {
@@ -911,7 +837,6 @@ Created By: {comm_data.get('created_by', 'System User')}
             return []
 
     def get_client_name_by_id(self, client_id):
-        """Helper function to get client name by ID"""
         try:
             clients = self.get_clients_enhanced()
             for client in clients:
@@ -923,7 +848,6 @@ Created By: {comm_data.get('created_by', 'System User')}
             return 'Unknown Client'
 
     def complete_task(self, task_id):
-        """Mark task as completed"""
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.tasks_spreadsheet_id,
@@ -934,9 +858,9 @@ Created By: {comm_data.get('created_by', 'System User')}
             for i, row in enumerate(values):
                 if len(row) > 0 and row[0] == task_id:
                     if len(row) > 7:
-                        row[7] = 'Completed'  # Status
+                        row[7] = 'Completed'
                     if len(row) > 9:
-                        row[9] = datetime.now().strftime('%Y-%m-%d')  # Completed date
+                        row[9] = datetime.now().strftime('%Y-%m-%d')
                     else:
                         row.append(datetime.now().strftime('%Y-%m-%d'))
 
@@ -956,7 +880,6 @@ Created By: {comm_data.get('created_by', 'System User')}
             return False
 
     def save_task_to_drive(self, client, task_data):
-        """Save task document to client's Tasks folder"""
         try:
             if not client.get('folder_id'):
                 return False
@@ -971,7 +894,6 @@ Created By: {comm_data.get('created_by', 'System User')}
 
             tasks_folder_id = folders[0]['id']
 
-            # Create task content with time tracking
             task_content = f"""TASK - {client['display_name']}
 Task ID: {task_data.get('task_id', '')}
 Created Date: {task_data.get('created_date', '')}
@@ -1006,10 +928,7 @@ Time Spent: {task_data.get('time_spent', 'Not tracked')}
             logger.error(f"Error saving task to drive: {e}")
             return False
 
-    # ==================== FACT FIND FUNCTIONS ====================
-
     def save_fact_find_to_drive(self, client, fact_find_data):
-        """Save fact find document to client's FF & ATR folder"""
         try:
             if not client.get('folder_id'):
                 return False

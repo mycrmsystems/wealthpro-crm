@@ -1,6 +1,6 @@
 """
 WealthPro CRM - Google Drive Integration Model
-EMERGENCY FIX - Extract folder IDs from jumbled data
+FINAL EMERGENCY FIX - RESTORE ALL CLIENTS AND FIX FOLDER LINKS
 """
 
 import os
@@ -377,84 +377,118 @@ class SimpleGoogleDrive:
             return False
 
     def get_clients_enhanced(self):
-        """EMERGENCY FIX - Extract folder IDs from jumbled data"""
+        """EMERGENCY RESTORE - Read all data from spreadsheet properly"""
         try:
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A2:A'
+                range='Sheet1!A:K'
             ).execute()
             values = result.get('values', [])
 
             clients = []
-            for row in values:
-                if row and row[0]:
-                    data_string = row[0]
+            for i, row in enumerate(values):
+                if i == 0:  # Skip header row
+                    continue
                     
-                    # Extract client data using simple pattern matching
-                    import re
-                    
-                    # Find client ID
-                    client_id_match = re.search(r'(WP\d{14})', data_string)
-                    if not client_id_match:
-                        continue
+                if row and len(row) > 0:
+                    # Handle both normal rows and jumbled data
+                    if len(row) >= 9 and not row[0].startswith('WP2025'):  # Normal formatted row
+                        while len(row) < 11:
+                            row.append('')
                         
-                    client_id = client_id_match.group(1)
-                    
-                    # Find folder ID (pattern: 1 followed by letters/numbers/underscores/dashes)
-                    folder_id_match = re.search(r'(1[A-Za-z0-9_-]{33})', data_string)
-                    folder_id = folder_id_match.group(1) if folder_id_match else None
-                    
-                    # Find email to help parse name
-                    email_match = re.search(r'([^@\s]+@[^@\s]+\.[^@\s]+)', data_string)
-                    if not email_match:
-                        continue
+                        try:
+                            portfolio_value = float(row[9]) if row[9] and str(row[9]).replace('.', '').isdigit() else 0.0
+                        except (ValueError, TypeError):
+                            portfolio_value = 0.0
                         
-                    # Extract name (should be before email)
-                    email_pos = data_string.find(email_match.group(1))
-                    before_email = data_string[:email_pos]
-                    
-                    # Get display name (last part before email, after client ID)
-                    name_part = before_email.replace(client_id, '', 1).strip()
-                    if name_part:
-                        if ',' in name_part:
-                            name_parts = name_part.split(',')
-                            display_name = name_parts[0].strip() + ', ' + name_parts[1].strip()
+                        client_data = {
+                            'client_id': row[0],
+                            'display_name': row[1],
+                            'first_name': row[2],
+                            'surname': row[3],
+                            'email': row[4],
+                            'phone': row[5],
+                            'status': row[6],
+                            'date_added': row[7],
+                            'folder_id': row[8],
+                            'portfolio_value': portfolio_value,
+                            'notes': row[10]
+                        }
+                    else:  # Jumbled data in first column OR single column data
+                        data_string = str(row[0])
+                        import re
+                        
+                        # Extract client ID
+                        client_id_match = re.search(r'(WP\d{14})', data_string)
+                        if not client_id_match:
+                            continue
+                        client_id = client_id_match.group(1)
+                        
+                        # Extract folder ID (pattern starts with 1 followed by 33 characters)
+                        folder_id_matches = re.findall(r'(1[A-Za-z0-9_-]{33})', data_string)
+                        folder_id = folder_id_matches[0] if folder_id_matches else None
+                        
+                        # Extract email
+                        email_match = re.search(r'([^@\s]+@[^@\s]+\.[^@\s]+)', data_string)
+                        email = email_match.group(1) if email_match else ''
+                        
+                        # Extract display name (between client ID and email)
+                        if email:
+                            email_pos = data_string.find(email)
+                            name_section = data_string[len(client_id):email_pos]
+                            # Clean up the name
+                            display_name = name_section.strip()
+                            # Remove any trailing numbers or unwanted characters
+                            display_name = re.sub(r'\d+$', '', display_name).strip()
                         else:
-                            display_name = name_part
-                    else:
-                        display_name = "Unknown Client"
+                            display_name = "Unknown Client"
+                        
+                        # Extract status
+                        status_match = re.search(r'(prospect|active|no_longer_client|deceased)', data_string, re.IGNORECASE)
+                        status = status_match.group(1).lower() if status_match else 'prospect'
+                        
+                        # Extract portfolio value (number at the end before any text)
+                        portfolio_matches = re.findall(r'(\d+)', data_string)
+                        portfolio_value = 0.0
+                        if portfolio_matches:
+                            # Get the last reasonable number (not phone, not client ID)
+                            for match in reversed(portfolio_matches):
+                                if len(match) <= 8 and not match.startswith('2025'):  # Reasonable portfolio value
+                                    portfolio_value = float(match)
+                                    break
+                        
+                        # Extract phone (sequence of digits, but not client ID or year)
+                        phone_matches = re.findall(r'(\d{8,15})', data_string)
+                        phone = ''
+                        if phone_matches:
+                            for p in phone_matches:
+                                if not p.startswith('WP') and not p.startswith('2025') and len(p) >= 8:
+                                    phone = p
+                                    break
+                        
+                        client_data = {
+                            'client_id': client_id,
+                            'display_name': display_name,
+                            'first_name': '',
+                            'surname': '',
+                            'email': email,
+                            'phone': phone,
+                            'status': status,
+                            'date_added': '2025-08-06',  # Default date
+                            'folder_id': folder_id,
+                            'portfolio_value': portfolio_value,
+                            'notes': ''
+                        }
                     
-                    # Extract status and portfolio value
-                    status_match = re.search(r'(prospect|active|no_longer_client|deceased)', data_string)
-                    status = status_match.group(1) if status_match else 'prospect'
-                    
-                    # Extract portfolio value (number followed by optional text)
-                    portfolio_match = re.search(r'(\d+)(?=\D*$)', data_string)
-                    portfolio_value = float(portfolio_match.group(1)) if portfolio_match else 0.0
-                    
-                    client_data = {
-                        'client_id': client_id,
-                        'display_name': display_name,
-                        'first_name': '',
-                        'surname': '',
-                        'email': email_match.group(1),
-                        'phone': '',
-                        'status': status,
-                        'date_added': '',
-                        'folder_id': folder_id,
-                        'portfolio_value': portfolio_value,
-                        'notes': ''
-                    }
-                    
-                    # Create folder URL
-                    if folder_id:
-                        client_data['folder_url'] = f"https://drive.google.com/drive/folders/{folder_id}"
+                    # Add folder URL if folder ID exists
+                    if client_data['folder_id']:
+                        client_data['folder_url'] = f"https://drive.google.com/drive/folders/{client_data['folder_id']}"
                     else:
                         client_data['folder_url'] = None
                     
                     clients.append(client_data)
 
-            logger.info(f"Extracted {len(clients)} clients with folder URLs")
+            logger.info(f"Successfully loaded {len(clients)} clients")
             return sorted(clients, key=lambda x: x['display_name'])
             
         except Exception as e:

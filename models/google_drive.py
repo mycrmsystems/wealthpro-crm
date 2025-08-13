@@ -12,6 +12,33 @@ import googleapiclient.http
 
 logger = logging.getLogger(__name__)
 
+# ────────────────────────────────────────────────────────────────────────────────
+# FIXED ROOT: your existing Drive folder ID (no slash)
+# If you ever want to move this to an env var instead, delete the hardcoded value
+# and set: ROOT_CLIENTS_FOLDER_ID = os.getenv("ROOT_CLIENTS_FOLDER_ID")
+# ────────────────────────────────────────────────────────────────────────────────
+ROOT_CLIENTS_FOLDER_ID = "1DzljucgOkvm7rpfSCiYP1zlsOpwtbaWh"
+SHARED_DRIVE_ID = os.getenv("SHARED_DRIVE_ID")  # leave empty if using My Drive
+USE_SHARED_DRIVE = bool(SHARED_DRIVE_ID)
+
+def _list_params():
+    """Shared-Drive safe params for files().list()"""
+    params = {"fields": "files(id,name,parents)"}
+    if USE_SHARED_DRIVE:
+        params.update({
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
+            "corpora": "drive",
+            "driveId": SHARED_DRIVE_ID,
+        })
+    return params
+
+def _get_kwargs_supports_all_drives(kwargs: dict):
+    """Add supportsAllDrives=True where required (get/update/create) on Shared Drives."""
+    if USE_SHARED_DRIVE:
+        kwargs["supportsAllDrives"] = True
+    return kwargs
+
 SPREADSHEET_ID = None
 PROFILES_SPREADSHEET_ID = None
 COMMUNICATIONS_SPREADSHEET_ID = None
@@ -36,19 +63,19 @@ class SimpleGoogleDrive:
             if not self.spreadsheet_id:
                 self.find_or_create_spreadsheet()
                 SPREADSHEET_ID = self.spreadsheet_id
-                
+
             if not self.profiles_spreadsheet_id:
                 self.find_or_create_profiles_spreadsheet()
                 PROFILES_SPREADSHEET_ID = self.profiles_spreadsheet_id
-                
+
             if not self.communications_spreadsheet_id:
                 self.find_or_create_communications_spreadsheet()
                 COMMUNICATIONS_SPREADSHEET_ID = self.communications_spreadsheet_id
-                
+
             if not self.tasks_spreadsheet_id:
                 self.find_or_create_tasks_spreadsheet()
                 TASKS_SPREADSHEET_ID = self.tasks_spreadsheet_id
-                
+
             logger.info(f"Setup complete - spreadsheet: {self.spreadsheet_id}")
         except Exception as e:
             logger.error(f"Setup error: {e}")
@@ -56,7 +83,7 @@ class SimpleGoogleDrive:
     def find_or_create_spreadsheet(self):
         try:
             query = "name='WealthPro CRM - Clients Data' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
+            results = self.service.files().list(q=query, **_list_params()).execute()
             spreadsheets = results.get('files', [])
 
             if spreadsheets:
@@ -70,9 +97,7 @@ class SimpleGoogleDrive:
 
     def create_new_spreadsheet(self):
         try:
-            spreadsheet = {
-                'properties': {'title': 'WealthPro CRM - Clients Data'}
-            }
+            spreadsheet = {'properties': {'title': 'WealthPro CRM - Clients Data'}}
             result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
             self.spreadsheet_id = result['spreadsheetId']
 
@@ -95,9 +120,9 @@ class SimpleGoogleDrive:
     def find_or_create_profiles_spreadsheet(self):
         try:
             query = "name='WealthPro CRM - Client Profiles' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
+            results = self.service.files().list(q=query, **_list_params()).execute()
             spreadsheets = results.get('files', [])
-            
+
             if spreadsheets:
                 self.profiles_spreadsheet_id = spreadsheets[0]['id']
                 logger.info(f"Found existing profiles spreadsheet: {self.profiles_spreadsheet_id}")
@@ -131,9 +156,9 @@ class SimpleGoogleDrive:
     def find_or_create_communications_spreadsheet(self):
         try:
             query = "name='WealthPro CRM - Communications' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
+            results = self.service.files().list(q=query, **_list_params()).execute()
             spreadsheets = results.get('files', [])
-            
+
             if spreadsheets:
                 self.communications_spreadsheet_id = spreadsheets[0]['id']
                 logger.info(f"Found existing communications spreadsheet: {self.communications_spreadsheet_id}")
@@ -150,7 +175,7 @@ class SimpleGoogleDrive:
             self.communications_spreadsheet_id = result['spreadsheetId']
 
             headers = [
-                'Communication ID', 'Client ID', 'Date', 'Type', 'Subject', 'Details', 
+                'Communication ID', 'Client ID', 'Date', 'Type', 'Subject', 'Details',
                 'Outcome', 'Follow Up Required', 'Follow Up Date', 'Created By'
             ]
 
@@ -165,9 +190,9 @@ class SimpleGoogleDrive:
     def find_or_create_tasks_spreadsheet(self):
         try:
             query = "name='WealthPro CRM - Tasks & Reminders' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
+            results = self.service.files().list(q=query, **_list_params()).execute()
             spreadsheets = results.get('files', [])
-            
+
             if spreadsheets:
                 self.tasks_spreadsheet_id = spreadsheets[0]['id']
                 logger.info(f"Found existing tasks spreadsheet: {self.tasks_spreadsheet_id}")
@@ -184,7 +209,7 @@ class SimpleGoogleDrive:
             self.tasks_spreadsheet_id = result['spreadsheetId']
 
             headers = [
-                'Task ID', 'Client ID', 'Task Type', 'Title', 'Description', 'Due Date', 
+                'Task ID', 'Client ID', 'Task Type', 'Title', 'Description', 'Due Date',
                 'Priority', 'Status', 'Created Date', 'Completed Date'
             ]
 
@@ -196,15 +221,24 @@ class SimpleGoogleDrive:
         except Exception as e:
             logger.error(f"Error creating tasks spreadsheet: {e}")
 
+    # ───────────────────────────────────────────
+    # FOLDERS
+    # ───────────────────────────────────────────
     def ensure_status_folders(self):
+        """Anchor under your fixed root; create status + A–Z parents as needed."""
         try:
-            if not hasattr(self, '_status_folders_created'):
-                self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
-                self.active_clients_folder_id = self.create_folder('Active Clients', self.main_folder_id)
-                self.former_clients_folder_id = self.create_folder('Former Clients', self.main_folder_id)
-                self.deceased_clients_folder_id = self.create_folder('Deceased Clients', self.main_folder_id)
-                self._status_folders_created = True
-                logger.info("Status folders created")
+            if getattr(self, "_status_folders_created", False):
+                return
+            # Anchor to your existing root by ID (never create a new root by name)
+            self.main_folder_id = ROOT_CLIENTS_FOLDER_ID
+
+            # Ensure status folders exist under root
+            self.active_clients_folder_id = self.create_folder('Active Clients', self.main_folder_id)
+            self.former_clients_folder_id = self.create_folder('Former Clients', self.main_folder_id)
+            self.deceased_clients_folder_id = self.create_folder('Deceased Clients', self.main_folder_id)
+
+            self._status_folders_created = True
+            logger.info("Status folders ensured under fixed root")
         except Exception as e:
             logger.error(f"Error creating status folders: {e}")
 
@@ -221,14 +255,19 @@ class SimpleGoogleDrive:
 
     def create_folder(self, name, parent_id):
         try:
+            q = [
+                "mimeType='application/vnd.google-apps.folder'",
+                "trashed=false",
+                f"name='{name}'",
+            ]
             if parent_id:
-                query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed=false"
-            else:
-                query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                q.append(f"'{parent_id}' in parents")
 
-            results = self.service.files().list(q=query, fields="files(id)").execute()
+            params = _list_params()
+            params["q"] = " and ".join(q)
+
+            results = self.service.files().list(**params).execute()
             folders = results.get('files', [])
-
             if folders:
                 return folders[0]['id']
 
@@ -239,7 +278,10 @@ class SimpleGoogleDrive:
             if parent_id:
                 folder_metadata['parents'] = [parent_id]
 
-            folder = self.service.files().create(body=folder_metadata, fields='id').execute()
+            create_kwargs = {"body": folder_metadata, "fields": "id"}
+            _get_kwargs_supports_all_drives(create_kwargs)
+
+            folder = self.service.files().create(**create_kwargs).execute()
             return folder.get('id')
         except Exception as e:
             logger.error(f"Error creating folder {name}: {e}")
@@ -254,7 +296,7 @@ class SimpleGoogleDrive:
 
             display_name = f"{surname}, {first_name}"
             client_folder_id = self.create_folder(display_name, letter_folder_id)
-            
+
             reviews_folder_id = self.create_folder("Reviews", client_folder_id)
 
             document_folders = [
@@ -263,7 +305,7 @@ class SimpleGoogleDrive:
             ]
 
             sub_folder_ids = {'Reviews': reviews_folder_id}
-            
+
             for doc_type in document_folders:
                 folder_id = self.create_folder(doc_type, client_folder_id)
                 sub_folder_ids[doc_type] = folder_id
@@ -274,7 +316,7 @@ class SimpleGoogleDrive:
 
             tasks_folder_id = self.create_folder("Tasks", client_folder_id)
             communications_folder_id = self.create_folder("Communications", client_folder_id)
-            
+
             sub_folder_ids['Tasks'] = tasks_folder_id
             sub_folder_ids['Communications'] = communications_folder_id
 
@@ -303,15 +345,19 @@ class SimpleGoogleDrive:
             letter = client['surname'][0].upper() if client['surname'] else 'Z'
             new_letter_folder_id = self.create_folder(letter, new_status_folder_id)
 
-            file = self.service.files().get(fileId=old_folder_id, fields='parents').execute()
+            get_kwargs = {"fileId": old_folder_id, "fields": "parents"}
+            _get_kwargs_supports_all_drives(get_kwargs)
+            file = self.service.files().get(**get_kwargs).execute()
             previous_parents = ",".join(file.get('parents', []))
 
-            self.service.files().update(
-                fileId=old_folder_id,
-                addParents=new_letter_folder_id,
-                removeParents=previous_parents,
-                fields='id, parents'
-            ).execute()
+            update_kwargs = {
+                "fileId": old_folder_id,
+                "addParents": new_letter_folder_id,
+                "removeParents": previous_parents,
+                "fields": "id, parents",
+            }
+            _get_kwargs_supports_all_drives(update_kwargs)
+            self.service.files().update(**update_kwargs).execute()
 
             logger.info(f"Successfully moved {client['display_name']} to {new_status}")
             return True
@@ -319,6 +365,9 @@ class SimpleGoogleDrive:
             logger.error(f"Error moving client folder: {e}")
             return False
 
+    # ───────────────────────────────────────────
+    # CLIENTS / SHEETS
+    # ───────────────────────────────────────────
     def add_client(self, client_data):
         try:
             values = [[
@@ -334,7 +383,7 @@ class SimpleGoogleDrive:
                 client_data.get('portfolio_value', 0),
                 client_data.get('notes', '')
             ]]
-            
+
             self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id,
                 range='Sheet1!A:K',
@@ -359,17 +408,17 @@ class SimpleGoogleDrive:
             for i, row in enumerate(values):
                 if i == 0:
                     continue
-                    
+
                 if row and len(row) > 0:
                     if len(row) >= 9:
                         while len(row) < 11:
                             row.append('')
-                        
+
                         try:
                             portfolio_value = float(row[9]) if row[9] and str(row[9]).replace('.', '').isdigit() else 0.0
                         except (ValueError, TypeError):
                             portfolio_value = 0.0
-                        
+
                         client_data = {
                             'client_id': row[0],
                             'display_name': row[1],
@@ -386,18 +435,18 @@ class SimpleGoogleDrive:
                     else:
                         data_string = str(row[0])
                         import re
-                        
+
                         client_id_match = re.search(r'(WP\d{14})', data_string)
                         if not client_id_match:
                             continue
                         client_id = client_id_match.group(1)
-                        
+
                         folder_id_matches = re.findall(r'(1[A-Za-z0-9_-]{33})', data_string)
                         folder_id = folder_id_matches[0] if folder_id_matches else None
-                        
+
                         email_match = re.search(r'([^@\s]+@[^@\s]+\.[^@\s]+)', data_string)
                         email = email_match.group(1) if email_match else ''
-                        
+
                         if email:
                             email_pos = data_string.find(email)
                             name_section = data_string[len(client_id):email_pos]
@@ -405,10 +454,10 @@ class SimpleGoogleDrive:
                             display_name = re.sub(r'\d+$', '', display_name).strip()
                         else:
                             display_name = "Unknown Client"
-                        
+
                         status_match = re.search(r'(prospect|active|no_longer_client|deceased)', data_string, re.IGNORECASE)
                         status = status_match.group(1).lower() if status_match else 'prospect'
-                        
+
                         portfolio_matches = re.findall(r'(\d+)', data_string)
                         portfolio_value = 0.0
                         if portfolio_matches:
@@ -416,7 +465,7 @@ class SimpleGoogleDrive:
                                 if len(match) <= 8 and not match.startswith('2025'):
                                     portfolio_value = float(match)
                                     break
-                        
+
                         phone_matches = re.findall(r'(\d{8,15})', data_string)
                         phone = ''
                         if phone_matches:
@@ -424,7 +473,7 @@ class SimpleGoogleDrive:
                                 if not p.startswith('WP') and not p.startswith('2025') and len(p) >= 8:
                                     phone = p
                                     break
-                        
+
                         client_data = {
                             'client_id': client_id,
                             'display_name': display_name,
@@ -438,17 +487,13 @@ class SimpleGoogleDrive:
                             'portfolio_value': portfolio_value,
                             'notes': ''
                         }
-                    
-                    if client_data['folder_id']:
-                        client_data['folder_url'] = f"https://drive.google.com/drive/folders/{client_data['folder_id']}"
-                    else:
-                        client_data['folder_url'] = None
-                    
+
+                    client_data['folder_url'] = f"https://drive.google.com/drive/folders/{client_data['folder_id']}" if client_data['folder_id'] else None
                     clients.append(client_data)
 
             logger.info(f"Successfully loaded {len(clients)} clients")
             return sorted(clients, key=lambda x: x['display_name'])
-            
+
         except Exception as e:
             logger.error(f"Error getting clients: {e}")
             return []
@@ -510,10 +555,9 @@ class SimpleGoogleDrive:
                     ).execute()
 
             if client.get('folder_id'):
-                self.service.files().update(
-                    fileId=client['folder_id'],
-                    body={'trashed': True}
-                ).execute()
+                kwargs = {"fileId": client['folder_id'], "body": {'trashed': True}}
+                _get_kwargs_supports_all_drives(kwargs)
+                self.service.files().update(**kwargs).execute()
                 logger.info(f"Trashed folder for {client['display_name']}")
 
             return True
@@ -521,6 +565,9 @@ class SimpleGoogleDrive:
             logger.error(f"Error deleting client: {e}")
             return False
 
+    # ───────────────────────────────────────────
+    # PROFILES
+    # ───────────────────────────────────────────
     def add_client_profile(self, profile_data):
         try:
             values = [list(profile_data.values())]
@@ -548,7 +595,7 @@ class SimpleGoogleDrive:
                 if len(row) > 0 and row[0] == client_id:
                     while len(row) < 19:
                         row.append('')
-                    
+
                     return {
                         'client_id': row[0],
                         'address_line_1': row[1],
@@ -600,6 +647,9 @@ class SimpleGoogleDrive:
             logger.error(f"Error updating client profile: {e}")
             return False
 
+    # ───────────────────────────────────────────
+    # COMMUNICATIONS
+    # ───────────────────────────────────────────
     def add_communication_enhanced(self, comm_data, client_data):
         try:
             values = [list(comm_data.values())]
@@ -609,9 +659,9 @@ class SimpleGoogleDrive:
                 valueInputOption='RAW',
                 body={'values': values}
             ).execute()
-            
+
             self.save_communication_to_drive(client_data, comm_data)
-            
+
             logger.info(f"Added enhanced communication for client: {comm_data.get('client_id')}")
             return True
         except Exception as e:
@@ -631,7 +681,7 @@ class SimpleGoogleDrive:
                 if len(row) > 1 and row[1] == client_id:
                     while len(row) < 10:
                         row.append('')
-                    
+
                     communications.append({
                         'communication_id': row[0],
                         'client_id': row[1],
@@ -656,7 +706,7 @@ class SimpleGoogleDrive:
                 return False
 
             query = f"name='Communications' and '{client['folder_id']}' in parents and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id)").execute()
+            results = self.service.files().list(q=query, **_list_params()).execute()
             folders = results.get('files', [])
 
             if not folders:
@@ -689,11 +739,9 @@ Created By: {comm_data.get('created_by', 'System User')}
                 mimetype='text/plain'
             )
 
-            self.service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id'
-            ).execute()
+            kwargs = {"body": file_metadata, "media_body": media, "fields": "id"}
+            _get_kwargs_supports_all_drives(kwargs)
+            self.service.files().create(**kwargs).execute()
 
             logger.info(f"Saved communication to Google Drive for {client['display_name']}")
             return True
@@ -701,6 +749,9 @@ Created By: {comm_data.get('created_by', 'System User')}
             logger.error(f"Error saving communication to drive: {e}")
             return False
 
+    # ───────────────────────────────────────────
+    # TASKS
+    # ───────────────────────────────────────────
     def add_task_enhanced(self, task_data, client_data):
         try:
             task_row = [
@@ -715,18 +766,18 @@ Created By: {comm_data.get('created_by', 'System User')}
                 task_data.get('created_date', datetime.now().strftime('%Y-%m-%d')),
                 task_data.get('completed_date', '')
             ]
-            
+
             result = self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.tasks_spreadsheet_id,
                 range='Sheet1!A:J',
                 valueInputOption='RAW',
                 body={'values': [task_row]}
             ).execute()
-            
+
             logger.info(f"Task saved to spreadsheet: {result}")
-            
+
             self.save_task_to_drive(client_data, task_data)
-            
+
             logger.info(f"Added enhanced task for client: {task_data.get('client_id')}")
             return True
         except Exception as e:
@@ -746,7 +797,7 @@ Created By: {comm_data.get('created_by', 'System User')}
                 if len(row) > 1 and row[1] == client_id:
                     while len(row) < 10:
                         row.append('')
-                    
+
                     tasks.append({
                         'task_id': row[0],
                         'client_id': row[1],
@@ -770,7 +821,7 @@ Created By: {comm_data.get('created_by', 'System User')}
             if not self.tasks_spreadsheet_id:
                 logger.error("Tasks spreadsheet ID not found")
                 return []
-                
+
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=self.tasks_spreadsheet_id,
                 range='Sheet1!A2:J'
@@ -792,22 +843,22 @@ Created By: {comm_data.get('created_by', 'System User')}
                     try:
                         due_date_str = row[5].strip()
                         due_date = None
-                        
+
                         for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d']:
                             try:
                                 due_date = datetime.strptime(due_date_str, fmt).date()
                                 break
                             except ValueError:
                                 continue
-                        
+
                         if due_date and today <= due_date <= future_date:
                             status = row[7] if len(row) > 7 else 'Pending'
                             if status.lower() != 'completed':
                                 while len(row) < 10:
                                     row.append('')
-                                
+
                                 client_name = self.get_client_name_by_id(row[1]) if len(row) > 1 else 'Unknown Client'
-                                
+
                                 task = {
                                     'task_id': row[0],
                                     'client_id': row[1],
@@ -824,14 +875,14 @@ Created By: {comm_data.get('created_by', 'System User')}
                                 }
                                 upcoming_tasks.append(task)
                                 logger.info(f"Found upcoming task: {task['title']} for {client_name}")
-                                
+
                     except Exception as e:
                         logger.error(f"Error processing task row {i}: {e}")
                         continue
 
             logger.info(f"Found {len(upcoming_tasks)} upcoming tasks")
             return sorted(upcoming_tasks, key=lambda x: x['due_date_obj'])
-            
+
         except Exception as e:
             logger.error(f"Error getting upcoming tasks: {e}")
             return []
@@ -885,7 +936,7 @@ Created By: {comm_data.get('created_by', 'System User')}
                 return False
 
             query = f"name='Tasks' and '{client['folder_id']}' in parents and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id)").execute()
+            results = self.service.files().list(q=query, **_list_params()).execute()
             folders = results.get('files', [])
 
             if not folders:
@@ -916,11 +967,9 @@ Time Spent: {task_data.get('time_spent', 'Not tracked')}
                 mimetype='text/plain'
             )
 
-            self.service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id'
-            ).execute()
+            kwargs = {"body": file_metadata, "media_body": media, "fields": "id"}
+            _get_kwargs_supports_all_drives(kwargs)
+            self.service.files().create(**kwargs).execute()
 
             logger.info(f"Saved task to Google Drive for {client['display_name']}")
             return True
@@ -928,13 +977,16 @@ Time Spent: {task_data.get('time_spent', 'Not tracked')}
             logger.error(f"Error saving task to drive: {e}")
             return False
 
+    # ───────────────────────────────────────────
+    # FACT FIND
+    # ───────────────────────────────────────────
     def save_fact_find_to_drive(self, client, fact_find_data):
         try:
             if not client.get('folder_id'):
                 return False
 
             query = f"name='FF & ATR' and '{client['folder_id']}' in parents and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id)").execute()
+            results = self.service.files().list(q=query, **_list_params()).execute()
             folders = results.get('files', [])
 
             if not folders:
@@ -965,11 +1017,9 @@ Investment Experience: {fact_find_data.get('investment_experience', 'N/A')}
                 mimetype='text/plain'
             )
 
-            self.service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id'
-            ).execute()
+            kwargs = {"body": file_metadata, "media_body": media, "fields": "id"}
+            _get_kwargs_supports_all_drives(kwargs)
+            self.service.files().create(**kwargs).execute()
 
             logger.info(f"Saved fact find for {client['display_name']}")
             return True

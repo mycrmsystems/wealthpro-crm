@@ -1,8 +1,14 @@
 """
 WealthPro CRM - Google Drive Integration Model
-- Saves new tasks to Tasks/Ongoing
-- On completion, moves file to Tasks/Completed and prefixes name with [Task Complete]
-- Robust deletes and optional Shared Drive support
+
+What’s included:
+- Fixed Google Drive root (your clients folder) via ROOT_CLIENTS_FOLDER_ID
+- Client A–Z foldering by status
+- Reviews: auto-create "Review {YEAR}" with subfolders you specified
+- Two Word (.docx) templates in "Agenda & Valuation" with client name + today’s date
+- Tasks saved to Tasks/Ongoing; on completion move to Tasks/Completed and rename with [Task Complete]
+- "Review" pack creator + auto-create review task in Sheets and Drive
+- Resilient deletes and Shared-Drive-safe operations
 """
 
 import os
@@ -13,15 +19,22 @@ from googleapiclient.discovery import build
 import googleapiclient.http
 from googleapiclient.errors import HttpError
 
+# DOCX support
+try:
+    from docx import Document
+    from docx.shared import Pt
+    DOCX_AVAILABLE = True
+except Exception:
+    DOCX_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# FIXED ROOT FOLDER (provided by you)
-# This is the Google Drive folder that contains your client sections (Active/Former/Deceased)
+# YOUR ROOT CLIENTS FOLDER (already provided by you previously)
 # ────────────────────────────────────────────────────────────────────────────────
 ROOT_CLIENTS_FOLDER_ID = "1DzljucgOkvm7rpfSCiYP1zlsOpwtbaWh"
 
-# Optional: If your folder is on a Shared Drive, set SHARED_DRIVE_ID as an env var in Render
+# Optional: Shared Drive support (set SHARED_DRIVE_ID in the environment on Render)
 SHARED_DRIVE_ID = os.getenv("SHARED_DRIVE_ID")
 USE_SHARED_DRIVE = bool(SHARED_DRIVE_ID)
 
@@ -51,7 +64,7 @@ def _safe_dateparse(s):
             continue
     return None
 
-# Sheet IDs cached globally per process (reduces API calls)
+# Cached IDs (reduce API calls)
 SPREADSHEET_ID = None
 PROFILES_SPREADSHEET_ID = None
 COMMUNICATIONS_SPREADSHEET_ID = None
@@ -228,6 +241,140 @@ class SimpleGoogleDrive:
         return self.create_folder(sub_name, parent_id)
 
     # ───────────────────────────────────────────
+    # Reviews: year structure + .docx templates
+    # ───────────────────────────────────────────
+    def _docx_bytes(self, title: str, client_display_name: str):
+        """
+        Build a simple .docx with heading + metadata + placeholder sections.
+        (Editable in Word afterwards.)
+        """
+        if not DOCX_AVAILABLE:
+            logger.warning("python-docx not installed; skipping .docx generation.")
+            return None
+
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        year = datetime.now().year
+
+        doc = Document()
+        h = doc.add_heading(title, 0)
+        for run in h.runs:
+            run.font.size = Pt(20)
+
+        # Meta
+        doc.add_paragraph(f"Client: {client_display_name}")
+        doc.add_paragraph(f"Date: {today_str}")
+        doc.add_paragraph(f"Review Year: {year}")
+
+        doc.add_paragraph("")  # spacing
+
+        # Light placeholder sections users can edit later
+        if "Agenda" in title:
+            doc.add_heading("Agenda", level=1)
+            doc.add_paragraph("1) Welcome & objectives")
+            doc.add_paragraph("2) Portfolio performance & valuation")
+            doc.add_paragraph("3) Risk profile and capacity for loss")
+            doc.add_paragraph("4) Changes in circumstances")
+            doc.add_paragraph("5) Recommendations & next steps")
+        else:
+            doc.add_heading("Valuation Summary", level=1)
+            doc.add_paragraph("• Plan list and current valuations")
+            doc.add_paragraph("• Contributions/withdrawals since last review")
+            doc.add_paragraph("• Asset allocation overview")
+            doc.add_paragraph("• Fees summary")
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf
+
+    def _upload_docx(self, parent_folder_id: str, filename: str, file_like: io.BytesIO):
+        file_metadata = {'name': filename, 'parents': [parent_folder_id]}
+        media = googleapiclient.http.MediaIoBaseUpload(
+            file_like,
+            mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        )
+        kwargs = {"body": file_metadata, "media_body": media, "fields": "id"}
+        _supports_all_drives(kwargs)
+        self.service.files().create(**kwargs).execute()
+
+    def _get_or_create_review_year_structure(self, reviews_folder_id: str):
+        """
+        Inside Reviews/, create/find 'Review {YEAR}' and the required subfolders.
+        Returns: (year_folder_id, subfolder_ids_dict)
+        """
+        year = datetime.now().year
+        year_folder_name = f"Review {year}"
+        year_folder_id = self.create_folder(year_folder_name, reviews_folder_id)
+
+        subfolders = [
+            "Agenda & Valuation",
+            "FF&ATR",
+            "ID&V & Sanction Search",
+            "Meeting Notes",
+            "Research",
+            "Review Letter",
+            "Client Confirmation",
+            "Emails",
+        ]
+        ids = {}
+        for name in subfolders:
+            ids[name] = self.create_folder(name, year_folder_id)
+
+        return year_folder_id, ids
+
+    def _create_review_templates(self, client_display_name: str, agenda_val_folder_id: str):
+        """Create the two Word templates in 'Agenda & Valuation' with client name & date."""
+        year = datetime.now().year
+        if not DOCX_AVAILABLE:
+            logger.info("Skipping .docx template creation (python-docx not available).")
+            return
+
+        # Meeting Agenda
+        agenda_stream = self._docx_bytes("Meeting Agenda", client_display_name)
+        if agenda_stream:
+            self._upload_docx(
+                agenda_val_folder_id,
+                f"Meeting Agenda – {client_display_name} – {year}.docx",
+                agenda_stream
+            )
+
+        # Valuation Summary
+        valuation_stream = self._docx_bytes("Valuation Summary", client_display_name)
+        if valuation_stream:
+            self._upload_docx(
+                agenda_val_folder_id,
+                f"Valuation Summary – {client_display_name} – {year}.docx",
+                valuation_stream
+            )
+
+    def create_review_pack_for_client(self, client):
+        """
+        Public method used by the Review button:
+        - ensures Reviews/Review {YEAR} structure
+        - drops the two .docx templates in Agenda & Valuation
+        """
+        try:
+            if not client.get('folder_id'):
+                return False
+
+            # Ensure Reviews/ exists
+            reviews_q = f"name='Reviews' and '{client['folder_id']}' in parents and trashed=false"
+            params = _list_params(); params["q"] = reviews_q
+            revs = self.service.files().list(**params).execute().get('files', [])
+            if revs:
+                reviews_id = revs[0]['id']
+            else:
+                reviews_id = self.create_folder("Reviews", client['folder_id'])
+
+            # Ensure Review {YEAR} & subfolders, then create templates
+            year_folder_id, ids = self._get_or_create_review_year_structure(reviews_id)
+            self._create_review_templates(client['display_name'], ids["Agenda & Valuation"])
+            return True
+        except Exception as e:
+            logger.error(f"create_review_pack_for_client: {e}")
+            return False
+
+    # ───────────────────────────────────────────
     # Client folders & sheet
     # ───────────────────────────────────────────
     def create_client_folder_enhanced(self, first_name, surname, status='prospect'):
@@ -240,7 +387,15 @@ class SimpleGoogleDrive:
             display_name = f"{surname}, {first_name}"
             client_folder_id = self.create_folder(display_name, letter_folder_id)
 
+            # Reviews root & this-year structure + templates
             reviews_folder_id = self.create_folder("Reviews", client_folder_id)
+            try:
+                year_folder_id, ids = self._get_or_create_review_year_structure(reviews_folder_id)
+                self._create_review_templates(display_name, ids["Agenda & Valuation"])
+            except Exception as e:
+                logger.warning(f"Could not create Review year structure: {e}")
+
+            # Legacy doc folders at client root
             document_folders = [
                 "ID&V", "FF & ATR", "Research", "LOAs", "Suitability Letter",
                 "Meeting Notes", "Terms of Business", "Policy Information", "Valuation"
@@ -316,7 +471,7 @@ class SimpleGoogleDrive:
             ]]
             self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id, range='Sheet1!A:K',
-                valueInputOption='RAW', body={'values': values}
+                valueInputOption='RAW', body={'values': [values[0]]}
             ).execute()
             return True
         except Exception as e:
@@ -627,7 +782,7 @@ Completed Date: {task_data.get('completed_date', '')}
             return []
 
     # ───────────────────────────────────────────
-    # Communications & Fact Find (unchanged logic)
+    # Communications & Fact Find
     # ───────────────────────────────────────────
     def add_communication_enhanced(self, comm_data, client_data):
         try:
@@ -724,4 +879,29 @@ Investment Experience: {fact_find_data.get('investment_experience', 'N/A')}
             return True
         except Exception as e:
             logger.error(f"save_fact_find_to_drive: {e}")
+            return False
+
+    # ───────────────────────────────────────────
+    # Review task (for the Review button)
+    # ───────────────────────────────────────────
+    def create_review_task(self, client, due_in_days=14):
+        """Create a task for the client review in Sheets and save task file to Drive."""
+        try:
+            task_data = {
+                'task_id': f"TSK{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                'client_id': client['client_id'],
+                'task_type': 'Review',
+                'title': f"Annual Review – {client['display_name']}",
+                'description': 'Prepare and conduct annual review meeting',
+                'due_date': (datetime.now() + timedelta(days=due_in_days)).strftime('%Y-%m-%d'),
+                'priority': 'Medium',
+                'status': 'Pending',
+                'created_date': datetime.now().strftime('%Y-%m-%d'),
+                'completed_date': '',
+                'time_spent': ''
+            }
+            self.add_task_enhanced(task_data, client)
+            return True
+        except Exception as e:
+            logger.error(f"create_review_task: {e}")
             return False

@@ -1,135 +1,179 @@
 # models/google_drive.py
 import io
+import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from google.oauth2.credentials import Credentials
-
-from docx import Document
 
 logger = logging.getLogger(__name__)
 
-def _today_str(fmt="%Y-%m-%d"):
-    return datetime.now().strftime(fmt)
-
-def _this_year() -> int:
-    return datetime.now().year
-
-def _safe(s: Optional[str]) -> str:
-    return s if s else ""
-
-def _name_for_drive(first_name: str, surname: str) -> str:
-    return f"{_safe(surname).strip()}, {_safe(first_name).strip()}".strip(", ").strip()
-
-def _ensure_fields(d: dict, keys: List[str]):
-    for k in keys:
-        d.setdefault(k, "")
 
 class SimpleGoogleDrive:
-    # >>>> Set to your WealthPro root folder ID on Drive <<<<
-    ROOT_FOLDER_ID = "1DzljucgOkvm7rpfSCiYP1zlsOpwtbaWh"
+    """
+    Thin wrapper around Google Drive (and optionally Sheets) for WealthPro CRM.
 
-    BUCKETS = {
-        "active": "Active Clients",
-        "prospect": "Prospects",
-        "no_longer_client": "Former Clients",
-        "deceased": "Deceased Clients",
-    }
-
-    CLIENT_SUBFOLDERS = [
-        "Reviews",
-        "ID&V",
-        "FF & ATR",
-        "Research",
-        "LOAs",
-        "Suitability Letter",
-        "Meeting Notes",
-        "Terms of Business",
-        "Policy Information",
-        "Valuation",
-        "Tasks",
-        "Communications",
-    ]
-
-    TASKS_ONGOING = "Ongoing Tasks"
-    TASKS_COMPLETED = "Completed Tasks"
-
-    REVIEW_YEAR_SUBS = [
-        "Agenda & Valuation",
-        "FF&ATR",
-        "ID&V & Sanction Search",
-        "Meeting Notes",
-        "Research",
-        "Review Letter",
-        "Client Confirmation",
-        "Emails",
-        "Review Letter",
-    ]
-
-    PROFILE_FILENAME = "_profile.txt"
+    Folder layout (per client):
+      <ROOT>/
+        <Client Display Name>/                         (client_root)
+          meta.json                                    (client metadata)
+          Communications/
+            communications.json
+          Tasks/
+            Ongoing Tasks/
+              <task_id>.txt
+            Completed Tasks/
+              COMPLETED - <task_id>.txt
+            tasks.json                                 (all tasks list)
+          Reviews/
+            Review <YEAR>/
+              Agenda & Valuation/
+              FF&ATR/
+              ID&V & Sanction Search/
+              Meeting Notes/
+              Research/
+              Review Letter/
+              Client Confirmation/
+              Emails/
+              Review Letter/       (duplicate kept per your original spec)
+    """
 
     def __init__(self, credentials: Credentials):
-        self.credentials = credentials
-        # keep memory usage low on Render free tier
+        # Disable discovery caching to reduce memory and avoid cache warnings
         self.drive = build("drive", "v3", credentials=credentials, cache_discovery=False)
+        # self.sheets = build("sheets", "v4", credentials=credentials, cache_discovery=False)  # if needed later
+
+        # Base folder id must be set as an environment variable in Render
+        import os
+
+        self.root_folder_id = os.environ.get("GDRIVE_ROOT_FOLDER_ID")
+        if not self.root_folder_id:
+            raise RuntimeError(
+                "GDRIVE_ROOT_FOLDER_ID is not set. Please set the Google Drive base folder ID in Render env vars."
+            )
+
         logger.info("Google Drive/Sheets setup complete.")
 
-    # --------- Low-level Drive helpers ---------
+    # ---------------------------------------------------------------------
+    # Low-level helpers
+    # ---------------------------------------------------------------------
+    def _create_folder(self, name: str, parent_id: str) -> Optional[str]:
+        """Create a folder under parent_id and return its file id."""
+        try:
+            file_metadata = {
+                "name": name,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent_id],
+            }
+            f = self.drive.files().create(body=file_metadata, fields="id,name").execute()
+            return f.get("id")
+        except HttpError as e:
+            logger.error(f"_create_folder error: {e}")
+            return None
 
     def _find_folder(self, name: str, parent_id: str) -> Optional[str]:
+        """Find a subfolder by name under parent_id (safe against quotes)."""
         try:
+            safe_name = name.replace("'", "\\'")
             q = (
-                f"mimeType='application/vnd.google-apps.folder' "
-                f"and name='{name.replace(\"'\", \"\\'\")}' "
+                "mimeType='application/vnd.google-apps.folder' "
+                f"and name='{safe_name}' "
                 f"and '{parent_id}' in parents and trashed=false"
             )
-            resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=1).execute()
+            resp = self.drive.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
             files = resp.get("files", [])
             return files[0]["id"] if files else None
         except HttpError as e:
             logger.error(f"_find_folder error: {e}")
             return None
 
-    def _create_folder(self, name: str, parent_id: str) -> Optional[str]:
-        try:
-            meta = {
-                "name": name,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [parent_id],
-            }
-            f = self.drive.files().create(body=meta, fields="id").execute()
-            return f.get("id")
-        except HttpError as e:
-            logger.error(f"_create_folder error creating {name}: {e}")
-            return None
-
-    def _ensure_folder(self, name: str, parent_id: str) -> Optional[str]:
+    def _find_or_create_folder(self, name: str, parent_id: str) -> Optional[str]:
         fid = self._find_folder(name, parent_id)
-        return fid or self._create_folder(name, parent_id)
+        if fid:
+            return fid
+        return self._create_folder(name, parent_id)
 
     def _find_file_in_folder(self, name: str, parent_id: str) -> Optional[str]:
+        """Find a file by name under parent_id."""
         try:
-            q = f"name='{name.replace(\"'\", \"\\'\")}' and '{parent_id}' in parents and trashed=false"
-            resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=1).execute()
+            safe_name = name.replace("'", "\\'")
+            q = f"name='{safe_name}' and '{parent_id}' in parents and trashed=false"
+            resp = self.drive.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
             files = resp.get("files", [])
             return files[0]["id"] if files else None
         except HttpError as e:
             logger.error(f"_find_file_in_folder error: {e}")
             return None
 
-    def _upload_bytes(self, name: str, parent_id: str, buf: io.BytesIO, mimetype: str) -> Optional[str]:
+    def _upload_json(self, name: str, data: dict, parent_id: str) -> Optional[str]:
+        """Create a JSON file under parent_id."""
         try:
-            media = MediaIoBaseUpload(buf, mimetype=mimetype, resumable=False)
-            meta = {"name": name, "parents": [parent_id]}
-            f = self.drive.files().create(body=meta, media_body=media, fields="id").execute()
+            body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+            media = MediaIoBaseUpload(io.BytesIO(body), mimetype="application/json", resumable=False)
+            file_metadata = {"name": name, "parents": [parent_id]}
+            f = self.drive.files().create(body=file_metadata, media_body=media, fields="id,name").execute()
             return f.get("id")
         except HttpError as e:
-            logger.error(f"_upload_bytes error {name}: {e}")
+            logger.error(f"_upload_json error: {e}")
             return None
+
+    def _update_json_file(self, file_id: str, data: dict) -> bool:
+        """Overwrite an existing JSON file by id."""
+        try:
+            body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+            media = MediaIoBaseUpload(io.BytesIO(body), mimetype="application/json", resumable=False)
+            self.drive.files().update(fileId=file_id, media_body=media).execute()
+            return True
+        except HttpError as e:
+            logger.error(f"_update_json_file error: {e}")
+            return False
+
+    def _download_json(self, file_id: str) -> Optional[dict]:
+        """Download and parse JSON file."""
+        try:
+            request = self.drive.files().get_media(fileId=file_id)
+            buf = io.BytesIO()
+            downloader = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            buf.seek(0)
+            return json.load(io.TextIOWrapper(buf, encoding="utf-8"))
+        except HttpError as e:
+            logger.error(f"_download_json error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"_download_json parse error: {e}")
+            return None
+
+    def _upload_text(self, name: str, content: str, parent_id: str) -> Optional[str]:
+        """Create a text/plain file under parent_id."""
+        try:
+            media = MediaIoBaseUpload(io.BytesIO(content.encode("utf-8")), mimetype="text/plain", resumable=False)
+            file_metadata = {"name": name, "parents": [parent_id]}
+            f = self.drive.files().create(body=file_metadata, media_body=media, fields="id,name,parents").execute()
+            return f.get("id")
+        except HttpError as e:
+            logger.error(f"_upload_text error: {e}")
+            return None
+
+    def _move_file(self, file_id: str, new_parent_id: str) -> bool:
+        """Move file to another folder (replace all parents)."""
+        try:
+            # First, get current parents
+            file_obj = self.drive.files().get(fileId=file_id, fields="parents").execute()
+            prev_parents = ",".join(file_obj.get("parents", []))
+            self.drive.files().update(
+                fileId=file_id, addParents=new_parent_id, removeParents=prev_parents, fields="id, parents"
+            ).execute()
+            return True
+        except HttpError as e:
+            logger.error(f"_move_file error: {e}")
+            return False
 
     def _rename_file(self, file_id: str, new_name: str) -> bool:
         try:
@@ -139,486 +183,366 @@ class SimpleGoogleDrive:
             logger.error(f"_rename_file error: {e}")
             return False
 
-    def _move_file(self, file_id: str, old_parent_id: str, new_parent_id: str) -> bool:
+    # ---------------------------------------------------------------------
+    # Client helpers
+    # ---------------------------------------------------------------------
+    def _ensure_client_structure(self, display_name: str) -> Tuple[str, Dict[str, str]]:
+        """
+        Ensure client folder exists with required subfolders/files.
+        Returns: (client_folder_id, subfolder_ids dict)
+        """
+        client_folder_id = self._find_or_create_folder(display_name, self.root_folder_id)
+
+        # Communications
+        comms_id = self._find_or_create_folder("Communications", client_folder_id)
+        if self._find_file_in_folder("communications.json", comms_id) is None:
+            self._upload_json("communications.json", [], comms_id)
+
+        # Tasks + subfolders
+        tasks_root_id = self._find_or_create_folder("Tasks", client_folder_id)
+        ongoing_id = self._find_or_create_folder("Ongoing Tasks", tasks_root_id)
+        completed_id = self._find_or_create_folder("Completed Tasks", tasks_root_id)
+        if self._find_file_in_folder("tasks.json", tasks_root_id) is None:
+            self._upload_json("tasks.json", [], tasks_root_id)
+
+        # Reviews
+        reviews_id = self._find_or_create_folder("Reviews", client_folder_id)
+
+        # Meta
+        if self._find_file_in_folder("meta.json", client_folder_id) is None:
+            meta = {
+                "display_name": display_name,
+                "folder_id": client_folder_id,
+                "created": datetime.utcnow().isoformat(),
+            }
+            self._upload_json("meta.json", meta, client_folder_id)
+
+        return client_folder_id, {
+            "communications": comms_id,
+            "tasks_root": tasks_root_id,
+            "tasks_ongoing": ongoing_id,
+            "tasks_completed": completed_id,
+            "reviews": reviews_id,
+        }
+
+    def _get_client_folder_by_id(self, client_id: str) -> Optional[str]:
+        """
+        We store client_id inside meta.json of each client folder. To find a client by id,
+        scan direct children under root and read meta.json. (Kept simple; root usually holds only client folders.)
+        """
         try:
-            self.drive.files().update(
-                fileId=file_id,
-                addParents=new_parent_id,
-                removeParents=old_parent_id,
-                fields="id, parents",
-            ).execute()
-            return True
+            q = f"'{self.root_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            page_token = None
+            while True:
+                resp = self.drive.files().list(
+                    q=q, fields="nextPageToken, files(id,name)", pageSize=100, pageToken=page_token
+                ).execute()
+                for it in resp.get("files", []):
+                    # Read meta.json if present
+                    meta_id = self._find_file_in_folder("meta.json", it["id"])
+                    if meta_id:
+                        meta = self._download_json(meta_id) or {}
+                        if meta.get("client_id") == client_id:
+                            return it["id"]
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+            return None
         except HttpError as e:
-            logger.error(f"_move_file error: {e}")
-            return False
-
-    def _get_web_link(self, file_or_folder_id: str) -> str:
-        try:
-            f = self.drive.files().get(fileId=file_or_folder_id, fields="webViewLink").execute()
-            return f.get("webViewLink", "")
-        except HttpError as e:
-            logger.error(f"_get_web_link error: {e}")
-            return ""
-
-    # --------- Client listing / CRUD ---------
-
-    def _ensure_status_buckets(self) -> Dict[str, str]:
-        ids = {}
-        for key, name in self.BUCKETS.items():
-            fid = self._ensure_folder(name, self.ROOT_FOLDER_ID)
-            if not fid:
-                logger.error(f"Could not ensure bucket: {name}")
-            ids[key] = fid
-        return ids
+            logger.error(f"_get_client_folder_by_id error: {e}")
+            return None
 
     def get_clients_enhanced(self) -> List[dict]:
-        results = []
-        buckets = self._ensure_status_buckets()
-
-        for status_key, bucket_id in buckets.items():
-            if not bucket_id:
-                continue
-            try:
-                q = f"mimeType='application/vnd.google-apps.folder' and '{bucket_id}' in parents and trashed=false"
-                resp = self.drive.files().list(q=q, fields="files(id, name, createdTime)", pageSize=200).execute()
-                for f in resp.get("files", []):
-                    display_name = f["name"]
-                    created = f.get("createdTime", "")[:19].replace(":", "").replace("-", "").replace("T", "")
-                    client_id = f"WP{created}"
-                    results.append({
-                        "client_id": client_id,
-                        "display_name": display_name,
-                        "first_name": display_name.split(", ")[1] if ", " in display_name else display_name,
-                        "surname": display_name.split(", ")[0] if ", " in display_name else display_name,
-                        "email": "",
-                        "phone": "",
-                        "status": status_key,
-                        "date_added": _today_str(),
-                        "folder_id": f["id"],
-                        "folder_url": self._get_web_link(f["id"]),
-                        "portfolio_value": 0.0,
-                        "notes": "",
-                    })
-            except HttpError as e:
-                logger.error(f"get_clients_enhanced: listing error: {e}")
-
-        results.sort(key=lambda c: c["display_name"].lower())
-        return results
-
-    def create_client_folder_enhanced(self, first_name: str, surname: str, status: str) -> Optional[dict]:
-        buckets = self._ensure_status_buckets()
-        parent = buckets.get(status, buckets.get("prospect"))
-        if not parent:
-            return None
-
-        display = _name_for_drive(first_name, surname)
-        client_folder_id = self._ensure_folder(display, parent)
-        if not client_folder_id:
-            return None
-
-        for sub in self.CLIENT_SUBFOLDERS:
-            self._ensure_folder(sub, client_folder_id)
-
-        tasks_id = self._ensure_folder("Tasks", client_folder_id)
-        if tasks_id:
-            self._ensure_folder(self.TASKS_ONGOING, tasks_id)
-            self._ensure_folder(self.TASKS_COMPLETED, tasks_id)
-
-        logger.info(f"Created enhanced client folder for {display} in active section")
-        return {
-            "client_folder_id": client_folder_id,
-            "display_name": display,
-            "folder_url": self._get_web_link(client_folder_id),
-        }
-
-    def add_client(self, client_data: dict) -> bool:
-        return True
-
-    def update_client_status(self, client_id: str, new_status: str) -> bool:
-        clients = self.get_clients_enhanced()
-        client = next((c for c in clients if c["client_id"] == client_id), None)
-        if not client:
-            return False
-
-        buckets = self._ensure_status_buckets()
-        dest_parent = buckets.get(new_status)
-        if not dest_parent:
-            return False
-
+        """
+        Return client summaries from all folders under the root.
+        A client is a folder under root with a 'meta.json'.
+        """
+        result: List[dict] = []
         try:
-            file_info = self.drive.files().get(fileId=client["folder_id"], fields="parents").execute()
-            old_parents = ",".join(file_info.get("parents", []))
-            if not old_parents:
-                self.drive.files().update(fileId=client["folder_id"], addParents=dest_parent, fields="id, parents").execute()
-            else:
-                self.drive.files().update(
-                    fileId=client["folder_id"], addParents=dest_parent, removeParents=old_parents, fields="id, parents"
+            q = f"'{self.root_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            page_token = None
+            while True:
+                resp = self.drive.files().list(
+                    q=q, fields="nextPageToken, files(id,name)", pageSize=200, pageToken=page_token
                 ).execute()
-            return True
-        except HttpError as e:
-            logger.error(f"update_client_status error: {e}")
-            return False
-
-    def delete_client(self, client_id: str) -> bool:
-        clients = self.get_clients_enhanced()
-        client = next((c for c in clients if c["client_id"] == client_id), None)
-        if not client:
-            return False
-        try:
-            self.drive.files().update(fileId=client["folder_id"], body={"trashed": True}).execute()
-            return True
-        except HttpError as e:
-            logger.error(f"delete_client error: {e}")
-            return False
-
-    def update_client_profile(self, client_id: str, profile_data: dict) -> bool:
-        client = self._client_by_id(client_id)
-        if not client:
-            return False
-
-        buf = io.BytesIO()
-        lines = [f"{k}: {v}" for k, v in profile_data.items()]
-        buf.write("\n".join(lines).encode("utf-8"))
-        buf.seek(0)
-
-        existing = self._find_file_in_folder(self.PROFILE_FILENAME, client["folder_id"])
-        if existing:
-            try:
-                self.drive.files().delete(fileId=existing).execute()
-            except HttpError:
-                pass
-
-        return bool(self._upload_bytes(self.PROFILE_FILENAME, client["folder_id"], buf, "text/plain"))
-
-    def get_client_profile(self, client_id: str) -> Optional[dict]:
-        client = self._client_by_id(client_id)
-        if not client:
-            return None
-
-        file_id = self._find_file_in_folder(self.PROFILE_FILENAME, client["folder_id"])
-        if not file_id:
-            return None
-
-        try:
-            data = self.drive.files().get_media(fileId=file_id).execute()
-            text = data.decode("utf-8", errors="ignore")
-            out = {}
-            for line in text.splitlines():
-                if ":" in line:
-                    k, v = line.split(":", 1)
-                    out[k.strip()] = v.strip()
-            return out
-        except HttpError as e:
-            logger.error(f"get_client_profile error: {e}")
-            return None
-
-    def _client_by_id(self, client_id: str) -> Optional[dict]:
-        clients = self.get_clients_enhanced()
-        return next((c for c in clients if c["client_id"] == client_id), None)
-
-    # --------- Tasks ---------
-
-    def _ensure_tasks_dirs(self, client_folder_id: str) -> (Optional[str], Optional[str]):
-        tasks_id = self._ensure_folder("Tasks", client_folder_id)
-        if not tasks_id:
-            return None, None
-        ongoing_id = self._ensure_folder(self.TASKS_ONGOING, tasks_id)
-        completed_id = self._ensure_folder(self.TASKS_COMPLETED, tasks_id)
-        return ongoing_id, completed_id
-
-    def add_task_enhanced(self, task_data: dict, client: dict) -> bool:
-        ongoing_id, _ = self._ensure_tasks_dirs(client["folder_id"])
-        if not ongoing_id:
-            return False
-
-        title = _safe(task_data.get("title"))
-        due = _safe(task_data.get("due_date"))
-        t_id = _safe(task_data.get("task_id"))
-        body = []
-        for k in ["task_id", "task_type", "title", "description", "due_date", "priority",
-                  "status", "created_date", "completed_date", "time_spent", "client_id"]:
-            body.append(f"{k}: {task_data.get(k, '')}")
-        buf = io.BytesIO("\n".join(body).encode("utf-8"))
-        buf.seek(0)
-
-        name = f"{due} – {title} – {t_id}.txt" if due else f"{title} – {t_id}.txt"
-        return bool(self._upload_bytes(name, ongoing_id, buf, "text/plain"))
-
-    def complete_task(self, task_id: str) -> bool:
-        clients = self.get_clients_enhanced()
-        for c in clients:
-            ongoing_id, completed_id = self._ensure_tasks_dirs(c["folder_id"])
-            if not ongoing_id or not completed_id:
-                continue
-
-            try:
-                q = f"'{ongoing_id}' in parents and trashed=false"
-                resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
-                for f in resp.get("files", []):
-                    if task_id in f["name"]:
-                        moved = self._move_file(f["id"], ongoing_id, completed_id)
-                        new_name = f["name"]
-                        if "(Completed)" not in new_name:
-                            if "." in new_name:
-                                base, ext = new_name.rsplit(".", 1)
-                                new_name = f"{base} (Completed).{ext}"
-                            else:
-                                new_name = f"{new_name} (Completed)"
-                        if moved:
-                            self._rename_file(f["id"], new_name)
-                            return True
-            except HttpError as e:
-                logger.error(f"complete_task list/move error: {e}")
-        return False
-
-    def get_upcoming_tasks(self, days: int = 30) -> List[dict]:
-        limit = datetime.now() + timedelta(days=days)
-        out = []
-        clients = self.get_clients_enhanced()
-        for c in clients:
-            ongoing_id, _ = self._ensure_tasks_dirs(c["folder_id"])
-            if not ongoing_id:
-                continue
-            try:
-                q = f"'{ongoing_id}' in parents and trashed=false"
-                resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
-                for f in resp.get("files", []):
-                    try:
-                        data = self.drive.files().get_media(fileId=f["id"]).execute()
-                        text = data.decode("utf-8", errors="ignore")
-                        fields = {}
-                        for line in text.splitlines():
-                            if ":" in line:
-                                k, v = line.split(":", 1)
-                                fields[k.strip()] = v.strip()
-                        _ensure_fields(fields, ["title", "due_date", "priority", "status", "task_type", "client_id"])
-                        due_raw = fields.get("due_date", "")
-                        due_dt = None
-                        if due_raw:
-                            try:
-                                due_dt = datetime.strptime(due_raw, "%Y-%m-%d")
-                            except ValueError:
-                                pass
-                        if due_dt and due_dt <= limit:
-                            out.append({
-                                "task_id": fields.get("task_id", ""),
-                                "client_id": fields.get("client_id", ""),
-                                "title": fields["title"],
-                                "due_date": due_raw,
-                                "priority": fields["priority"] or "Medium",
-                                "status": fields["status"] or "Pending",
-                                "task_type": fields["task_type"] or "Other",
-                                "description": fields.get("description", ""),
-                                "created_date": fields.get("created_date", ""),
-                                "completed_date": fields.get("completed_date", ""),
-                            })
-                    except HttpError:
+                for folder in resp.get("files", []):
+                    meta_id = self._find_file_in_folder("meta.json", folder["id"])
+                    if not meta_id:
+                        # Not a client folder we manage
                         continue
-            except HttpError as e:
-                logger.error(f"get_upcoming_tasks error: {e}")
-        out.sort(key=lambda t: t["due_date"] or "9999-12-31")
-        return out
-
-    def get_client_tasks(self, client_id: str) -> List[dict]:
-        c = self._client_by_id(client_id)
-        if not c:
+                    meta = self._download_json(meta_id) or {}
+                    display_name = meta.get("display_name") or folder["name"]
+                    client_id = meta.get("client_id")
+                    if not client_id:
+                        # If missing, synthesize a stable id and save back
+                        client_id = f"WP{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+                        meta["client_id"] = client_id
+                        self._update_json_file(meta_id, meta)
+                    result.append(
+                        {
+                            "client_id": client_id,
+                            "display_name": display_name,
+                            "folder_id": folder["id"],
+                        }
+                    )
+                page_token = resp.get("nextPageToken")
+                if not page_token:
+                    break
+            return sorted(result, key=lambda x: x["display_name"].lower())
+        except HttpError as e:
+            logger.error(f"get_clients_enhanced error: {e}")
             return []
-        tasks = []
-        ongoing_id, completed_id = self._ensure_tasks_dirs(c["folder_id"])
-        for folder_id in [ongoing_id, completed_id]:
-            if not folder_id:
-                continue
-            try:
-                q = f"'{folder_id}' in parents and trashed=false"
-                resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
-                for f in resp.get("files", []):
-                    try:
-                        data = self.drive.files().get_media(fileId=f["id"]).execute()
-                        text = data.decode("utf-8", errors="ignore")
-                        fields = {}
-                        for line in text.splitlines():
-                            if ":" in line:
-                                k, v = line.split(":", 1)
-                                fields[k.strip()] = v.strip()
-                        _ensure_fields(fields, ["title", "due_date", "priority", "status", "task_type"])
-                        tasks.append({
-                            "task_id": fields.get("task_id", ""),
-                            "title": fields["title"],
-                            "due_date": fields["due_date"],
-                            "priority": fields["priority"] or "Medium",
-                            "status": fields["status"] or ("Completed" if folder_id == completed_id else "Pending"),
-                            "task_type": fields["task_type"] or "Other",
-                            "description": fields.get("description", ""),
-                            "created_date": fields.get("created_date", ""),
-                            "completed_date": fields.get("completed_date", ""),
-                        })
-                    except HttpError:
-                        continue
-            except HttpError as e:
-                logger.error(f"get_client_tasks error: {e}")
-        tasks.sort(key=lambda t: (t["status"] != "Pending", t["due_date"] or "9999-12-31"))
-        return tasks
 
-    # --------- Communications ---------
-
+    # ---------------------------------------------------------------------
+    # Communications
+    # ---------------------------------------------------------------------
     def add_communication_enhanced(self, comm_data: dict, client: dict) -> bool:
-        comms_id = self._ensure_folder("Communications", client["folder_id"])
-        if not comms_id:
+        """
+        Append a communication record to the client's communications.json.
+        """
+        try:
+            client_folder_id, subs = self._ensure_client_structure(client["display_name"])
+            comms_id = subs["communications"]
+            json_id = self._find_file_in_folder("communications.json", comms_id)
+            data = self._download_json(json_id) or []
+            data.insert(0, comm_data)  # newest first
+            return self._update_json_file(json_id, data)
+        except Exception as e:
+            logger.error(f"add_communication_enhanced error: {e}")
             return False
-        doc_name = f"{comm_data.get('date','')}_{comm_data.get('time','')}_{comm_data.get('communication_id','')}.txt"
-        lines = [f"{k}: {comm_data.get(k,'')}" for k in [
-            "communication_id","client_id","date","time","type","subject","details",
-            "outcome","duration","follow_up_required","follow_up_date","created_by"
-        ]]
-        buf = io.BytesIO("\n".join(lines).encode("utf-8"))
-        buf.seek(0)
-        return bool(self._upload_bytes(doc_name, comms_id, buf, "text/plain"))
 
     def get_client_communications(self, client_id: str) -> List[dict]:
-        c = self._client_by_id(client_id)
-        if not c:
-            return []
-        comms_id = self._ensure_folder("Communications", c["folder_id"])
-        if not comms_id:
-            return []
-        out = []
+        """
+        Read communications.json for a given client.
+        """
         try:
-            q = f"'{comms_id}' in parents and trashed=false"
-            resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
-            for f in resp.get("files", []):
-                try:
-                    data = self.drive.files().get_media(fileId=f["id"]).execute()
-                    text = data.decode("utf-8", errors="ignore")
-                    item = {}
-                    for line in text.splitlines():
-                        if ":" in line:
-                            k, v = line.split(":", 1)
-                            item[k.strip()] = v.strip()
-                    _ensure_fields(item, ["type", "date", "time", "subject", "details", "outcome",
-                                          "duration", "follow_up_required", "follow_up_date"])
-                    out.append(item)
-                except HttpError:
-                    continue
-        except HttpError as e:
+            client_folder_id = self._get_client_folder_by_id(client_id)
+            if not client_folder_id:
+                return []
+            comms_id = self._find_folder("Communications", client_folder_id)
+            if not comms_id:
+                return []
+            json_id = self._find_file_in_folder("communications.json", comms_id)
+            if not json_id:
+                return []
+            data = self._download_json(json_id) or []
+            # Normalize keys for Jinja access via dot (optional)
+            return [{k: v for k, v in item.items()} for item in data]
+        except Exception as e:
             logger.error(f"get_client_communications error: {e}")
-        out.sort(key=lambda r: r.get("date", ""), reverse=True)
-        return out
+            return []
 
-    # --------- Fact Find ---------
+    # ---------------------------------------------------------------------
+    # Tasks
+    # ---------------------------------------------------------------------
+    def add_task_enhanced(self, task_data: dict, client: dict) -> bool:
+        """
+        Add a task to tasks.json AND create/mirror a .txt file under Tasks/Ongoing Tasks.
+        """
+        try:
+            client_folder_id, subs = self._ensure_client_structure(client["display_name"])
+            tasks_root = subs["tasks_root"]
+            ongoing_id = subs["tasks_ongoing"]
 
-    def save_fact_find_to_drive(self, client: dict, fact_find_data: dict) -> bool:
-        ff_id = self._ensure_folder("FF & ATR", client["folder_id"])
-        if not ff_id:
+            # Save json
+            json_id = self._find_file_in_folder("tasks.json", tasks_root)
+            tasks = self._download_json(json_id) or []
+            tasks.append(task_data)
+            ok = self._update_json_file(json_id, tasks)
+            if not ok:
+                return False
+
+            # Create a small task text file to appear in Drive
+            due = task_data.get("due_date", "")
+            title = task_data.get("title", "Task")
+            task_id = task_data.get("task_id")
+            filename = f"{due} - {title} [{task_id}].txt".strip()
+            content = (
+                f"Task ID: {task_id}\n"
+                f"Client: {client['display_name']}\n"
+                f"Type: {task_data.get('task_type','')}\n"
+                f"Title: {title}\n"
+                f"Due: {due}\n"
+                f"Priority: {task_data.get('priority','')}\n"
+                f"Status: {task_data.get('status','Pending')}\n"
+                f"Created: {task_data.get('created_date','')}\n"
+                f"Description:\n{task_data.get('description','')}\n"
+            )
+            self._upload_text(filename, content, ongoing_id)
+            return True
+        except Exception as e:
+            logger.error(f"add_task_enhanced error: {e}")
             return False
-        name = f"Fact Find – {fact_find_data.get('fact_find_date', _today_str())}.txt"
-        lines = [f"{k}: {v}" for k, v in fact_find_data.items()]
-        buf = io.BytesIO("\n".join(lines).encode("utf-8"))
-        buf.seek(0)
-        return bool(self._upload_bytes(name, ff_id, buf, "text/plain"))
 
-    # --------- Review pack creation ---------
+    def get_client_tasks(self, client_id: str) -> List[dict]:
+        """
+        Return all tasks (pending + completed) for a client from tasks.json.
+        """
+        try:
+            client_folder_id = self._get_client_folder_by_id(client_id)
+            if not client_folder_id:
+                return []
+            tasks_root = self._find_folder("Tasks", client_folder_id)
+            if not tasks_root:
+                return []
+            json_id = self._find_file_in_folder("tasks.json", tasks_root)
+            if not json_id:
+                return []
+            tasks = self._download_json(json_id) or []
+            # newest due date last; leave display sorting to templates if needed
+            return tasks
+        except Exception as e:
+            logger.error(f"get_client_tasks error: {e}")
+            return []
 
-    def create_review_pack_for_client(self, client: dict) -> Optional[dict]:
-        client_folder_id = client["folder_id"]
-        reviews_id = self._ensure_folder("Reviews", client_folder_id)
-        if not reviews_id:
-            return None
+    def complete_task(self, task_id: str) -> bool:
+        """
+        Mark a task as Completed:
+          - Update tasks.json status + completed_date
+          - Move its .txt file from Ongoing Tasks to Completed Tasks and rename with 'COMPLETED - ' prefix
+        """
+        try:
+            # Iterate through clients to locate the task (kept simple)
+            clients = self.get_clients_enhanced()
+            found = False
+            for client in clients:
+                client_folder_id = client["folder_id"]
+                tasks_root = self._find_folder("Tasks", client_folder_id)
+                if not tasks_root:
+                    continue
 
-        year = _this_year()
-        year_folder_name = f"Review {year}"
-        year_id = self._ensure_folder(year_folder_name, reviews_id)
-        if not year_id:
-            return None
+                json_id = self._find_file_in_folder("tasks.json", tasks_root)
+                if not json_id:
+                    continue
 
-        sub_ids = {}
-        for sub in self.REVIEW_YEAR_SUBS:
-            sub_ids[sub] = self._ensure_folder(sub, year_id)
+                tasks = self._download_json(json_id) or []
+                changed = False
+                for t in tasks:
+                    if t.get("task_id") == task_id:
+                        if t.get("status") != "Completed":
+                            t["status"] = "Completed"
+                            t["completed_date"] = datetime.utcnow().strftime("%Y-%m-%d")
+                            changed = True
+                        found = True
 
-        agenda_id = sub_ids.get("Agenda & Valuation")
-        if agenda_id:
-            client_name_first_last = f"{_safe(client.get('first_name'))} {_safe(client.get('surname'))}".strip()
-            if not client_name_first_last:
-                disp = client.get("display_name", "")
-                if ", " in disp:
-                    s, f = disp.split(", ", 1)
-                    client_name_first_last = f"{f} {s}".strip()
-                else:
-                    client_name_first_last = disp
+                        # Move file in Drive
+                        ongoing_id = self._find_folder("Ongoing Tasks", tasks_root)
+                        completed_id = self._find_folder("Completed Tasks", tasks_root)
+                        if ongoing_id and completed_id:
+                            # Find the file by its pattern "[task_id]"
+                            q = (
+                                f"'{ongoing_id}' in parents and "
+                                "mimeType!='application/vnd.google-apps.folder' and "
+                                "trashed=false"
+                            )
+                            resp = self.drive.files().list(q=q, fields="files(id,name)").execute()
+                            for f in resp.get("files", []):
+                                if f"[{task_id}]" in f["name"]:
+                                    # Move and rename
+                                    self._move_file(f["id"], completed_id)
+                                    new_name = f"COMPLETED - {f['name']}"
+                                    self._rename_file(f["id"], new_name)
+                                    break
+                        break
 
-            try:
-                pretty_date = datetime.now().strftime("%-d %B %Y")
-            except Exception:
-                pretty_date = _today_str("%d %B %Y")
+                if changed:
+                    self._update_json_file(json_id, tasks)
+                if found:
+                    break
 
-            agenda_title = f"Meeting Agenda – {client_name_first_last} – {year}.docx"
-            valuation_title = f"Meeting Valuation – {client_name_first_last} – {year}.docx"
+            return found
+        except Exception as e:
+            logger.error(f"complete_task error: {e}")
+            return False
 
-            if not self._find_file_in_folder(agenda_title, agenda_id):
-                self._upload_bytes(
-                    agenda_title, agenda_id,
-                    self._generate_agenda_docx(client_name_first_last, pretty_date),
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    def get_upcoming_tasks(self, days: int = 30) -> List[dict]:
+        """
+        Gather all *Pending* tasks across all clients with due_date within the next `days`.
+        """
+        try:
+            horizon = datetime.utcnow().date() + timedelta(days=days)
+            today = datetime.utcnow().date()
+            upcoming: List[dict] = []
+            for client in self.get_clients_enhanced():
+                client_tasks = self.get_client_tasks(client["client_id"])
+                for t in client_tasks:
+                    status = t.get("status", "Pending")
+                    if status == "Completed":
+                        continue
+                    due_str = t.get("due_date")
+                    if not due_str:
+                        continue
+                    try:
+                        due = datetime.strptime(due_str, "%Y-%m-%d").date()
+                    except ValueError:
+                        # allow dd/mm/yyyy as fallback
+                        try:
+                            due = datetime.strptime(due_str, "%d/%m/%Y").date()
+                        except ValueError:
+                            continue
+                    if today <= due <= horizon:
+                        # include client_id so templates can join to display name
+                        t_copy = dict(t)
+                        t_copy["client_id"] = client["client_id"]
+                        upcoming.append(t_copy)
+
+            # Sort by due date then priority
+            priority_order = {"High": 0, "Medium": 1, "Low": 2}
+            upcoming.sort(
+                key=lambda x: (
+                    x.get("due_date") or "",
+                    priority_order.get(x.get("priority", "Medium"), 1),
                 )
-            if not self._find_file_in_folder(valuation_title, agenda_id):
-                self._upload_bytes(
-                    valuation_title, agenda_id,
-                    self._generate_valuation_docx(client_name_first_last, pretty_date),
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
+            )
+            return upcoming
+        except Exception as e:
+            logger.error(f"get_upcoming_tasks error: {e}")
+            return []
 
-        return {
-            "reviews_folder_id": reviews_id,
-            "year_folder_id": year_id,
-            "subfolder_ids": sub_ids,
-            "reviews_folder_url": self._get_web_link(reviews_id),
-            "year_folder_url": self._get_web_link(year_id),
-        }
+    # ---------------------------------------------------------------------
+    # Reviews pack creation (NEW)
+    # ---------------------------------------------------------------------
+    def create_review_pack_for_client(self, client: dict) -> bool:
+        """
+        Create/ensure the annual Review folder structure and its subfolders:
+          Reviews/
+            Review <YEAR>/
+              Agenda & Valuation/
+              FF&ATR/
+              ID&V & Sanction Search/
+              Meeting Notes/
+              Research/
+              Review Letter/
+              Client Confirmation/
+              Emails/
+              Review Letter/  (duplicate name kept by request)
+        """
+        try:
+            # Ensure client structure first (in case new client)
+            client_folder_id, subs = self._ensure_client_structure(client["display_name"])
+            reviews_id = subs["reviews"]
 
-    # --------- .docx generators ---------
+            # Year folder
+            year_name = f"Review {datetime.now().year}"
+            year_folder_id = self._find_or_create_folder(year_name, reviews_id)
 
-    def _generate_agenda_docx(self, client_name: str, pretty_date: str) -> io.BytesIO:
-        doc = Document()
-        doc.add_heading("Client Review – Meeting Agenda", level=1)
-        p = doc.add_paragraph()
-        p.add_run("Client: ").bold = True
-        p.add_run(client_name)
-        p = doc.add_paragraph()
-        p.add_run("Date: ").bold = True
-        p.add_run(pretty_date)
+            # Subfolders
+            subfolders = [
+                "Agenda & Valuation",
+                "FF&ATR",
+                "ID&V & Sanction Search",
+                "Meeting Notes",
+                "Research",
+                "Review Letter",
+                "Client Confirmation",
+                "Emails",
+                "Review Letter",  # duplicate kept intentionally
+            ]
+            for name in subfolders:
+                self._find_or_create_folder(name, year_folder_id)
 
-        doc.add_paragraph("")
-        doc.add_paragraph("Agenda")
-        doc.add_paragraph("Welcome and purpose of meeting", style="List Bullet")
-        doc.add_paragraph("Review of current portfolio and performance", style="List Bullet")
-        doc.add_paragraph("Update on goals, circumstances, and risk profile", style="List Bullet")
-        doc.add_paragraph("Fees, charges, and any recommended changes", style="List Bullet")
-        doc.add_paragraph("Next steps & actions", style="List Bullet")
-
-        buf = io.BytesIO()
-        doc.save(buf)
-        buf.seek(0)
-        return buf
-
-    def _generate_valuation_docx(self, client_name: str, pretty_date: str) -> io.BytesIO:
-        doc = Document()
-        doc.add_heading("Client Review – Valuation Summary", level=1)
-        p = doc.add_paragraph()
-        p.add_run("Client: ").bold = True
-        p.add_run(client_name)
-        p = doc.add_paragraph()
-        p.add_run("Date: ").bold = True
-        p.add_run(pretty_date)
-
-        doc.add_paragraph("")
-        doc.add_paragraph("Plan(s) and Valuation")
-        tbl = doc.add_table(rows=1, cols=4)
-        hdr = tbl.rows[0].cells
-        hdr[0].text = "Provider"
-        hdr[1].text = "Policy / Plan"
-        hdr[2].text = "Valuation Date"
-        hdr[3].text = "Value (£)"
-
-        buf = io.BytesIO()
-        doc.save(buf)
-        buf.seek(0)
-        return buf
+            logger.info(f"Review pack created/ensured for {client.get('display_name')}: {year_name}")
+            return True
+        except Exception as e:
+            logger.error(f"create_review_pack_for_client error: {e}")
+            return False

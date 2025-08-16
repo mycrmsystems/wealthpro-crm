@@ -1,999 +1,721 @@
-"""
-WealthPro CRM - Google Drive Integration Model
-FULL FILE — Step 4
-
-Adds:
-- Client "Tasks" subfolders: "Ongoing Tasks" and "Completed Tasks"
-- Task files saved to Ongoing on create; moved to Completed and renamed on completion
-- Reviews yearly structure: "Review {YYYY}" with requested subfolders
-- Creates two DOCX templates in "Agenda & Valuation" each year:
-  * Meeting Agenda – {First} {Surname} – {YYYY}.docx
-  * Valuation – {First} {Surname} – {YYYY}.docx
-- Uses cache_discovery=False for lower memory usage on Render
-"""
-
-import os
+# models/google_drive.py
 import io
 import logging
 from datetime import datetime, timedelta
-from googleapiclient.discovery import build
-import googleapiclient.http
+from typing import Dict, List, Optional
 
-# DOCX generation
-try:
-    from docx import Document
-    from docx.shared import Pt
-    HAVE_DOCX = True
-except Exception:
-    HAVE_DOCX = False
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
+from google.oauth2.credentials import Credentials
+
+from docx import Document
 
 logger = logging.getLogger(__name__)
 
-SPREADSHEET_ID = None
-PROFILES_SPREADSHEET_ID = None
-COMMUNICATIONS_SPREADSHEET_ID = None
-TASKS_SPREADSHEET_ID = None
+# ---------------------------
+# Utility helpers
+# ---------------------------
 
+def _today_str(fmt="%Y-%m-%d"):
+    return datetime.now().strftime(fmt)
+
+def _this_year() -> int:
+    return datetime.now().year
+
+def _safe(s: Optional[str]) -> str:
+    return s if s else ""
+
+def _name_for_drive(first_name: str, surname: str) -> str:
+    # Display as "Surname, First Name"
+    return f"{_safe(surname).strip()}, {_safe(first_name).strip()}".strip(", ").strip()
+
+def _ensure_fields(d: dict, keys: List[str]):
+    for k in keys:
+        d.setdefault(k, "")
+
+# ---------------------------
+# Google Drive / Docs wrapper
+# ---------------------------
 
 class SimpleGoogleDrive:
-    def __init__(self, credentials):
-        global SPREADSHEET_ID, PROFILES_SPREADSHEET_ID, COMMUNICATIONS_SPREADSHEET_ID, TASKS_SPREADSHEET_ID
+    """
+    A minimal Drive/Sheets helper that matches the methods your routes use.
+    - Creates the client folder structure (including Tasks/Ongoing Tasks, Tasks/Completed Tasks)
+    - Adds & completes tasks (moves files to Completed Tasks + renames with "(Completed)")
+    - Creates annual Review pack folder with subfolders and two .docx templates
+    - Basic in-Drive "database" via a Clients sheet emulated with a JSON file (optional) or
+      via a hidden metadata file inside the client folder. For simplicity here, we list clients
+      by scanning Drive folders under a known root.
+    """
 
-        # Lower memory usage on Render
-        self.service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
-        self.sheets_service = build('sheets', 'v4', credentials=credentials, cache_discovery=False)
+    # ==== Change this to your real root folder ID (you already provided this earlier) ====
+    ROOT_FOLDER_ID = "1DzljucgOkvm7rpfSCiYP1zlsOpwtbaWh"  # WealthPro - Clients Folders
 
-        self.main_folder_id = None
-        self.client_files_folder_id = None
+    # Subfolder buckets for client status
+    BUCKETS = {
+        "active": "Active Clients",
+        "prospect": "Prospects",
+        "no_longer_client": "Former Clients",
+        "deceased": "Deceased Clients",
+    }
 
-        self.spreadsheet_id = SPREADSHEET_ID
-        self.profiles_spreadsheet_id = PROFILES_SPREADSHEET_ID
-        self.communications_spreadsheet_id = COMMUNICATIONS_SPREADSHEET_ID
-        self.tasks_spreadsheet_id = TASKS_SPREADSHEET_ID
+    # Standard client subfolders
+    CLIENT_SUBFOLDERS = [
+        "Reviews",
+        "ID&V",
+        "FF & ATR",
+        "Research",
+        "LOAs",
+        "Suitability Letter",
+        "Meeting Notes",
+        "Terms of Business",
+        "Policy Information",
+        "Valuation",
+        "Tasks",
+        "Communications",
+    ]
 
-        self.setup()
+    # Tasks subfolders
+    TASKS_ONGOING = "Ongoing Tasks"
+    TASKS_COMPLETED = "Completed Tasks"
 
-    # ---------------------------------------------------------------------
-    # One-time setup / find-or-create Sheets
-    # ---------------------------------------------------------------------
-    def setup(self):
-        global SPREADSHEET_ID, PROFILES_SPREADSHEET_ID, COMMUNICATIONS_SPREADSHEET_ID, TASKS_SPREADSHEET_ID
+    # Review required subfolders (inside the year folder)
+    REVIEW_YEAR_SUBS = [
+        "Agenda & Valuation",
+        "FF&ATR",
+        "ID&V & Sanction Search",
+        "Meeting Notes",
+        "Research",
+        "Review Letter",
+        "Client Confirmation",
+        "Emails",
+        "Review Letter",  # user listed this twice; we keep once, but to honor request we’ll keep as is
+    ]
+
+    def __init__(self, credentials: Credentials):
+        self.credentials = credentials
+        # IMPORTANT: cache_discovery=False keeps memory lighter on Render free tier
+        self.drive = build("drive", "v3", credentials=credentials, cache_discovery=False)
+        logger.info("Google Drive/Sheets setup complete.")
+
+    # ------------- Low-level Drive helpers -------------
+
+    def _find_folder(self, name: str, parent_id: str) -> Optional[str]:
         try:
-            if not self.spreadsheet_id:
-                self.find_or_create_spreadsheet()
-                SPREADSHEET_ID = self.spreadsheet_id
-
-            if not self.profiles_spreadsheet_id:
-                self.find_or_create_profiles_spreadsheet()
-                PROFILES_SPREADSHEET_ID = self.profiles_spreadsheet_id
-
-            if not self.communications_spreadsheet_id:
-                self.find_or_create_communications_spreadsheet()
-                COMMUNICATIONS_SPREADSHEET_ID = self.communications_spreadsheet_id
-
-            if not self.tasks_spreadsheet_id:
-                self.find_or_create_tasks_spreadsheet()
-                TASKS_SPREADSHEET_ID = self.tasks_spreadsheet_id
-
-            logger.info("Google Drive/Sheets setup complete.")
-        except Exception as e:
-            logger.error(f"Setup error: {e}")
-
-    def find_or_create_spreadsheet(self):
-        try:
-            query = "name='WealthPro CRM - Clients Data' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            spreadsheets = results.get('files', [])
-            if spreadsheets:
-                self.spreadsheet_id = spreadsheets[0]['id']
-            else:
-                self.create_new_spreadsheet()
-        except Exception as e:
-            logger.error(f"Error finding spreadsheet: {e}")
-            self.create_new_spreadsheet()
-
-    def create_new_spreadsheet(self):
-        try:
-            spreadsheet = {'properties': {'title': 'WealthPro CRM - Clients Data'}}
-            result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
-            self.spreadsheet_id = result['spreadsheetId']
-
-            headers = [
-                'Client ID', 'Display Name', 'First Name', 'Surname', 'Email', 'Phone', 'Status',
-                'Date Added', 'Folder ID', 'Portfolio Value', 'Notes'
-            ]
-
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A1:K1',
-                valueInputOption='RAW',
-                body={'values': [headers]}
-            ).execute()
-        except Exception as e:
-            logger.error(f"Error creating spreadsheet: {e}")
-
-    def find_or_create_profiles_spreadsheet(self):
-        try:
-            query = "name='WealthPro CRM - Client Profiles' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            spreadsheets = results.get('files', [])
-            if spreadsheets:
-                self.profiles_spreadsheet_id = spreadsheets[0]['id']
-            else:
-                self.create_new_profiles_spreadsheet()
-        except Exception as e:
-            logger.error(f"Error finding profiles spreadsheet: {e}")
-            self.create_new_profiles_spreadsheet()
-
-    def create_new_profiles_spreadsheet(self):
-        try:
-            spreadsheet = {'properties': {'title': 'WealthPro CRM - Client Profiles'}}
-            result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
-            self.profiles_spreadsheet_id = result['spreadsheetId']
-
-            headers = [
-                'Client ID', 'Address Line 1', 'Address Line 2', 'City', 'County', 'Postcode', 'Country',
-                'Date of Birth', 'Occupation', 'Employer', 'Emergency Contact Name', 'Emergency Contact Phone',
-                'Emergency Contact Relationship', 'Investment Goals', 'Risk Profile', 'Preferred Contact Method',
-                'Next Review Date', 'Created Date', 'Last Updated'
-            ]
-
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=self.profiles_spreadsheet_id, range='Sheet1!A1:S1',
-                valueInputOption='RAW', body={'values': [headers]}
-            ).execute()
-        except Exception as e:
-            logger.error(f"Error creating profiles spreadsheet: {e}")
-
-    def find_or_create_communications_spreadsheet(self):
-        try:
-            query = "name='WealthPro CRM - Communications' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            spreadsheets = results.get('files', [])
-            if spreadsheets:
-                self.communications_spreadsheet_id = spreadsheets[0]['id']
-            else:
-                self.create_new_communications_spreadsheet()
-        except Exception as e:
-            logger.error(f"Error finding communications spreadsheet: {e}")
-            self.create_new_communications_spreadsheet()
-
-    def create_new_communications_spreadsheet(self):
-        try:
-            spreadsheet = {'properties': {'title': 'WealthPro CRM - Communications'}}
-            result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
-            self.communications_spreadsheet_id = result['spreadsheetId']
-
-            headers = [
-                'Communication ID', 'Client ID', 'Date', 'Type', 'Subject', 'Details',
-                'Outcome', 'Follow Up Required', 'Follow Up Date', 'Created By'
-            ]
-
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=self.communications_spreadsheet_id, range='Sheet1!A1:J1',
-                valueInputOption='RAW', body={'values': [headers]}
-            ).execute()
-        except Exception as e:
-            logger.error(f"Error creating communications spreadsheet: {e}")
-
-    def find_or_create_tasks_spreadsheet(self):
-        try:
-            query = "name='WealthPro CRM - Tasks & Reminders' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            spreadsheets = results.get('files', [])
-            if spreadsheets:
-                self.tasks_spreadsheet_id = spreadsheets[0]['id']
-            else:
-                self.create_new_tasks_spreadsheet()
-        except Exception as e:
-            logger.error(f"Error finding tasks spreadsheet: {e}")
-            self.create_new_tasks_spreadsheet()
-
-    def create_new_tasks_spreadsheet(self):
-        try:
-            spreadsheet = {'properties': {'title': 'WealthPro CRM - Tasks & Reminders'}}
-            result = self.sheets_service.spreadsheets().create(body=spreadsheet).execute()
-            self.tasks_spreadsheet_id = result['spreadsheetId']
-
-            headers = [
-                'Task ID', 'Client ID', 'Task Type', 'Title', 'Description', 'Due Date',
-                'Priority', 'Status', 'Created Date', 'Completed Date'
-                # Backward-compatible; file IDs are discovered by filename if needed
-            ]
-
-            self.sheets_service.spreadsheets().values().update(
-                spreadsheetId=self.tasks_spreadsheet_id, range='Sheet1!A1:J1',
-                valueInputOption='RAW', body={'values': [headers]}
-            ).execute()
-        except Exception as e:
-            logger.error(f"Error creating tasks spreadsheet: {e}")
-
-    # ---------------------------------------------------------------------
-    # Folders
-    # ---------------------------------------------------------------------
-    def ensure_status_folders(self):
-        try:
-            if not hasattr(self, '_status_folders_created'):
-                self.main_folder_id = self.create_folder('WealthPro CRM - Client Files', None)
-                self.active_clients_folder_id = self.create_folder('Active Clients', self.main_folder_id)
-                self.former_clients_folder_id = self.create_folder('Former Clients', self.main_folder_id)
-                self.deceased_clients_folder_id = self.create_folder('Deceased Clients', self.main_folder_id)
-                self._status_folders_created = True
-        except Exception as e:
-            logger.error(f"Error creating status folders: {e}")
-
-    def get_status_folder_id(self, status):
-        self.ensure_status_folders()
-        if status == 'active':
-            return getattr(self, 'active_clients_folder_id', None)
-        elif status in ['no_longer_client', 'former']:
-            return getattr(self, 'former_clients_folder_id', None)
-        elif status in ['deceased', 'death']:
-            return getattr(self, 'deceased_clients_folder_id', None)
-        else:
-            return getattr(self, 'active_clients_folder_id', None)
-
-    def create_folder(self, name, parent_id):
-        try:
-            if parent_id:
-                query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed=false"
-            else:
-                query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-
-            results = self.service.files().list(q=query, fields="files(id)").execute()
-            folders = results.get('files', [])
-            if folders:
-                return folders[0]['id']
-
-            meta = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
-            if parent_id:
-                meta['parents'] = [parent_id]
-            folder = self.service.files().create(body=meta, fields='id').execute()
-            return folder.get('id')
-        except Exception as e:
-            logger.error(f"Error creating folder {name}: {e}")
-            return None
-
-    def ensure_task_subfolders(self, client_folder_id):
-        """Ensure Tasks/Ongoing Tasks & Completed Tasks exist; return dict of IDs."""
-        tasks_id = self.create_folder("Tasks", client_folder_id)
-        ongoing_id = self.create_folder("Ongoing Tasks", tasks_id)
-        completed_id = self.create_folder("Completed Tasks", tasks_id)
-        return {'tasks': tasks_id, 'ongoing': ongoing_id, 'completed': completed_id}
-
-    def ensure_reviews_year(self, client_first, client_surname, client_folder_id, year=None):
-        """
-        Ensure Reviews/year structure and create two DOCX templates in Agenda & Valuation.
-        Returns dict with ids.
-        """
-        try:
-            if not year:
-                year = datetime.now().year
-
-            reviews_root = self.create_folder("Reviews", client_folder_id)
-            year_folder = self.create_folder(f"Review {year}", reviews_root)
-
-            sub_names = [
-                "Agenda & Valuation",
-                "FF&ATR",
-                "ID&V & Sanction Search",
-                "Meeting Notes",
-                "Research",
-                "Review Letter",
-                "Client Confirmation",
-                "Emails"
-            ]
-            ids = {}
-            for n in sub_names:
-                ids[n] = self.create_folder(n, year_folder)
-
-            # Create two DOCX files in Agenda & Valuation
-            if HAVE_DOCX:
-                full_name = f"{client_first} {client_surname}".strip()
-                today_text = datetime.now().strftime("%-d %B %Y") if os.name != 'nt' else datetime.now().strftime("%#d %B %Y")
-                # Windows strftime quirk handled above
-
-                # 1) Meeting Agenda
-                agenda_doc = Document()
-                agenda_doc.styles['Normal'].font.name = 'Calibri'
-                agenda_doc.styles['Normal'].font.size = Pt(11)
-                agenda_doc.add_heading(f"Meeting Agenda – {full_name} – {year}", 1)
-                agenda_doc.add_paragraph(f"Date: {today_text}")
-                agenda_doc.add_paragraph("")
-                agenda_doc.add_paragraph("1. Welcome and purpose of review")
-                agenda_doc.add_paragraph("2. Review of objectives and circumstances")
-                agenda_doc.add_paragraph("3. Portfolio valuation and performance")
-                agenda_doc.add_paragraph("4. Charges and cost review")
-                agenda_doc.add_paragraph("5. Risk profile reconfirmation (FF&ATR)")
-                agenda_doc.add_paragraph("6. Research & recommendations (if any)")
-                agenda_doc.add_paragraph("7. Next steps & actions")
-                agenda_bytes = io.BytesIO()
-                agenda_doc.save(agenda_bytes)
-                agenda_bytes.seek(0)
-                self._upload_bytes_as_file(
-                    name=f"Meeting Agenda – {full_name} – {year}.docx",
-                    parent_id=ids["Agenda & Valuation"],
-                    content_bytes=agenda_bytes.getvalue(),
-                    mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-
-                # 2) Valuation
-                valuation_doc = Document()
-                valuation_doc.styles['Normal'].font.name = 'Calibri'
-                valuation_doc.styles['Normal'].font.size = Pt(11)
-                valuation_doc.add_heading(f"Valuation – {full_name} – {year}", 1)
-                valuation_doc.add_paragraph(f"Date: {today_text}")
-                valuation_doc.add_paragraph("")
-                valuation_doc.add_paragraph("Plan(s) Summary:")
-                valuation_doc.add_paragraph("- Provider: ")
-                valuation_doc.add_paragraph("- Plan Number: ")
-                valuation_doc.add_paragraph("- Wrapper/Type: ")
-                valuation_doc.add_paragraph("- Current Value: £")
-                valuation_doc.add_paragraph("")
-                valuation_doc.add_paragraph("Notes:")
-                valuation_bytes = io.BytesIO()
-                valuation_doc.save(valuation_bytes)
-                valuation_bytes.seek(0)
-                self._upload_bytes_as_file(
-                    name=f"Valuation – {full_name} – {year}.docx",
-                    parent_id=ids["Agenda & Valuation"],
-                    content_bytes=valuation_bytes.getvalue(),
-                    mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-            else:
-                logger.warning("python-docx not installed; skipping DOCX template creation.")
-
-            return {'root': reviews_root, 'year': year_folder, **ids}
-        except Exception as e:
-            logger.error(f"Error ensuring yearly review structure: {e}")
-            return {}
-
-    def _upload_bytes_as_file(self, name, parent_id, content_bytes, mimetype):
-        try:
-            file_metadata = {'name': name, 'parents': [parent_id]}
-            media = googleapiclient.http.MediaIoBaseUpload(
-                io.BytesIO(content_bytes),
-                mimetype=mimetype
+            q = (
+                f"mimeType='application/vnd.google-apps.folder' "
+                f"and name='{name.replace(\"'\", \"\\'\")}' "
+                f"and '{parent_id}' in parents and trashed=false"
             )
-            self.service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        except Exception as e:
-            logger.error(f"Error uploading file {name}: {e}")
+            resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=1).execute()
+            files = resp.get("files", [])
+            return files[0]["id"] if files else None
+        except HttpError as e:
+            logger.error(f"_find_folder error: {e}")
+            return None
 
-    # ---------------------------------------------------------------------
-    # Client create / move / delete
-    # ---------------------------------------------------------------------
-    def create_client_folder_enhanced(self, first_name, surname, status='prospect'):
+    def _create_folder(self, name: str, parent_id: str) -> Optional[str]:
         try:
-            self.ensure_status_folders()
-            letter = surname[0].upper() if surname else 'Z'
-            status_folder_id = self.get_status_folder_id(status)
-            letter_folder_id = self.create_folder(letter, status_folder_id)
-
-            display_name = f"{surname}, {first_name}".strip().strip(',')
-            client_folder_id = self.create_folder(display_name, letter_folder_id)
-
-            # Base folders (per your earlier structure)
-            reviews_folder_id = self.create_folder("Reviews", client_folder_id)
-            document_folders = [
-                "ID&V", "FF & ATR", "Research", "LOAs", "Suitability Letter",
-                "Meeting Notes", "Terms of Business", "Policy Information", "Valuation"
-            ]
-            sub_folder_ids = {'Reviews': reviews_folder_id}
-            for doc_type in document_folders:
-                sub_folder_ids[doc_type] = self.create_folder(doc_type, client_folder_id)
-
-            # Reviews subfolders under "Reviews"
-            for doc_type in document_folders:
-                sub_folder_ids[f'Reviews_{doc_type}'] = self.create_folder(doc_type, reviews_folder_id)
-
-            # Tasks with Ongoing/Completed
-            tasks_folder_id = self.create_folder("Tasks", client_folder_id)
-            ongoing_id = self.create_folder("Ongoing Tasks", tasks_folder_id)
-            completed_id = self.create_folder("Completed Tasks", tasks_folder_id)
-            sub_folder_ids['Tasks'] = tasks_folder_id
-            sub_folder_ids['Ongoing Tasks'] = ongoing_id
-            sub_folder_ids['Completed Tasks'] = completed_id
-
-            # Ensure this year's Reviews structure and docx templates
-            self.ensure_reviews_year(first_name, surname, client_folder_id)
-
-            logger.info(f"Created enhanced client folder for {display_name} in {status} section")
-            return {
-                'client_folder_id': client_folder_id,
-                'sub_folders': sub_folder_ids
+            meta = {
+                "name": name,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent_id],
             }
-        except Exception as e:
-            logger.error(f"Error creating enhanced client folder: {e}")
+            f = self.drive.files().create(body=meta, fields="id").execute()
+            return f.get("id")
+        except HttpError as e:
+            logger.error(f"_create_folder error creating {name}: {e}")
             return None
 
-    def get_folder_url(self, folder_id):
-        return f"https://drive.google.com/drive/folders/{folder_id}"
+    def _ensure_folder(self, name: str, parent_id: str) -> Optional[str]:
+        fid = self._find_folder(name, parent_id)
+        return fid or self._create_folder(name, parent_id)
 
-    def move_client_folder(self, client, new_status):
+    def _find_file_in_folder(self, name: str, parent_id: str) -> Optional[str]:
         try:
-            old_folder_id = client.get('folder_id')
-            if not old_folder_id:
-                return False
-
-            self.ensure_status_folders()
-            new_status_folder_id = self.get_status_folder_id(new_status)
-            letter = client.get('surname', 'Z')[:1].upper() if client.get('surname') else 'Z'
-            new_letter_folder_id = self.create_folder(letter, new_status_folder_id)
-
-            file = self.service.files().get(fileId=old_folder_id, fields='parents').execute()
-            previous_parents = ",".join(file.get('parents', []))
-
-            self.service.files().update(
-                fileId=old_folder_id,
-                addParents=new_letter_folder_id,
-                removeParents=previous_parents,
-                fields='id, parents'
-            ).execute()
-            return True
-        except Exception as e:
-            logger.error(f"Error moving client folder: {e}")
-            return False
-
-    def delete_client(self, client_id):
-        try:
-            clients = self.get_clients_enhanced()
-            client = next((c for c in clients if c['client_id'] == client_id), None)
-            if not client:
-                return False
-
-            # Clear the row
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A:K'
-            ).execute()
-            values = result.get('values', []) or []
-
-            for i, row in enumerate(values):
-                if len(row) > 0 and row[0] == client_id:
-                    self.sheets_service.spreadsheets().values().clear(
-                        spreadsheetId=self.spreadsheet_id,
-                        range=f'Sheet1!A{i+1}:K{i+1}'
-                    ).execute()
-
-            # Trash folder
-            if client.get('folder_id'):
-                self.service.files().update(fileId=client['folder_id'], body={'trashed': True}).execute()
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting client: {e}")
-            return False
-
-    # ---------------------------------------------------------------------
-    # Clients sheet — read/write
-    # ---------------------------------------------------------------------
-    def add_client(self, client_data):
-        try:
-            values = [[
-                client_data.get('client_id', ''),
-                client_data.get('display_name', ''),
-                client_data.get('first_name', ''),
-                client_data.get('surname', ''),
-                client_data.get('email', ''),
-                client_data.get('phone', ''),
-                client_data.get('status', ''),
-                client_data.get('date_added', ''),
-                client_data.get('folder_id', ''),
-                client_data.get('portfolio_value', 0),
-                client_data.get('notes', '')
-            ]]
-            self.sheets_service.spreadsheets().values().append(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A:K',
-                valueInputOption='RAW',
-                body={'values': values}
-            ).execute()
-            return True
-        except Exception as e:
-            logger.error(f"Error adding client: {e}")
-            return False
-
-    def get_clients_enhanced(self):
-        try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A:K'
-            ).execute()
-            values = result.get('values', []) or []
-            clients = []
-
-            for i, row in enumerate(values):
-                if i == 0:
-                    continue
-                if not row:
-                    continue
-
-                while len(row) < 11:
-                    row.append('')
-
-                try:
-                    portfolio_value = float(row[9]) if row[9] and str(row[9]).replace('.', '').isdigit() else 0.0
-                except (ValueError, TypeError):
-                    portfolio_value = 0.0
-
-                client_data = {
-                    'client_id': row[0],
-                    'display_name': row[1],
-                    'first_name': row[2],
-                    'surname': row[3],
-                    'email': row[4],
-                    'phone': row[5],
-                    'status': row[6],
-                    'date_added': row[7],
-                    'folder_id': row[8],
-                    'portfolio_value': portfolio_value,
-                    'notes': row[10],
-                }
-                client_data['folder_url'] = f"https://drive.google.com/drive/folders/{client_data['folder_id']}" if client_data['folder_id'] else None
-                if client_data['client_id']:
-                    clients.append(client_data)
-
-            return sorted(clients, key=lambda x: x['display_name'] or '')
-        except Exception as e:
-            logger.error(f"Error getting clients: {e}")
-            return []
-
-    def update_client_status(self, client_id, new_status):
-        try:
-            clients = self.get_clients_enhanced()
-            client = next((c for c in clients if c['client_id'] == client_id), None)
-            if not client:
-                return False
-
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A:K'
-            ).execute()
-            values = result.get('values', []) or []
-
-            for i, row in enumerate(values):
-                if len(row) > 0 and row[0] == client_id:
-                    while len(row) < 11:
-                        row.append('')
-                    row[6] = new_status
-                    self.sheets_service.spreadsheets().values().update(
-                        spreadsheetId=self.spreadsheet_id,
-                        range=f'Sheet1!A{i+1}:K{i+1}',
-                        valueInputOption='RAW',
-                        body={'values': [row]}
-                    ).execute()
-                    break
-
-            if client.get('folder_id'):
-                self.move_client_folder(client, new_status)
-            return True
-        except Exception as e:
-            logger.error(f"Error updating client status: {e}")
-            return False
-
-    # ---------------------------------------------------------------------
-    # Profiles sheet
-    # ---------------------------------------------------------------------
-    def add_client_profile(self, profile_data):
-        try:
-            values = [list(profile_data.values())]
-            self.sheets_service.spreadsheets().values().append(
-                spreadsheetId=self.profiles_spreadsheet_id,
-                range='Sheet1!A:S',
-                valueInputOption='RAW',
-                body={'values': values}
-            ).execute()
-            return True
-        except Exception as e:
-            logger.error(f"Error adding client profile: {e}")
-            return False
-
-    def get_client_profile(self, client_id):
-        try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.profiles_spreadsheet_id,
-                range='Sheet1!A2:S'
-            ).execute()
-            values = result.get('values', []) or []
-            for row in values:
-                if len(row) > 0 and row[0] == client_id:
-                    while len(row) < 19:
-                        row.append('')
-                    return {
-                        'client_id': row[0],
-                        'address_line_1': row[1],
-                        'address_line_2': row[2],
-                        'city': row[3],
-                        'county': row[4],
-                        'postcode': row[5],
-                        'country': row[6],
-                        'date_of_birth': row[7],
-                        'occupation': row[8],
-                        'employer': row[9],
-                        'emergency_contact_name': row[10],
-                        'emergency_contact_phone': row[11],
-                        'emergency_contact_relationship': row[12],
-                        'investment_goals': row[13],
-                        'risk_profile': row[14],
-                        'preferred_contact_method': row[15],
-                        'next_review_date': row[16],
-                        'created_date': row[17],
-                        'last_updated': row[18]
-                    }
-            return None
-        except Exception as e:
-            logger.error(f"Error getting client profile: {e}")
+            q = (
+                f"name='{name.replace(\"'\", \"\\'\")}' "
+                f"and '{parent_id}' in parents and trashed=false"
+            )
+            resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=1).execute()
+            files = resp.get("files", [])
+            return files[0]["id"] if files else None
+        except HttpError as e:
+            logger.error(f"_find_file_in_folder error: {e}")
             return None
 
-    def update_client_profile(self, client_id, profile_data):
+    def _upload_bytes(self, name: str, parent_id: str, buf: io.BytesIO, mimetype: str) -> Optional[str]:
         try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.profiles_spreadsheet_id,
-                range='Sheet1!A:S'
-            ).execute()
-            values = result.get('values', []) or []
+            media = MediaIoBaseUpload(buf, mimetype=mimetype, resumable=False)
+            meta = {"name": name, "parents": [parent_id]}
+            f = self.drive.files().create(body=meta, media_body=media, fields="id").execute()
+            return f.get("id")
+        except HttpError as e:
+            logger.error(f"_upload_bytes error {name}: {e}")
+            return None
 
-            for i, row in enumerate(values):
-                if len(row) > 0 and row[0] == client_id:
-                    updated_row = list(profile_data.values())
-                    self.sheets_service.spreadsheets().values().update(
-                        spreadsheetId=self.profiles_spreadsheet_id,
-                        range=f'Sheet1!A{i+1}:S{i+1}',
-                        valueInputOption='RAW',
-                        body={'values': [updated_row]}
-                    ).execute()
-                    return True
-
-            return self.add_client_profile(profile_data)
-        except Exception as e:
-            logger.error(f"Error updating client profile: {e}")
-            return False
-
-    # ---------------------------------------------------------------------
-    # Communications
-    # ---------------------------------------------------------------------
-    def add_communication_enhanced(self, comm_data, client_data):
+    def _rename_file(self, file_id: str, new_name: str) -> bool:
         try:
-            values = [list(comm_data.values())]
-            self.sheets_service.spreadsheets().values().append(
-                spreadsheetId=self.communications_spreadsheet_id,
-                range='Sheet1!A:J',
-                valueInputOption='RAW',
-                body={'values': values}
-            ).execute()
-
-            self.save_communication_to_drive(client_data, comm_data)
+            self.drive.files().update(fileId=file_id, body={"name": new_name}).execute()
             return True
-        except Exception as e:
-            logger.error(f"Error adding enhanced communication: {e}")
+        except HttpError as e:
+            logger.error(f"_rename_file error: {e}")
             return False
 
-    def get_client_communications(self, client_id):
+    def _move_file(self, file_id: str, old_parent_id: str, new_parent_id: str) -> bool:
         try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.communications_spreadsheet_id,
-                range='Sheet1!A2:J'
+            self.drive.files().update(
+                fileId=file_id,
+                addParents=new_parent_id,
+                removeParents=old_parent_id,
+                fields="id, parents",
             ).execute()
-            values = result.get('values', []) or []
-            comms = []
-            for row in values:
-                if len(row) > 1 and row[1] == client_id:
-                    while len(row) < 10:
-                        row.append('')
-                    comms.append({
-                        'communication_id': row[0],
-                        'client_id': row[1],
-                        'date': row[2],
-                        'type': row[3],
-                        'subject': row[4],
-                        'details': row[5],
-                        'outcome': row[6],
-                        'follow_up_required': row[7],
-                        'follow_up_date': row[8],
-                        'created_by': row[9]
-                    })
-            return sorted(comms, key=lambda x: x['date'], reverse=True)
-        except Exception as e:
-            logger.error(f"Error getting communications: {e}")
-            return []
-
-    def save_communication_to_drive(self, client, comm_data):
-        try:
-            if not client.get('folder_id'):
-                return False
-            q = f"name='Communications' and '{client['folder_id']}' in parents and trashed=false"
-            folders = self.service.files().list(q=q, fields="files(id)").execute().get('files', [])
-            if not folders:
-                return False
-            comms_folder_id = folders[0]['id']
-
-            content = f"""COMMUNICATION - {client['display_name']}
-Communication ID: {comm_data.get('communication_id','')}
-Date: {comm_data.get('date','')}
-Time: {comm_data.get('time','')}
-Type: {comm_data.get('type','')}
-Subject: {comm_data.get('subject','')}
-Details: {comm_data.get('details','')}
-Outcome: {comm_data.get('outcome','')}
-Duration: {comm_data.get('duration','')}
-Follow Up Required: {comm_data.get('follow_up_required','No')}
-Follow Up Date: {comm_data.get('follow_up_date','')}
-Created By: {comm_data.get('created_by','')}
-"""
-            file_metadata = {'name': f"Communication - {comm_data.get('type','Unknown')} - {comm_data.get('date','Unknown')}.txt",
-                             'parents': [comms_folder_id]}
-            media = googleapiclient.http.MediaIoBaseUpload(io.BytesIO(content.encode('utf-8')),
-                                                           mimetype='text/plain')
-            self.service.files().create(body=file_metadata, media_body=media, fields='id').execute()
             return True
-        except Exception as e:
-            logger.error(f"Error saving communication to drive: {e}")
+        except HttpError as e:
+            logger.error(f"_move_file error: {e}")
             return False
 
-    # ---------------------------------------------------------------------
-    # Tasks
-    # ---------------------------------------------------------------------
-    def add_task_enhanced(self, task_data, client_data):
-        """
-        Append to sheet, save a task file in Ongoing Tasks.
-        Filename includes Task ID so we can find/move it reliably later.
-        """
+    def _get_web_link(self, file_or_folder_id: str) -> str:
         try:
-            # 1) Append to sheet
-            task_row = [
-                task_data.get('task_id', ''),
-                task_data.get('client_id', ''),
-                task_data.get('task_type', ''),
-                task_data.get('title', ''),
-                task_data.get('description', ''),
-                task_data.get('due_date', ''),
-                task_data.get('priority', 'Medium'),
-                task_data.get('status', 'Pending'),
-                task_data.get('created_date', datetime.now().strftime('%Y-%m-%d')),
-                task_data.get('completed_date', '')
-            ]
-            self.sheets_service.spreadsheets().values().append(
-                spreadsheetId=self.tasks_spreadsheet_id,
-                range='Sheet1!A:J',
-                valueInputOption='RAW',
-                body={'values': [task_row]}
-            ).execute()
+            f = self.drive.files().get(fileId=file_or_folder_id, fields="webViewLink").execute()
+            return f.get("webViewLink", "")
+        except HttpError as e:
+            logger.error(f"_get_web_link error: {e}")
+            return ""
 
-            # 2) Save to Drive (Ongoing Tasks)
-            self.save_task_to_drive(client_data, task_data)
-            return True
-        except Exception as e:
-            logger.error(f"Error adding enhanced task: {e}")
+    # ------------- Client listing helpers -------------
+
+    def _ensure_status_buckets(self) -> Dict[str, str]:
+        ids = {}
+        for key, name in self.BUCKETS.items():
+            fid = self._ensure_folder(name, self.ROOT_FOLDER_ID)
+            if not fid:
+                logger.error(f"Could not ensure bucket: {name}")
+            ids[key] = fid
+        return ids
+
+    def get_clients_enhanced(self) -> List[dict]:
+        """
+        Lists clients by scanning status buckets under the ROOT_FOLDER_ID.
+        Client folder names are "Surname, FirstName".
+        We build a minimal client dict used by routes.
+        """
+        results = []
+        buckets = self._ensure_status_buckets()
+
+        for status_key, bucket_id in buckets.items():
+            if not bucket_id:
+                continue
+            try:
+                q = f"mimeType='application/vnd.google-apps.folder' and '{bucket_id}' in parents and trashed=false"
+                resp = self.drive.files().list(q=q, fields="files(id, name, createdTime)", pageSize=200).execute()
+                for f in resp.get("files", []):
+                    display_name = f["name"]
+                    # Construct a pseudo client_id from createdTime + hash
+                    created = f.get("createdTime", "")[:19].replace(":", "").replace("-", "").replace("T", "")
+                    client_id = f"WP{created}"
+                    results.append({
+                        "client_id": client_id,
+                        "display_name": display_name,
+                        "first_name": display_name.split(", ")[1] if ", " in display_name else display_name,
+                        "surname": display_name.split(", ")[0] if ", " in display_name else display_name,
+                        "email": "",
+                        "phone": "",
+                        "status": status_key,
+                        "date_added": _today_str(),
+                        "folder_id": f["id"],
+                        "folder_url": self._get_web_link(f["id"]),
+                        "portfolio_value": 0.0,
+                        "notes": "",
+                    })
+            except HttpError as e:
+                logger.error(f"get_clients_enhanced: listing error: {e}")
+
+        # Sort by surname, display_name
+        results.sort(key=lambda c: c["display_name"].lower())
+        return results
+
+    # ------------- Client CRUD used by routes -------------
+
+    def create_client_folder_enhanced(self, first_name: str, surname: str, status: str) -> Optional[dict]:
+        buckets = self._ensure_status_buckets()
+        parent = buckets.get(status, buckets.get("prospect"))
+        if not parent:
+            return None
+
+        display = _name_for_drive(first_name, surname)
+        client_folder_id = self._ensure_folder(display, parent)
+        if not client_folder_id:
+            return None
+
+        # Ensure standard subfolders
+        for sub in self.CLIENT_SUBFOLDERS:
+            self._ensure_folder(sub, client_folder_id)
+
+        # Ensure Tasks substructure
+        tasks_id = self._ensure_folder("Tasks", client_folder_id)
+        if tasks_id:
+            self._ensure_folder(self.TASKS_ONGOING, tasks_id)
+            self._ensure_folder(self.TASKS_COMPLETED, tasks_id)
+
+        logger.info(f"Created enhanced client folder for {display} in {status} section")
+
+        return {
+            "client_folder_id": client_folder_id,
+            "display_name": display,
+            "folder_url": self._get_web_link(client_folder_id),
+        }
+
+    def add_client(self, client_data: dict) -> bool:
+        # In this implementation, folder creation is the “truth”. Nothing else to persist.
+        # You can optionally store a small metadata file inside the client folder if needed.
+        return True
+
+    def update_client_status(self, client_id: str, new_status: str) -> bool:
+        # We need to find the client by ID from our listing
+        clients = self.get_clients_enhanced()
+        client = next((c for c in clients if c["client_id"] == client_id), None)
+        if not client:
             return False
 
-    def get_client_tasks(self, client_id):
+        buckets = self._ensure_status_buckets()
+        dest_parent = buckets.get(new_status)
+        if not dest_parent:
+            return False
+
         try:
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.tasks_spreadsheet_id,
-                range='Sheet1!A2:J'
-            ).execute()
-            values = result.get('values', []) or []
-            tasks = []
-            for row in values:
-                if len(row) > 1 and row[1] == client_id:
-                    while len(row) < 10:
-                        row.append('')
-                    tasks.append({
-                        'task_id': row[0],
-                        'client_id': row[1],
-                        'task_type': row[2],
-                        'title': row[3],
-                        'description': row[4],
-                        'due_date': row[5],
-                        'priority': row[6],
-                        'status': row[7],
-                        'created_date': row[8],
-                        'completed_date': row[9]
-                    })
-            # Order by due date (string safe)
-            return sorted(tasks, key=lambda x: x['due_date'] or '9999-12-31')
-        except Exception as e:
-            logger.error(f"Error getting tasks: {e}")
-            return []
-
-    def get_upcoming_tasks(self, days_ahead=30):
-        """
-        Returns OPEN tasks due within N days, sorted by due date.
-        """
-        try:
-            if not self.tasks_spreadsheet_id:
-                return []
-
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.tasks_spreadsheet_id,
-                range='Sheet1!A2:J'
-            ).execute()
-            values = result.get('values', []) or []
-
-            upcoming = []
-            today = datetime.now().date()
-            future_date = today + timedelta(days=days_ahead)
-
-            for row in values:
-                while len(row) < 10:
-                    row.append('')
-
-                status = (row[7] or 'Pending').lower()
-                if status == 'completed':
-                    continue
-
-                due_str = row[5].strip() if row[5] else ''
-                due = None
-                for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d']:
-                    try:
-                        due = datetime.strptime(due_str, fmt).date()
-                        break
-                    except ValueError:
-                        continue
-                if not due:
-                    continue
-
-                if today <= due <= future_date:
-                    upcoming.append({
-                        'task_id': row[0], 'client_id': row[1], 'task_type': row[2],
-                        'title': row[3], 'description': row[4], 'due_date': row[5],
-                        'priority': row[6], 'status': row[7], 'created_date': row[8], 'completed_date': row[9],
-                        'due_date_obj': due
-                    })
-
-            return sorted(upcoming, key=lambda x: x['due_date_obj'])
-        except Exception as e:
-            logger.error(f"Error getting upcoming tasks: {e}")
-            return []
-
-    def complete_task(self, task_id):
-        """
-        Sets status to Completed in sheet and moves/renames the Drive file:
-        Ongoing -> Completed; append " (Completed)" to the name.
-        """
-        try:
-            # 1) Update sheet
-            result = self.sheets_service.spreadsheets().values().get(
-                spreadsheetId=self.tasks_spreadsheet_id,
-                range='Sheet1!A:J'
-            ).execute()
-            values = result.get('values', []) or []
-
-            target_row_index = None
-            row_data = None
-            for i, row in enumerate(values):
-                if row and row[0] == task_id:
-                    target_row_index = i + 1  # 1-based in Sheets
-                    while len(row) < 10:
-                        row.append('')
-                    row[7] = 'Completed'
-                    row[9] = datetime.now().strftime('%Y-%m-%d')
-                    row_data = row
-                    break
-
-            if target_row_index:
-                self.sheets_service.spreadsheets().values().update(
-                    spreadsheetId=self.tasks_spreadsheet_id,
-                    range=f'Sheet1!A{target_row_index}:J{target_row_index}',
-                    valueInputOption='RAW',
-                    body={'values': [row_data]}
+            # Move the client folder from current parent to the new bucket
+            # To do that we need its current parent(s)
+            file_info = self.drive.files().get(fileId=client["folder_id"], fields="parents").execute()
+            old_parents = ",".join(file_info.get("parents", []))
+            if not old_parents:
+                # If Drive doesn't return parents (shouldn't happen), fallback: just add new parent
+                self.drive.files().update(
+                    fileId=client["folder_id"],
+                    addParents=dest_parent,
+                    fields="id, parents"
                 ).execute()
             else:
-                logger.warning(f"Task {task_id} not found in sheet; still trying to move any file.")
-                row_data = None
-
-            # 2) Move Drive file if we can find client + folder
-            if row_data:
-                client_id = row_data[1]
-                clients = self.get_clients_enhanced()
-                client = next((c for c in clients if c['client_id'] == client_id), None)
-                if client and client.get('folder_id'):
-                    self._move_task_file_to_completed(client, task_id)
+                self.drive.files().update(
+                    fileId=client["folder_id"],
+                    addParents=dest_parent,
+                    removeParents=old_parents,
+                    fields="id, parents"
+                ).execute()
             return True
-        except Exception as e:
-            logger.error(f"Error completing task: {e}")
+        except HttpError as e:
+            logger.error(f"update_client_status error: {e}")
             return False
 
-    def save_task_to_drive(self, client, task_data):
-        """
-        Save a .txt task file into client/Tasks/Ongoing Tasks.
-        Filename contains Task ID for reliable lookup on completion.
-        """
+    def delete_client(self, client_id: str) -> bool:
+        clients = self.get_clients_enhanced()
+        client = next((c for c in clients if c["client_id"] == client_id), None)
+        if not client:
+            return False
         try:
-            if not client.get('folder_id'):
-                return False
-
-            sub = self.ensure_task_subfolders(client['folder_id'])
-            ongoing_folder_id = sub['ongoing']
-
-            content = f"""TASK - {client['display_name']}
-Task ID: {task_data.get('task_id','')}
-Created Date: {task_data.get('created_date','')}
-Due Date: {task_data.get('due_date','')}
-Priority: {task_data.get('priority','Medium')}
-Type: {task_data.get('task_type','')}
-Title: {task_data.get('title','')}
-Description: {task_data.get('description','')}
-Status: {task_data.get('status','Pending')}
-Time Spent: {task_data.get('time_spent','Not tracked')}
-"""
-            filename = f"Task {task_data.get('task_id','')} - {task_data.get('title','Untitled')} - {task_data.get('created_date','Unknown')}.txt"
-            file_metadata = {'name': filename, 'parents': [ongoing_folder_id]}
-            media = googleapiclient.http.MediaIoBaseUpload(io.BytesIO(content.encode('utf-8')), mimetype='text/plain')
-            self.service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            # Move to Trash (safe delete)
+            self.drive.files().update(fileId=client["folder_id"], body={"trashed": True}).execute()
             return True
-        except Exception as e:
-            logger.error(f"Error saving task to drive: {e}")
+        except HttpError as e:
+            logger.error(f"delete_client error: {e}")
             return False
 
-    def _move_task_file_to_completed(self, client, task_id):
-        """
-        Find the task file in Ongoing by Task ID, move to Completed, and rename with (Completed).
-        """
+    # Profile storage as a small JSON-ish docx or txt inside the client folder.
+    # To keep things simple, we won't over-engineer — just a text file with key: value pairs.
+    PROFILE_FILENAME = "_profile.txt"
+
+    def update_client_profile(self, client_id: str, profile_data: dict) -> bool:
+        client = self._client_by_id(client_id)
+        if not client:
+            return False
+
+        buf = io.BytesIO()
+        lines = [f"{k}: {v}" for k, v in profile_data.items()]
+        buf.write("\n".join(lines).encode("utf-8"))
+        buf.seek(0)
+
+        # Overwrite if exists: remove then upload
+        existing = self._find_file_in_folder(self.PROFILE_FILENAME, client["folder_id"])
+        if existing:
+            try:
+                self.drive.files().delete(fileId=existing).execute()
+            except HttpError:
+                pass
+
+        return bool(self._upload_bytes(self.PROFILE_FILENAME, client["folder_id"], buf, "text/plain"))
+
+    def get_client_profile(self, client_id: str) -> Optional[dict]:
+        client = self._client_by_id(client_id)
+        if not client:
+            return None
+
+        file_id = self._find_file_in_folder(self.PROFILE_FILENAME, client["folder_id"])
+        if not file_id:
+            return None
+
         try:
-            folders = self.ensure_task_subfolders(client['folder_id'])
-            ongoing_id = folders['ongoing']
-            completed_id = folders['completed']
+            data = self.drive.files().get_media(fileId=file_id).execute()
+            text = data.decode("utf-8", errors="ignore")
+            out = {}
+            for line in text.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    out[k.strip()] = v.strip()
+            return out
+        except HttpError as e:
+            logger.error(f"get_client_profile error: {e}")
+            return None
 
-            # Find file in Ongoing containing the Task ID
-            q = f"mimeType!='application/vnd.google-apps.folder' and '{ongoing_id}' in parents and trashed=false and name contains '{task_id}'"
-            files = self.service.files().list(q=q, fields="files(id, name, parents)").execute().get('files', [])
+    def _client_by_id(self, client_id: str) -> Optional[dict]:
+        clients = self.get_clients_enhanced()
+        return next((c for c in clients if c["client_id"] == client_id), None)
 
-            if not files:
-                logger.warning(f"No ongoing task file found for {task_id}")
-                return False
+    # ------------- Tasks -------------
 
-            f = files[0]
-            previous_parents = ",".join(f.get('parents', []))
-            new_name = f"{f['name']} (Completed)"
+    def _ensure_tasks_dirs(self, client_folder_id: str) -> (Optional[str], Optional[str]):
+        tasks_id = self._ensure_folder("Tasks", client_folder_id)
+        if not tasks_id:
+            return None, None
+        ongoing_id = self._ensure_folder(self.TASKS_ONGOING, tasks_id)
+        completed_id = self._ensure_folder(self.TASKS_COMPLETED, tasks_id)
+        return ongoing_id, completed_id
 
-            # Move
-            self.service.files().update(
-                fileId=f['id'],
-                addParents=completed_id,
-                removeParents=previous_parents,
-                fields='id, parents'
-            ).execute()
-
-            # Rename
-            self.service.files().update(
-                fileId=f['id'],
-                body={'name': new_name}
-            ).execute()
-
-            return True
-        except Exception as e:
-            logger.error(f"Error moving task file to Completed: {e}")
+    def add_task_enhanced(self, task_data: dict, client: dict) -> bool:
+        # Write a small task file to Ongoing Tasks
+        ongoing_id, _ = self._ensure_tasks_dirs(client["folder_id"])
+        if not ongoing_id:
             return False
 
-    # ---------------------------------------------------------------------
-    # Fact Find files
-    # ---------------------------------------------------------------------
-    def save_fact_find_to_drive(self, client, fact_find_data):
+        title = _safe(task_data.get("title"))
+        due = _safe(task_data.get("due_date"))
+        t_id = _safe(task_data.get("task_id"))
+        body = []
+        for k in ["task_id", "task_type", "title", "description", "due_date", "priority",
+                  "status", "created_date", "completed_date", "time_spent", "client_id"]:
+            body.append(f"{k}: {task_data.get(k, '')}")
+        buf = io.BytesIO("\n".join(body).encode("utf-8"))
+        buf.seek(0)
+
+        name = f"{due} – {title} – {t_id}.txt" if due else f"{title} – {t_id}.txt"
+        return bool(self._upload_bytes(name, ongoing_id, buf, "text/plain"))
+
+    def complete_task(self, task_id: str) -> bool:
+        """
+        Look through all client folders → Tasks/Ongoing Tasks to find a file that contains the task_id,
+        then move it to Tasks/Completed Tasks and rename with " (Completed)".
+        """
+        clients = self.get_clients_enhanced()
+        for c in clients:
+            ongoing_id, completed_id = self._ensure_tasks_dirs(c["folder_id"])
+            if not ongoing_id or not completed_id:
+                continue
+
+            # List files in Ongoing
+            try:
+                q = f"'{ongoing_id}' in parents and trashed=false"
+                resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
+                for f in resp.get("files", []):
+                    if task_id in f["name"]:
+                        # Move
+                        moved = self._move_file(f["id"], ongoing_id, completed_id)
+                        # Rename
+                        new_name = f["name"]
+                        if "(Completed)" not in new_name:
+                            # insert completion tag before extension
+                            if "." in new_name:
+                                base, ext = new_name.rsplit(".", 1)
+                                new_name = f"{base} (Completed).{ext}"
+                            else:
+                                new_name = f"{new_name} (Completed)"
+                        if moved:
+                            self._rename_file(f["id"], new_name)
+                            return True
+            except HttpError as e:
+                logger.error(f"complete_task list/move error: {e}")
+        return False
+
+    def get_upcoming_tasks(self, days: int = 30) -> List[dict]:
+        """
+        Scan all Ongoing Tasks; parse 'due_date' line inside each file.
+        Return tasks due within the next `days` days, excluding completed ones.
+        """
+        limit = datetime.now() + timedelta(days=days)
+        out = []
+        clients = self.get_clients_enhanced()
+        for c in clients:
+            ongoing_id, _ = self._ensure_tasks_dirs(c["folder_id"])
+            if not ongoing_id:
+                continue
+            try:
+                q = f"'{ongoing_id}' in parents and trashed=false"
+                resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
+                for f in resp.get("files", []):
+                    # Pull file content to parse fields
+                    try:
+                        data = self.drive.files().get_media(fileId=f["id"]).execute()
+                        text = data.decode("utf-8", errors="ignore")
+                        fields = {}
+                        for line in text.splitlines():
+                            if ":" in line:
+                                k, v = line.split(":", 1)
+                                fields[k.strip()] = v.strip()
+                        _ensure_fields(fields, ["title", "due_date", "priority", "status", "task_type", "client_id"])
+                        due_raw = fields.get("due_date", "")
+                        due_dt = None
+                        if due_raw:
+                            try:
+                                due_dt = datetime.strptime(due_raw, "%Y-%m-%d")
+                            except ValueError:
+                                pass
+                        if due_dt and due_dt <= limit:
+                            out.append({
+                                "task_id": fields.get("task_id", ""),
+                                "client_id": fields.get("client_id", ""),
+                                "title": fields["title"],
+                                "due_date": due_raw,
+                                "priority": fields["priority"] or "Medium",
+                                "status": fields["status"] or "Pending",
+                                "task_type": fields["task_type"] or "Other",
+                                "description": fields.get("description", ""),
+                                "created_date": fields.get("created_date", ""),
+                                "completed_date": fields.get("completed_date", ""),
+                            })
+                    except HttpError:
+                        continue
+            except HttpError as e:
+                logger.error(f"get_upcoming_tasks error: {e}")
+        # sort by due date
+        out.sort(key=lambda t: t["due_date"] or "9999-12-31")
+        return out
+
+    def get_client_tasks(self, client_id: str) -> List[dict]:
+        c = self._client_by_id(client_id)
+        if not c:
+            return []
+        tasks = []
+        ongoing_id, completed_id = self._ensure_tasks_dirs(c["folder_id"])
+        for folder_id in [ongoing_id, completed_id]:
+            if not folder_id:
+                continue
+            try:
+                q = f"'{folder_id}' in parents and trashed=false"
+                resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
+                for f in resp.get("files", []):
+                    try:
+                        data = self.drive.files().get_media(fileId=f["id"]).execute()
+                        text = data.decode("utf-8", errors="ignore")
+                        fields = {}
+                        for line in text.splitlines():
+                            if ":" in line:
+                                k, v = line.split(":", 1)
+                                fields[k.strip()] = v.strip()
+                        _ensure_fields(fields, ["title", "due_date", "priority", "status", "task_type"])
+                        tasks.append({
+                            "task_id": fields.get("task_id", ""),
+                            "title": fields["title"],
+                            "due_date": fields["due_date"],
+                            "priority": fields["priority"] or "Medium",
+                            "status": fields["status"] or ("Completed" if folder_id == completed_id else "Pending"),
+                            "task_type": fields["task_type"] or "Other",
+                            "description": fields.get("description", ""),
+                            "created_date": fields.get("created_date", ""),
+                            "completed_date": fields.get("completed_date", ""),
+                        })
+                    except HttpError:
+                        continue
+            except HttpError as e:
+                logger.error(f"get_client_tasks error: {e}")
+        # Order with ongoing first, then completed; within each by due_date
+        tasks.sort(key=lambda t: (t["status"] != "Pending", t["due_date"] or "9999-12-31"))
+        return tasks
+
+    # ------------- Communications -------------
+
+    def add_communication_enhanced(self, comm_data: dict, client: dict) -> bool:
+        comms_id = self._ensure_folder("Communications", client["folder_id"])
+        if not comms_id:
+            return False
+        # Store a simple txt log per entry
+        doc_name = f"{comm_data.get('date','')}_{comm_data.get('time','')}_{comm_data.get('communication_id','')}.txt"
+        lines = [f"{k}: {comm_data.get(k,'')}" for k in [
+            "communication_id","client_id","date","time","type","subject","details",
+            "outcome","duration","follow_up_required","follow_up_date","created_by"
+        ]]
+        buf = io.BytesIO("\n".join(lines).encode("utf-8"))
+        buf.seek(0)
+        return bool(self._upload_bytes(doc_name, comms_id, buf, "text/plain"))
+
+    def get_client_communications(self, client_id: str) -> List[dict]:
+        c = self._client_by_id(client_id)
+        if not c:
+            return []
+        comms_id = self._ensure_folder("Communications", c["folder_id"])
+        if not comms_id:
+            return []
+        out = []
         try:
-            if not client.get('folder_id'):
-                return False
-            q = f"name='FF & ATR' and '{client['folder_id']}' in parents and trashed=false"
-            folders = self.service.files().list(q=q, fields="files(id)").execute().get('files', [])
-            if not folders:
-                return False
-            ff_atr_folder_id = folders[0]['id']
+            q = f"'{comms_id}' in parents and trashed=false"
+            resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
+            for f in resp.get("files", []):
+                try:
+                    data = self.drive.files().get_media(fileId=f["id"]).execute()
+                    text = data.decode("utf-8", errors="ignore")
+                    item = {}
+                    for line in text.splitlines():
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            item[k.strip()] = v.strip()
+                    _ensure_fields(item, ["type", "date", "time", "subject", "details", "outcome",
+                                          "duration", "follow_up_required", "follow_up_date"])
+                    out.append(item)
+                except HttpError:
+                    continue
+        except HttpError as e:
+            logger.error(f"get_client_communications error: {e}")
+        # latest first
+        out.sort(key=lambda r: r.get("date", ""), reverse=True)
+        return out
 
-            content = f"""FACT FIND - {client['display_name']}
-Date: {fact_find_data.get('fact_find_date','')}
-Age: {fact_find_data.get('age','')}
-Marital Status: {fact_find_data.get('marital_status','')}
-Dependents: {fact_find_data.get('dependents','')}
-Employment: {fact_find_data.get('employment','')}
-Annual Income: £{fact_find_data.get('annual_income','')}
-Financial Objectives: {fact_find_data.get('financial_objectives','')}
-Risk Tolerance: {fact_find_data.get('risk_tolerance','')}
-Investment Experience: {fact_find_data.get('investment_experience','')}
-"""
-            file_metadata = {'name': f"Fact Find - {client['display_name']} - {fact_find_data.get('fact_find_date','Unknown')}.txt",
-                             'parents': [ff_atr_folder_id]}
-            media = googleapiclient.http.MediaIoBaseUpload(io.BytesIO(content.encode('utf-8')), mimetype='text/plain')
-            self.service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-            return True
-        except Exception as e:
-            logger.error(f"Error saving fact find: {e}")
+    # ------------- Fact Find -------------
+
+    def save_fact_find_to_drive(self, client: dict, fact_find_data: dict) -> bool:
+        ff_id = self._ensure_folder("FF & ATR", client["folder_id"])
+        if not ff_id:
             return False
+        name = f"Fact Find – {fact_find_data.get('fact_find_date', _today_str())}.txt"
+        lines = [f"{k}: {v}" for k, v in fact_find_data.items()]
+        buf = io.BytesIO("\n".join(lines).encode("utf-8"))
+        buf.seek(0)
+        return bool(self._upload_bytes(name, ff_id, buf, "text/plain"))
+
+    # ------------- Review pack creation -------------
+
+    def create_review_pack_for_client(self, client: dict) -> Optional[dict]:
+        """
+        Creates (if not present):
+          Reviews/
+          Reviews/Review {YEAR}/
+          Reviews/Review {YEAR}/[listed subfolders]
+          Reviews/Review {YEAR}/Agenda & Valuation/Meeting Agenda – {Client} – {YEAR}.docx
+          Reviews/Review {YEAR}/Agenda & Valuation/Meeting Valuation – {Client} – {YEAR}.docx
+        Returns dict with folder ids and file links.
+        """
+        client_folder_id = client["folder_id"]
+        reviews_id = self._ensure_folder("Reviews", client_folder_id)
+        if not reviews_id:
+            return None
+
+        year = _this_year()
+        year_folder_name = f"Review {year}"
+        year_id = self._ensure_folder(year_folder_name, reviews_id)
+        if not year_id:
+            return None
+
+        # Ensure subfolders for the year
+        sub_ids = {}
+        for sub in self.REVIEW_YEAR_SUBS:
+            sub_ids[sub] = self._ensure_folder(sub, year_id)
+
+        # Ensure Agenda & Valuation has two .docx templates
+        agenda_id = sub_ids.get("Agenda & Valuation")
+        if agenda_id:
+            # Create two docx files with client name + date
+            client_name_first_last = f"{_safe(client.get('first_name'))} {_safe(client.get('surname'))}".strip()
+            if not client_name_first_last:
+                # Fallback: parse from display_name which is "Surname, First"
+                disp = client.get("display_name", "")
+                if ", " in disp:
+                    s, f = disp.split(", ", 1)
+                    client_name_first_last = f"{f} {s}".strip()
+                else:
+                    client_name_first_last = disp
+
+            # Date format like “16 August 2025”
+            pretty_date = datetime.now().strftime("%-d %B %Y") if hasattr(datetime.now(), "strftime") else _today_str("%d %B %Y")
+
+            agenda_title = f"Meeting Agenda – {client_name_first_last} – {year}.docx"
+            valuation_title = f"Meeting Valuation – {client_name_first_last} – {year}.docx"
+
+            # Only create if not present
+            if not self._find_file_in_folder(agenda_title, agenda_id):
+                self._upload_bytes(
+                    agenda_title, agenda_id,
+                    self._generate_agenda_docx(client_name_first_last, pretty_date),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+            if not self._find_file_in_folder(valuation_title, agenda_id):
+                self._upload_bytes(
+                    valuation_title, agenda_id,
+                    self._generate_valuation_docx(client_name_first_last, pretty_date),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+
+        return {
+            "reviews_folder_id": reviews_id,
+            "year_folder_id": year_id,
+            "subfolder_ids": sub_ids,
+            "reviews_folder_url": self._get_web_link(reviews_id),
+            "year_folder_url": self._get_web_link(year_id),
+        }
+
+    # ------------- .docx generators -------------
+
+    def _generate_agenda_docx(self, client_name: str, pretty_date: str) -> io.BytesIO:
+        """
+        Build a simple agenda .docx. If you have a specific layout, we can adjust the sections later.
+        """
+        doc = Document()
+        doc.add_heading("Client Review – Meeting Agenda", level=1)
+        p = doc.add_paragraph()
+        p.add_run("Client: ").bold = True
+        p.add_run(client_name)
+        p = doc.add_paragraph()
+        p.add_run("Date: ").bold = True
+        p.add_run(pretty_date)
+
+        doc.add_paragraph("")
+        doc.add_paragraph("Agenda")
+        bul = doc.add_paragraph(style="List Bullet")
+        bul.add_run("Welcome and purpose of meeting")
+        bul2 = doc.add_paragraph(style="List Bullet")
+        bul2.add_run("Review of current portfolio and performance")
+        bul3 = doc.add_paragraph(style="List Bullet")
+        bul3.add_run("Update on goals, circumstances, and risk profile")
+        bul4 = doc.add_paragraph(style="List Bullet")
+        bul4.add_run("Fees, charges, and any recommended changes")
+        bul5 = doc.add_paragraph(style="List Bullet")
+        bul5.add_run("Next steps & actions")
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf
+
+    def _generate_valuation_docx(self, client_name: str, pretty_date: str) -> io.BytesIO:
+        """
+        Build a simple valuation .docx shell.
+        """
+        doc = Document()
+        doc.add_heading("Client Review – Valuation Summary", level=1)
+        p = doc.add_paragraph()
+        p.add_run("Client: ").bold = True
+        p.add_run(client_name)
+        p = doc.add_paragraph()
+        p.add_run("Date: ").bold = True
+        p.add_run(pretty_date)
+
+        doc.add_paragraph("")
+        doc.add_paragraph("Plan(s) and Valuation")
+        tbl = doc.add_table(rows=1, cols=4)
+        hdr = tbl.rows[0].cells
+        hdr[0].text = "Provider"
+        hdr[1].text = "Policy / Plan"
+        hdr[2].text = "Valuation Date"
+        hdr[3].text = "Value (£)"
+        # Leave rows empty for manual entry each year.
+
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        return buf

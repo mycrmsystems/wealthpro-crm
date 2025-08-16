@@ -13,10 +13,6 @@ from docx import Document
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------
-# Utility helpers
-# ---------------------------
-
 def _today_str(fmt="%Y-%m-%d"):
     return datetime.now().strftime(fmt)
 
@@ -27,32 +23,16 @@ def _safe(s: Optional[str]) -> str:
     return s if s else ""
 
 def _name_for_drive(first_name: str, surname: str) -> str:
-    # Display as "Surname, First Name"
     return f"{_safe(surname).strip()}, {_safe(first_name).strip()}".strip(", ").strip()
 
 def _ensure_fields(d: dict, keys: List[str]):
     for k in keys:
         d.setdefault(k, "")
 
-# ---------------------------
-# Google Drive / Docs wrapper
-# ---------------------------
-
 class SimpleGoogleDrive:
-    """
-    A minimal Drive/Sheets helper that matches the methods your routes use.
-    - Creates the client folder structure (including Tasks/Ongoing Tasks, Tasks/Completed Tasks)
-    - Adds & completes tasks (moves files to Completed Tasks + renames with "(Completed)")
-    - Creates annual Review pack folder with subfolders and two .docx templates
-    - Basic in-Drive "database" via a Clients sheet emulated with a JSON file (optional) or
-      via a hidden metadata file inside the client folder. For simplicity here, we list clients
-      by scanning Drive folders under a known root.
-    """
+    # >>>> Set to your WealthPro root folder ID on Drive <<<<
+    ROOT_FOLDER_ID = "1DzljucgOkvm7rpfSCiYP1zlsOpwtbaWh"
 
-    # ==== Change this to your real root folder ID (you already provided this earlier) ====
-    ROOT_FOLDER_ID = "1DzljucgOkvm7rpfSCiYP1zlsOpwtbaWh"  # WealthPro - Clients Folders
-
-    # Subfolder buckets for client status
     BUCKETS = {
         "active": "Active Clients",
         "prospect": "Prospects",
@@ -60,7 +40,6 @@ class SimpleGoogleDrive:
         "deceased": "Deceased Clients",
     }
 
-    # Standard client subfolders
     CLIENT_SUBFOLDERS = [
         "Reviews",
         "ID&V",
@@ -76,11 +55,9 @@ class SimpleGoogleDrive:
         "Communications",
     ]
 
-    # Tasks subfolders
     TASKS_ONGOING = "Ongoing Tasks"
     TASKS_COMPLETED = "Completed Tasks"
 
-    # Review required subfolders (inside the year folder)
     REVIEW_YEAR_SUBS = [
         "Agenda & Valuation",
         "FF&ATR",
@@ -90,16 +67,18 @@ class SimpleGoogleDrive:
         "Review Letter",
         "Client Confirmation",
         "Emails",
-        "Review Letter",  # user listed this twice; we keep once, but to honor request we’ll keep as is
+        "Review Letter",
     ]
+
+    PROFILE_FILENAME = "_profile.txt"
 
     def __init__(self, credentials: Credentials):
         self.credentials = credentials
-        # IMPORTANT: cache_discovery=False keeps memory lighter on Render free tier
+        # keep memory usage low on Render free tier
         self.drive = build("drive", "v3", credentials=credentials, cache_discovery=False)
         logger.info("Google Drive/Sheets setup complete.")
 
-    # ------------- Low-level Drive helpers -------------
+    # --------- Low-level Drive helpers ---------
 
     def _find_folder(self, name: str, parent_id: str) -> Optional[str]:
         try:
@@ -134,10 +113,7 @@ class SimpleGoogleDrive:
 
     def _find_file_in_folder(self, name: str, parent_id: str) -> Optional[str]:
         try:
-            q = (
-                f"name='{name.replace(\"'\", \"\\'\")}' "
-                f"and '{parent_id}' in parents and trashed=false"
-            )
+            q = f"name='{name.replace(\"'\", \"\\'\")}' and '{parent_id}' in parents and trashed=false"
             resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=1).execute()
             files = resp.get("files", [])
             return files[0]["id"] if files else None
@@ -184,7 +160,7 @@ class SimpleGoogleDrive:
             logger.error(f"_get_web_link error: {e}")
             return ""
 
-    # ------------- Client listing helpers -------------
+    # --------- Client listing / CRUD ---------
 
     def _ensure_status_buckets(self) -> Dict[str, str]:
         ids = {}
@@ -196,11 +172,6 @@ class SimpleGoogleDrive:
         return ids
 
     def get_clients_enhanced(self) -> List[dict]:
-        """
-        Lists clients by scanning status buckets under the ROOT_FOLDER_ID.
-        Client folder names are "Surname, FirstName".
-        We build a minimal client dict used by routes.
-        """
         results = []
         buckets = self._ensure_status_buckets()
 
@@ -212,7 +183,6 @@ class SimpleGoogleDrive:
                 resp = self.drive.files().list(q=q, fields="files(id, name, createdTime)", pageSize=200).execute()
                 for f in resp.get("files", []):
                     display_name = f["name"]
-                    # Construct a pseudo client_id from createdTime + hash
                     created = f.get("createdTime", "")[:19].replace(":", "").replace("-", "").replace("T", "")
                     client_id = f"WP{created}"
                     results.append({
@@ -232,11 +202,8 @@ class SimpleGoogleDrive:
             except HttpError as e:
                 logger.error(f"get_clients_enhanced: listing error: {e}")
 
-        # Sort by surname, display_name
         results.sort(key=lambda c: c["display_name"].lower())
         return results
-
-    # ------------- Client CRUD used by routes -------------
 
     def create_client_folder_enhanced(self, first_name: str, surname: str, status: str) -> Optional[dict]:
         buckets = self._ensure_status_buckets()
@@ -249,18 +216,15 @@ class SimpleGoogleDrive:
         if not client_folder_id:
             return None
 
-        # Ensure standard subfolders
         for sub in self.CLIENT_SUBFOLDERS:
             self._ensure_folder(sub, client_folder_id)
 
-        # Ensure Tasks substructure
         tasks_id = self._ensure_folder("Tasks", client_folder_id)
         if tasks_id:
             self._ensure_folder(self.TASKS_ONGOING, tasks_id)
             self._ensure_folder(self.TASKS_COMPLETED, tasks_id)
 
-        logger.info(f"Created enhanced client folder for {display} in {status} section")
-
+        logger.info(f"Created enhanced client folder for {display} in active section")
         return {
             "client_folder_id": client_folder_id,
             "display_name": display,
@@ -268,12 +232,9 @@ class SimpleGoogleDrive:
         }
 
     def add_client(self, client_data: dict) -> bool:
-        # In this implementation, folder creation is the “truth”. Nothing else to persist.
-        # You can optionally store a small metadata file inside the client folder if needed.
         return True
 
     def update_client_status(self, client_id: str, new_status: str) -> bool:
-        # We need to find the client by ID from our listing
         clients = self.get_clients_enhanced()
         client = next((c for c in clients if c["client_id"] == client_id), None)
         if not client:
@@ -285,23 +246,13 @@ class SimpleGoogleDrive:
             return False
 
         try:
-            # Move the client folder from current parent to the new bucket
-            # To do that we need its current parent(s)
             file_info = self.drive.files().get(fileId=client["folder_id"], fields="parents").execute()
             old_parents = ",".join(file_info.get("parents", []))
             if not old_parents:
-                # If Drive doesn't return parents (shouldn't happen), fallback: just add new parent
-                self.drive.files().update(
-                    fileId=client["folder_id"],
-                    addParents=dest_parent,
-                    fields="id, parents"
-                ).execute()
+                self.drive.files().update(fileId=client["folder_id"], addParents=dest_parent, fields="id, parents").execute()
             else:
                 self.drive.files().update(
-                    fileId=client["folder_id"],
-                    addParents=dest_parent,
-                    removeParents=old_parents,
-                    fields="id, parents"
+                    fileId=client["folder_id"], addParents=dest_parent, removeParents=old_parents, fields="id, parents"
                 ).execute()
             return True
         except HttpError as e:
@@ -314,16 +265,11 @@ class SimpleGoogleDrive:
         if not client:
             return False
         try:
-            # Move to Trash (safe delete)
             self.drive.files().update(fileId=client["folder_id"], body={"trashed": True}).execute()
             return True
         except HttpError as e:
             logger.error(f"delete_client error: {e}")
             return False
-
-    # Profile storage as a small JSON-ish docx or txt inside the client folder.
-    # To keep things simple, we won't over-engineer — just a text file with key: value pairs.
-    PROFILE_FILENAME = "_profile.txt"
 
     def update_client_profile(self, client_id: str, profile_data: dict) -> bool:
         client = self._client_by_id(client_id)
@@ -335,7 +281,6 @@ class SimpleGoogleDrive:
         buf.write("\n".join(lines).encode("utf-8"))
         buf.seek(0)
 
-        # Overwrite if exists: remove then upload
         existing = self._find_file_in_folder(self.PROFILE_FILENAME, client["folder_id"])
         if existing:
             try:
@@ -371,7 +316,7 @@ class SimpleGoogleDrive:
         clients = self.get_clients_enhanced()
         return next((c for c in clients if c["client_id"] == client_id), None)
 
-    # ------------- Tasks -------------
+    # --------- Tasks ---------
 
     def _ensure_tasks_dirs(self, client_folder_id: str) -> (Optional[str], Optional[str]):
         tasks_id = self._ensure_folder("Tasks", client_folder_id)
@@ -382,7 +327,6 @@ class SimpleGoogleDrive:
         return ongoing_id, completed_id
 
     def add_task_enhanced(self, task_data: dict, client: dict) -> bool:
-        # Write a small task file to Ongoing Tasks
         ongoing_id, _ = self._ensure_tasks_dirs(client["folder_id"])
         if not ongoing_id:
             return False
@@ -401,28 +345,20 @@ class SimpleGoogleDrive:
         return bool(self._upload_bytes(name, ongoing_id, buf, "text/plain"))
 
     def complete_task(self, task_id: str) -> bool:
-        """
-        Look through all client folders → Tasks/Ongoing Tasks to find a file that contains the task_id,
-        then move it to Tasks/Completed Tasks and rename with " (Completed)".
-        """
         clients = self.get_clients_enhanced()
         for c in clients:
             ongoing_id, completed_id = self._ensure_tasks_dirs(c["folder_id"])
             if not ongoing_id or not completed_id:
                 continue
 
-            # List files in Ongoing
             try:
                 q = f"'{ongoing_id}' in parents and trashed=false"
                 resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
                 for f in resp.get("files", []):
                     if task_id in f["name"]:
-                        # Move
                         moved = self._move_file(f["id"], ongoing_id, completed_id)
-                        # Rename
                         new_name = f["name"]
                         if "(Completed)" not in new_name:
-                            # insert completion tag before extension
                             if "." in new_name:
                                 base, ext = new_name.rsplit(".", 1)
                                 new_name = f"{base} (Completed).{ext}"
@@ -436,10 +372,6 @@ class SimpleGoogleDrive:
         return False
 
     def get_upcoming_tasks(self, days: int = 30) -> List[dict]:
-        """
-        Scan all Ongoing Tasks; parse 'due_date' line inside each file.
-        Return tasks due within the next `days` days, excluding completed ones.
-        """
         limit = datetime.now() + timedelta(days=days)
         out = []
         clients = self.get_clients_enhanced()
@@ -451,7 +383,6 @@ class SimpleGoogleDrive:
                 q = f"'{ongoing_id}' in parents and trashed=false"
                 resp = self.drive.files().list(q=q, fields="files(id, name)", pageSize=200).execute()
                 for f in resp.get("files", []):
-                    # Pull file content to parse fields
                     try:
                         data = self.drive.files().get_media(fileId=f["id"]).execute()
                         text = data.decode("utf-8", errors="ignore")
@@ -485,7 +416,6 @@ class SimpleGoogleDrive:
                         continue
             except HttpError as e:
                 logger.error(f"get_upcoming_tasks error: {e}")
-        # sort by due date
         out.sort(key=lambda t: t["due_date"] or "9999-12-31")
         return out
 
@@ -526,17 +456,15 @@ class SimpleGoogleDrive:
                         continue
             except HttpError as e:
                 logger.error(f"get_client_tasks error: {e}")
-        # Order with ongoing first, then completed; within each by due_date
         tasks.sort(key=lambda t: (t["status"] != "Pending", t["due_date"] or "9999-12-31"))
         return tasks
 
-    # ------------- Communications -------------
+    # --------- Communications ---------
 
     def add_communication_enhanced(self, comm_data: dict, client: dict) -> bool:
         comms_id = self._ensure_folder("Communications", client["folder_id"])
         if not comms_id:
             return False
-        # Store a simple txt log per entry
         doc_name = f"{comm_data.get('date','')}_{comm_data.get('time','')}_{comm_data.get('communication_id','')}.txt"
         lines = [f"{k}: {comm_data.get(k,'')}" for k in [
             "communication_id","client_id","date","time","type","subject","details",
@@ -573,11 +501,10 @@ class SimpleGoogleDrive:
                     continue
         except HttpError as e:
             logger.error(f"get_client_communications error: {e}")
-        # latest first
         out.sort(key=lambda r: r.get("date", ""), reverse=True)
         return out
 
-    # ------------- Fact Find -------------
+    # --------- Fact Find ---------
 
     def save_fact_find_to_drive(self, client: dict, fact_find_data: dict) -> bool:
         ff_id = self._ensure_folder("FF & ATR", client["folder_id"])
@@ -589,18 +516,9 @@ class SimpleGoogleDrive:
         buf.seek(0)
         return bool(self._upload_bytes(name, ff_id, buf, "text/plain"))
 
-    # ------------- Review pack creation -------------
+    # --------- Review pack creation ---------
 
     def create_review_pack_for_client(self, client: dict) -> Optional[dict]:
-        """
-        Creates (if not present):
-          Reviews/
-          Reviews/Review {YEAR}/
-          Reviews/Review {YEAR}/[listed subfolders]
-          Reviews/Review {YEAR}/Agenda & Valuation/Meeting Agenda – {Client} – {YEAR}.docx
-          Reviews/Review {YEAR}/Agenda & Valuation/Meeting Valuation – {Client} – {YEAR}.docx
-        Returns dict with folder ids and file links.
-        """
         client_folder_id = client["folder_id"]
         reviews_id = self._ensure_folder("Reviews", client_folder_id)
         if not reviews_id:
@@ -612,18 +530,14 @@ class SimpleGoogleDrive:
         if not year_id:
             return None
 
-        # Ensure subfolders for the year
         sub_ids = {}
         for sub in self.REVIEW_YEAR_SUBS:
             sub_ids[sub] = self._ensure_folder(sub, year_id)
 
-        # Ensure Agenda & Valuation has two .docx templates
         agenda_id = sub_ids.get("Agenda & Valuation")
         if agenda_id:
-            # Create two docx files with client name + date
             client_name_first_last = f"{_safe(client.get('first_name'))} {_safe(client.get('surname'))}".strip()
             if not client_name_first_last:
-                # Fallback: parse from display_name which is "Surname, First"
                 disp = client.get("display_name", "")
                 if ", " in disp:
                     s, f = disp.split(", ", 1)
@@ -631,13 +545,14 @@ class SimpleGoogleDrive:
                 else:
                     client_name_first_last = disp
 
-            # Date format like “16 August 2025”
-            pretty_date = datetime.now().strftime("%-d %B %Y") if hasattr(datetime.now(), "strftime") else _today_str("%d %B %Y")
+            try:
+                pretty_date = datetime.now().strftime("%-d %B %Y")
+            except Exception:
+                pretty_date = _today_str("%d %B %Y")
 
             agenda_title = f"Meeting Agenda – {client_name_first_last} – {year}.docx"
             valuation_title = f"Meeting Valuation – {client_name_first_last} – {year}.docx"
 
-            # Only create if not present
             if not self._find_file_in_folder(agenda_title, agenda_id):
                 self._upload_bytes(
                     agenda_title, agenda_id,
@@ -659,12 +574,9 @@ class SimpleGoogleDrive:
             "year_folder_url": self._get_web_link(year_id),
         }
 
-    # ------------- .docx generators -------------
+    # --------- .docx generators ---------
 
     def _generate_agenda_docx(self, client_name: str, pretty_date: str) -> io.BytesIO:
-        """
-        Build a simple agenda .docx. If you have a specific layout, we can adjust the sections later.
-        """
         doc = Document()
         doc.add_heading("Client Review – Meeting Agenda", level=1)
         p = doc.add_paragraph()
@@ -676,16 +588,11 @@ class SimpleGoogleDrive:
 
         doc.add_paragraph("")
         doc.add_paragraph("Agenda")
-        bul = doc.add_paragraph(style="List Bullet")
-        bul.add_run("Welcome and purpose of meeting")
-        bul2 = doc.add_paragraph(style="List Bullet")
-        bul2.add_run("Review of current portfolio and performance")
-        bul3 = doc.add_paragraph(style="List Bullet")
-        bul3.add_run("Update on goals, circumstances, and risk profile")
-        bul4 = doc.add_paragraph(style="List Bullet")
-        bul4.add_run("Fees, charges, and any recommended changes")
-        bul5 = doc.add_paragraph(style="List Bullet")
-        bul5.add_run("Next steps & actions")
+        doc.add_paragraph("Welcome and purpose of meeting", style="List Bullet")
+        doc.add_paragraph("Review of current portfolio and performance", style="List Bullet")
+        doc.add_paragraph("Update on goals, circumstances, and risk profile", style="List Bullet")
+        doc.add_paragraph("Fees, charges, and any recommended changes", style="List Bullet")
+        doc.add_paragraph("Next steps & actions", style="List Bullet")
 
         buf = io.BytesIO()
         doc.save(buf)
@@ -693,9 +600,6 @@ class SimpleGoogleDrive:
         return buf
 
     def _generate_valuation_docx(self, client_name: str, pretty_date: str) -> io.BytesIO:
-        """
-        Build a simple valuation .docx shell.
-        """
         doc = Document()
         doc.add_heading("Client Review – Valuation Summary", level=1)
         p = doc.add_paragraph()
@@ -713,7 +617,6 @@ class SimpleGoogleDrive:
         hdr[1].text = "Policy / Plan"
         hdr[2].text = "Valuation Date"
         hdr[3].text = "Value (£)"
-        # Leave rows empty for manual entry each year.
 
         buf = io.BytesIO()
         doc.save(buf)

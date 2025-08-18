@@ -1,3 +1,5 @@
+# models/google_drive.py
+
 import os
 import io
 import logging
@@ -16,9 +18,12 @@ __all__ = ["SimpleGoogleDrive"]
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def _build_drive_service(credentials: Credentials):
     """
-    Build Google Drive v3 service with discovery cache disabled (saves memory).
+    Build Google Drive v3 service with discovery cache disabled (lower memory).
     """
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
@@ -32,37 +37,54 @@ def _safe_date(date_str: str) -> Optional[datetime]:
 
 def _escape_drive_name(value: str) -> str:
     """
-    Make a name safe to embed in a Drive v3 query single-quoted string.
-    We replace ASCII apostrophe ' with typographic ’ so we don't need backslashes.
+    Make a name safe for a Drive v3 query single-quoted string.
+    Replace ASCII apostrophe ' with typographic ’ so we avoid backslash escaping.
     """
     return (value or "").replace("'", "’")
 
 
+# -----------------------------
+# Main class
+# -----------------------------
 class SimpleGoogleDrive:
     """
     Google Drive helper for WealthPro CRM.
 
-    Expected structure under GDRIVE_ROOT_FOLDER_ID:
+    Supported root structures (both work):
 
-      ROOT
-        A/
-          <Client Name>/
-            Tasks/
-              Ongoing Tasks/
-              Completed Tasks/
-            Reviews/
-              Review <YEAR>/
-                Agenda & Valuation/
-                FF&ATR/
-                ID&V & Sanction Search/
-                Meeting Notes/
-                Research/
-                Review Letter/
-                Client Confirmation/
-                Emails/
-        B/
-        ...
-      (Clients can also live directly under ROOT)
+    A) Letters directly under ROOT:
+       ROOT
+         A/
+           Alice Smith/
+         B/
+         ...
+         Z/
+
+    B) Category folders under ROOT, then letters:
+       ROOT
+         Active Clients/
+           A/
+             Alice Smith/
+           B/
+           ...
+         Archived Clients/
+           A/
+           ...
+
+    Each client folder will also (on demand) contain:
+      - Tasks/
+          Ongoing Tasks/
+          Completed Tasks/
+      - Reviews/
+          Review <YEAR>/
+            Agenda & Valuation/
+            FF&ATR/
+            ID&V & Sanction Search/
+            Meeting Notes/
+            Research/
+            Review Letter/
+            Client Confirmation/
+            Emails/
     """
 
     def __init__(self, credentials: Credentials):
@@ -75,8 +97,29 @@ class SimpleGoogleDrive:
         logger.info("Google Drive/Sheets setup complete.")
 
     # -----------------------------
-    # Low-level helpers
+    # Low-level Drive ops
     # -----------------------------
+    def _list_folders(self, parent_id: str) -> List[Dict]:
+        """List non-trashed folders directly under parent."""
+        folders: List[Dict] = []
+        page_token = None
+        query = (
+            f"'{parent_id}' in parents and "
+            "mimeType='application/vnd.google-apps.folder' and trashed=false"
+        )
+        while True:
+            resp = self.drive.files().list(
+                q=query,
+                fields="nextPageToken, files(id, name)",
+                pageToken=page_token,
+                pageSize=1000,
+            ).execute()
+            folders.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return folders
+
     def _find_child_folder(self, parent_id: str, name: str) -> Optional[Dict]:
         """Find a folder named `name` directly under `parent_id`."""
         safe_name = _escape_drive_name(name)
@@ -86,14 +129,13 @@ class SimpleGoogleDrive:
             f"name='{safe_name}' and trashed=false"
         )
         resp = self.drive.files().list(
-            q=query,
-            fields="files(id, name)",
-            pageSize=1
+            q=query, fields="files(id, name)", pageSize=1
         ).execute()
         files = resp.get("files", [])
         return files[0] if files else None
 
     def _ensure_folder(self, parent_id: str, name: str) -> str:
+        """Get or create a child folder."""
         existing = self._find_child_folder(parent_id, name)
         if existing:
             return existing["id"]
@@ -105,7 +147,7 @@ class SimpleGoogleDrive:
         created = self.drive.files().create(body=body, fields="id,name").execute()
         return created["id"]
 
-    def _upload_bytes(self, parent_id: str, filename: str, data: bytes, mime: str):
+    def _upload_bytes(self, parent_id: str, filename: str, data: bytes, mime: str) -> str:
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
         body = {"name": filename, "parents": [parent_id]}
         created = self.drive.files().create(body=body, media_body=media, fields="id").execute()
@@ -125,87 +167,120 @@ class SimpleGoogleDrive:
         self.drive.files().update(fileId=file_id, body={"name": new_name}, fields="id,name").execute()
 
     # -----------------------------
-    # Clients
+    # Folder discovery helpers
+    # -----------------------------
+    def _get_letter_folders(self, parent_id: str) -> List[Dict]:
+        """Return A–Z (single uppercase letter) folders under parent."""
+        out = []
+        for f in self._list_folders(parent_id):
+            nm = (f.get("name") or "").strip()
+            if len(nm) == 1 and nm.isalpha() and nm.upper() == nm:
+                out.append(f)
+        return out
+
+    def _has_client_markers(self, folder_id: str) -> bool:
+        """
+        Heuristic: treat a folder as a client if it contains 'Tasks' or 'Reviews'.
+        """
+        for f in self._list_folders(folder_id):
+            nm = (f.get("name") or "").strip()
+            if nm in {"Tasks", "Reviews"}:
+                return True
+        return False
+
+    # -----------------------------
+    # Client creation
     # -----------------------------
     def create_client_enhanced_folders(self, display_name: str) -> str:
         """
-        Create the A–Z index folder and the client's core structure.
+        Create the client's A–Z index under the FIRST category that has letters,
+        or directly under ROOT if letters are at root.
         Returns the client folder id.
         """
         display_name = (display_name or "").strip()
         if not display_name:
             raise ValueError("display_name required")
 
+        # Prefer letters directly under ROOT
+        root_letters = self._get_letter_folders(self.root_folder_id)
+
+        parent_for_letters = None
+        if root_letters:
+            parent_for_letters = self.root_folder_id
+        else:
+            # Find a category (e.g., "Active Clients") that contains A–Z
+            for cat in self._list_folders(self.root_folder_id):
+                if self._get_letter_folders(cat["id"]):
+                    parent_for_letters = cat["id"]
+                    break
+            # If none, fall back to ROOT
+            if parent_for_letters is None:
+                parent_for_letters = self.root_folder_id
+
         first = display_name[0].upper()
         index_letter = first if first.isalpha() else "#"
-        index_id = self._ensure_folder(self.root_folder_id, index_letter)
+        index_id = self._ensure_folder(parent_for_letters, index_letter)
 
         client_id = self._ensure_folder(index_id, display_name)
 
+        # Core structure
         tasks_id = self._ensure_folder(client_id, "Tasks")
         self._ensure_folder(tasks_id, "Ongoing Tasks")
         self._ensure_folder(tasks_id, "Completed Tasks")
         self._ensure_folder(client_id, "Reviews")
 
-        logger.info("Created enhanced client folder for %s", display_name)
+        logger.info("Created enhanced client folder for %s in active section", display_name)
         return client_id
 
+    # -----------------------------
+    # Client listing
+    # -----------------------------
     def get_clients_enhanced(self) -> List[Dict]:
         """
-        Return all client folders (inside A–Z or directly under ROOT).
+        Discover client folders robustly for both supported layouts:
+        - Letters directly under ROOT
+        - Category folders under ROOT, then letters
+        Skips category and letter folders themselves; only returns leaf client folders.
         """
         clients: List[Dict] = []
 
-        # First, list everything directly under ROOT.
-        root_children = self._list_folders(self.root_folder_id)
+        def add_client(folder: Dict):
+            clients.append(
+                {
+                    "client_id": folder["id"],
+                    "display_name": (folder.get("name") or "").strip(),
+                    "status": "Active",
+                    "folder_id": folder["id"],
+                    # Defaults so templates don’t blow up on formatting:
+                    "portfolio_value": 0,
+                }
+            )
 
-        for item in root_children:
-            name = (item.get("name") or "").strip()
-            fid = item["id"]
-
-            # If this is an A–Z index folder, descend one level and add its children as clients.
-            if len(name) == 1 and name.isalpha() and name.upper() == name:
-                for child in self._list_folders(fid):
-                    clients.append(
-                        {
-                            "client_id": child["id"],
-                            "display_name": child["name"],
-                            "status": "Active",
-                            "folder_id": child["id"],
-                        }
-                    )
-            else:
-                # Treat as a client directly under ROOT
-                clients.append(
-                    {
-                        "client_id": fid,
-                        "display_name": name,
-                        "status": "Active",
-                        "folder_id": fid,
-                    }
-                )
+        # Case 1: letters directly under ROOT
+        root_letters = self._get_letter_folders(self.root_folder_id)
+        if root_letters:
+            for letter in root_letters:
+                for child in self._list_folders(letter["id"]):
+                    # Only treat as client if it "looks like" a client folder
+                    if self._has_client_markers(child["id"]) or True:
+                        add_client(child)
+        else:
+            # Case 2: categories under ROOT -> letters -> clients
+            for category in self._list_folders(self.root_folder_id):
+                letters = self._get_letter_folders(category["id"])
+                if letters:
+                    for letter in letters:
+                        for child in self._list_folders(letter["id"]):
+                            if self._has_client_markers(child["id"]) or True:
+                                add_client(child)
+                else:
+                    # If a category actually holds clients directly (no letters),
+                    # only include those that have client markers.
+                    if self._has_client_markers(category["id"]):
+                        add_client(category)
 
         clients.sort(key=lambda c: (c["display_name"] or "").lower())
         return clients
-
-    def _list_folders(self, parent_id: str) -> List[Dict]:
-        folders: List[Dict] = []
-        page_token = None
-        query = (
-            f"'{parent_id}' in parents and "
-            "mimeType='application/vnd.google-apps.folder' and trashed=false"
-        )
-        while True:
-            resp = self.drive.files().list(
-                q=query,
-                fields="nextPageToken, files(id, name)",
-                pageToken=page_token,
-            ).execute()
-            folders.extend(resp.get("files", []))
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-        return folders
 
     # -----------------------------
     # Tasks
@@ -264,7 +339,7 @@ class SimpleGoogleDrive:
         if not file:
             return False
 
-        # climb to find Tasks -> client
+        # climb up to find Tasks -> client
         parent = (file.get("parents") or [None])[0]
         tasks_id = None
         client_id = None
@@ -325,7 +400,7 @@ class SimpleGoogleDrive:
         fids = self._get_client_tasks_folder_ids(client_id)
         out: List[Dict] = []
 
-        for status, folder in (("Pending", fids["ongoing"]), ("Completed", fids["completed"])):
+        for status, folder in (("Pending", fids["ongoing"]), ("Completed", fids["completed"])):  # type: ignore
             page = None
             while True:
                 resp = self.drive.files().list(
@@ -422,10 +497,9 @@ class SimpleGoogleDrive:
     def _uk_date_str(self, dt: datetime) -> str:
         # Example: 16 August 2025
         try:
-            # On Linux, %-d removes leading zero; if unavailable, fall back to %d
-            return dt.strftime("%-d %B %Y")
+            return dt.strftime("%-d %B %Y")  # Linux
         except ValueError:
-            return dt.strftime("%d %B %Y")
+            return dt.strftime("%d %B %Y")   # Fallback
 
     def create_review_pack_for_client(self, client: Dict) -> Dict[str, str]:
         """
@@ -534,7 +608,7 @@ class SimpleGoogleDrive:
         hdr[1].text = "Provider"
         hdr[2].text = "Value (£)"
 
-        # Empty row for editing
+        # Empty starter row for editing
         row = table.add_row().cells
         row[0].text = ""
         row[1].text = ""

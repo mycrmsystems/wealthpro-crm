@@ -1,20 +1,26 @@
 # routes/communications.py
 """
-WealthPro CRM — Communications (Drive-only, graceful fallback)
+WealthPro CRM — Communications (Drive-only)
 
-Designed to work even if models/google_drive.SimpleGoogleDrive
-does NOT yet define:
-  - add_communication_enhanced(comm_data, client)
-  - get_client_communications(client_id) -> List[Dict]
+- GET/POST /clients/<client_id>/communications
+    * Ensures a 'Communications' folder under the client folder
+    * POST creates a .txt note file with structured content
+    * GET lists existing communication files (newest first)
 
-If those methods exist, this page will use them. If not, it will
-render safely and show a gentle message after POST.
+- GET /communications/summary
+    * Scans each client's 'Communications' folder
+    * Shows the most recent notes across clients (top 20)
+
+This uses only the Google Drive service exposed by SimpleGoogleDrive and its
+private helpers (_ensure_folder, _upload_bytes). No changes to the model are required.
 """
 
+import io
 import logging
 from datetime import datetime
 from flask import Blueprint, render_template_string, request, redirect, url_for, session
 from google.oauth2.credentials import Credentials
+from googleapiclient.http import MediaIoBaseUpload
 from models.google_drive import SimpleGoogleDrive
 
 logger = logging.getLogger(__name__)
@@ -27,26 +33,87 @@ def _require_creds():
     return Credentials(**session["credentials"])
 
 
+def _ensure_comm_folder(drive: SimpleGoogleDrive, client_folder_id: str) -> str:
+    """Ensure the Communications folder exists under the client folder and return its id."""
+    return drive._ensure_folder(client_folder_id, "Communications")  # noqa: SLF001 (accessing private helper by design)
+
+
+def _list_comm_files(drive: SimpleGoogleDrive, comm_folder_id: str):
+    """List non-folder files (notes) in the Communications folder, newest first."""
+    files = []
+    page = None
+    service = drive.drive  # googleapiclient service
+    while True:
+        resp = service.files().list(
+            q=f"'{comm_folder_id}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false",
+            fields="nextPageToken, files(id,name,modifiedTime,createdTime,webViewLink,size,mimeType)",
+            orderBy="modifiedTime desc",
+            pageToken=page,
+            pageSize=100,
+        ).execute()
+        files.extend(resp.get("files", []))
+        page = resp.get("nextPageToken")
+        if not page:
+            break
+    return files
+
+
+def _create_comm_note(drive: SimpleGoogleDrive, comm_folder_id: str, payload: dict) -> str:
+    """
+    Create a .txt communication note in the Communications folder.
+    Filename example: '2025-08-17 14-30 - Phone Call - Subject [COM20250817143055].txt'
+    """
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    date = (payload.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
+    time_ = (payload.get("time") or "").replace(":", "-").strip()
+    ctype = (payload.get("type") or "Note").strip()
+    subj = (payload.get("subject") or "No Subject").strip()
+
+    base = f"{date}"
+    if time_:
+        base += f" {time_}"
+    filename = f"{base} - {ctype} - {subj} [COM{ts}].txt"
+
+    lines = [
+        f"Communication ID: COM{ts}",
+        f"Date: {payload.get('date', '')}",
+        f"Time: {payload.get('time', '')}",
+        f"Type: {ctype}",
+        f"Subject: {subj}",
+        f"Duration: {payload.get('duration','')}",
+        f"Outcome: {payload.get('outcome','')}",
+        f"Follow Up Required: {payload.get('follow_up_required','No')}",
+        f"Follow Up Date: {payload.get('follow_up_date','')}",
+        f"Created By: {payload.get('created_by','')}",
+        "",
+        "Details:",
+        (payload.get("details") or "").strip(),
+    ]
+    data = ("\n".join(lines)).encode("utf-8")
+    return drive._upload_bytes(comm_folder_id, filename, data, "text/plain")  # noqa: SLF001
+
+
 @communications_bp.route("/clients/<client_id>/communications", methods=["GET", "POST"])
 def client_communications(client_id):
-    """Client communications page with safe fallbacks."""
+    """Per-client communications page (Drive-only)."""
     creds = _require_creds()
     if not creds:
         return redirect(url_for("auth.authorize"))
 
     try:
         drive = SimpleGoogleDrive(creds)
+
+        # Find the client folder first
         clients = drive.get_clients_enhanced()
         client = next((c for c in clients if c["client_id"] == client_id), None)
         if not client:
             return "Client not found", 404
 
-        msg = request.args.get("msg", "")
+        client_folder_id = client.get("folder_id") or client.get("client_id")
+        comm_folder_id = _ensure_comm_folder(drive, client_folder_id)
 
         if request.method == "POST":
             comm_data = {
-                "communication_id": f"COM{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                "client_id": client_id,
                 "date": request.form.get("date", datetime.now().strftime("%Y-%m-%d")),
                 "time": request.form.get("time", ""),
                 "type": request.form.get("type", ""),
@@ -58,41 +125,11 @@ def client_communications(client_id):
                 "follow_up_date": request.form.get("follow_up_date", ""),
                 "created_by": "System User",
             }
+            _ = _create_comm_note(drive, comm_folder_id, comm_data)
+            return redirect(url_for("communications.client_communications", client_id=client_id))
 
-            # Only call if the model implements it
-            if hasattr(drive, "add_communication_enhanced"):
-                ok = False
-                try:
-                    ok = drive.add_communication_enhanced(comm_data, client)  # type: ignore[attr-defined]
-                except Exception as ex:
-                    logger.exception("add_communication_enhanced failed")
-                    return f"Error saving communication: {ex}", 500
-
-                return redirect(
-                    url_for(
-                        "communications.client_communications",
-                        client_id=client_id,
-                        msg="Communication saved." if ok else "Could not save communication.",
-                    )
-                )
-            else:
-                # Graceful message when feature not yet enabled in the Drive model
-                return redirect(
-                    url_for(
-                        "communications.client_communications",
-                        client_id=client_id,
-                        msg="Communications saving is not enabled yet in the Drive model.",
-                    )
-                )
-
-        # GET — list communications if model supports it
-        communications = []
-        if hasattr(drive, "get_client_communications"):
-            try:
-                communications = drive.get_client_communications(client_id)  # type: ignore[attr-defined]
-            except Exception as ex:
-                logger.exception("get_client_communications failed")
-                communications = []
+        # GET: list recent communications (files in Communications/)
+        notes = _list_comm_files(drive, comm_folder_id)
 
         return render_template_string(
             """
@@ -120,15 +157,10 @@ def client_communications(client_id):
         </div>
     </nav>
 
-    <main class="max-w-6xl mx-auto px-6 py-8">
+    <main class="max-w-7xl mx-auto px-6 py-8">
         <div class="mb-8">
             <h1 class="text-3xl font-bold">Communications: {{ client.display_name }}</h1>
-            <p class="text-gray-600 mt-2">Track interactions and follow-ups (saves to Google Drive if enabled)</p>
-            {% if msg %}
-            <div class="mt-4 p-3 bg-blue-50 border border-blue-200 text-blue-800 rounded">
-                {{ msg }}
-            </div>
-            {% endif %}
+            <p class="text-gray-600 mt-2">Notes are stored in Google Drive → Communications</p>
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -140,14 +172,13 @@ def client_communications(client_id):
                         <div class="grid grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-sm font-medium text-gray-700 mb-1">Date *</label>
-                                <input type="date" name="date" value="{{ nowdate }}" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                <input type="date" name="date" value="{{ now_date }}" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
                             </div>
                             <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Time *</label>
-                                <input type="time" name="time" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                <label class="block text-sm font-medium text-gray-700 mb-1">Time</label>
+                                <input type="time" name="time" class="w-full px-3 py-2 border border-gray-300 rounded-md">
                             </div>
                         </div>
-
                         <div>
                             <label class="block text-sm font-medium text-gray-700 mb-1">Type *</label>
                             <select name="type" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
@@ -156,32 +187,27 @@ def client_communications(client_id):
                                 <option>Email</option>
                                 <option>Meeting</option>
                                 <option>Video Call</option>
-                                <option>Letter</option>
                                 <option>Text Message</option>
+                                <option>Letter</option>
                                 <option>Other</option>
                             </select>
                         </div>
-
                         <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Duration *</label>
-                            <input type="text" name="duration" placeholder="e.g., 15 minutes, 1 hour" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Duration</label>
+                            <input type="text" name="duration" placeholder="e.g., 15 minutes, 1 hour" class="w-full px-3 py-2 border border-gray-300 rounded-md">
                         </div>
-
                         <div>
                             <label class="block text-sm font-medium text-gray-700 mb-1">Subject</label>
-                            <input type="text" name="subject" placeholder="Brief summary" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            <input type="text" name="subject" placeholder="Brief subject" class="w-full px-3 py-2 border border-gray-300 rounded-md">
                         </div>
-
                         <div>
                             <label class="block text-sm font-medium text-gray-700 mb-1">Details</label>
                             <textarea name="details" rows="4" placeholder="What was discussed?" class="w-full px-3 py-2 border border-gray-300 rounded-md"></textarea>
                         </div>
-
                         <div>
                             <label class="block text-sm font-medium text-gray-700 mb-1">Outcome</label>
-                            <textarea name="outcome" rows="2" placeholder="What was the result?" class="w-full px-3 py-2 border border-gray-300 rounded-md"></textarea>
+                            <textarea name="outcome" rows="2" placeholder="Result / next steps" class="w-full px-3 py-2 border border-gray-300 rounded-md"></textarea>
                         </div>
-
                         <div class="grid grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-sm font-medium text-gray-700 mb-1">Follow Up?</label>
@@ -197,62 +223,36 @@ def client_communications(client_id):
                         </div>
 
                         <div class="bg-blue-50 p-3 rounded">
-                            <p class="text-xs text-blue-700">
-                                {% if comm_enabled %}
-                                  💾 Will save to Google Drive (Communications) for this client.
-                                {% else %}
-                                  ℹ️ Saving to Drive is not enabled yet in the model.
-                                {% endif %}
-                            </p>
+                            <p class="text-xs text-blue-700">💾 Saves in: Communications/</p>
                         </div>
 
-                        <button class="w-full bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">Add Communication</button>
+                        <button class="w-full bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
+                            Add Communication
+                        </button>
                     </form>
                 </div>
             </div>
 
-            <!-- Communications History -->
+            <!-- Communications list -->
             <div class="lg:col-span-2">
                 <div class="bg-white rounded-lg shadow">
                     <div class="p-6 border-b">
-                        <h3 class="text-lg font-semibold">Communication History</h3>
+                        <h3 class="text-lg font-semibold">Recent Communications</h3>
                     </div>
                     <div class="p-6">
-                        {% if communications %}
+                        {% if notes %}
                             <div class="space-y-4">
-                                {% for comm in communications %}
-                                <div class="border-l-4
-                                    {% if comm.type == 'Meeting' %}border-blue-500
-                                    {% elif comm.type == 'Phone Call' %}border-green-500
-                                    {% elif comm.type == 'Email' %}border-purple-500
-                                    {% else %}border-gray-500{% endif %}
-                                    pl-4 py-3 bg-gray-50 rounded-r">
+                                {% for f in notes %}
+                                <div class="border-l-4 border-gray-500 pl-4 py-3 bg-gray-50 rounded-r">
                                     <div class="flex justify-between items-start">
                                         <div class="flex-1">
-                                            <h4 class="font-semibold text-gray-900">{{ comm.subject or 'No Subject' }}</h4>
-                                            <p class="text-sm text-gray-600">
-                                                {{ comm.type or 'Communication' }} — {{ comm.date or '' }}{% if comm.time %} at {{ comm.time }}{% endif %}
-                                            </p>
-                                            {% if comm.duration %}
-                                            <p class="text-xs text-gray-500">Duration: {{ comm.duration }}</p>
-                                            {% endif %}
+                                            <h4 class="font-semibold text-gray-900">{{ f.name }}</h4>
+                                            <p class="text-sm text-gray-600">Modified: {{ f.modifiedTime[:10] }} • Created: {{ f.createdTime[:10] }}</p>
                                         </div>
-                                        {% if comm.follow_up_required == 'Yes' %}
-                                        <span class="bg-yellow-100 text-yellow-800 text-xs px-2 py-1 rounded">
-                                            Follow Up: {{ comm.follow_up_date or 'TBD' }}
-                                        </span>
-                                        {% endif %}
+                                        <a href="https://drive.google.com/file/d/{{ f.id }}/view"
+                                           target="_blank"
+                                           class="text-blue-600 hover:text-blue-800 text-sm">Open</a>
                                     </div>
-                                    {% if comm.details %}
-                                    <div class="mt-2 text-sm text-gray-700">
-                                        <strong>Details:</strong> {{ comm.details }}
-                                    </div>
-                                    {% endif %}
-                                    {% if comm.outcome %}
-                                    <div class="mt-1 text-sm text-gray-600">
-                                        <strong>Outcome:</strong> {{ comm.outcome }}
-                                    </div>
-                                    {% endif %}
                                 </div>
                                 {% endfor %}
                             </div>
@@ -261,21 +261,19 @@ def client_communications(client_id):
                         {% endif %}
                     </div>
                 </div>
-            </div>
-        </div>
 
-        <div class="mt-8">
-            <a href="/clients" class="bg-gray-600 text-white px-6 py-3 rounded-lg hover:bg-gray-700">Back to Clients</a>
+                <div class="mt-6">
+                    <a href="/clients" class="bg-gray-600 text-white px-6 py-3 rounded-lg hover:bg-gray-700">Back to Clients</a>
+                </div>
+            </div>
         </div>
     </main>
 </body>
 </html>
             """,
             client=client,
-            communications=communications,
-            comm_enabled=hasattr(drive, "add_communication_enhanced"),
-            nowdate=datetime.now().strftime("%Y-%m-%d"),
-            msg=msg,
+            notes=notes,
+            now_date=datetime.now().strftime("%Y-%m-%d"),
         )
     except Exception as e:
         logger.exception("Client communications error")
@@ -284,7 +282,7 @@ def client_communications(client_id):
 
 @communications_bp.route("/communications/summary")
 def communications_summary():
-    """Overview of recent communications across all clients (safe fallback)."""
+    """Overview of the most recent communications across all clients (Drive-only)."""
     creds = _require_creds()
     if not creds:
         return redirect(url_for("auth.authorize"))
@@ -293,24 +291,22 @@ def communications_summary():
         drive = SimpleGoogleDrive(creds)
         clients = drive.get_clients_enhanced()
 
-        recent_communications = []
-        if hasattr(drive, "get_client_communications"):
-            for client in clients:
-                try:
-                    comms = drive.get_client_communications(client["client_id"])  # type: ignore[attr-defined]
-                except Exception:
-                    comms = []
-                for comm in comms[:5]:  # last 5 per client
-                    comm = dict(comm or {})
-                    comm["client_name"] = client["display_name"]
-                    # Normalize date string for sort
-                    comm["__sort_date"] = comm.get("date") or ""
-                    recent_communications.append(comm)
+        recent = []
+        for c in clients:
+            client_folder_id = c.get("folder_id") or c.get("client_id")
+            comm_folder_id = drive._ensure_folder(client_folder_id, "Communications")  # noqa: SLF001
+            files = _list_comm_files(drive, comm_folder_id)
+            for f in files[:5]:  # only the latest 5 per client
+                recent.append({
+                    "id": f.get("id"),
+                    "name": f.get("name"),
+                    "modifiedTime": f.get("modifiedTime"),
+                    "client_name": c.get("display_name"),
+                })
 
-            # Sort descending by date string (if ISO YYYY-MM-DD this is fine)
-            recent_communications.sort(key=lambda x: x.get("__sort_date", ""), reverse=True)
-            # Keep top 20
-            recent_communications = recent_communications[:20]
+        # Sort by modifiedTime desc
+        recent.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
+        recent = recent[:20]  # top 20 overall
 
         return render_template_string(
             """
@@ -341,44 +337,32 @@ def communications_summary():
     <main class="max-w-7xl mx-auto px-6 py-8">
         <div class="mb-8">
             <h1 class="text-3xl font-bold">Recent Communications</h1>
-            <p class="text-gray-600 mt-2">
-                Overview across clients{% if not enabled %} — saving/listing not enabled yet in the model{% endif %}.
-            </p>
+            <p class="text-gray-600 mt-2">Across all clients (latest 20)</p>
         </div>
 
         <div class="bg-white rounded-lg shadow">
             <div class="p-6 border-b">
-                <h3 class="text-lg font-semibold">Latest 20 Communications</h3>
+                <h3 class="text-lg font-semibold">Latest Notes</h3>
             </div>
             <div class="p-6">
-                {% if items %}
+                {% if recent %}
                     <div class="space-y-4">
-                        {% for comm in items %}
-                        <div class="border-l-4
-                            {% if comm.type == 'Meeting' %}border-blue-500
-                            {% elif comm.type == 'Phone Call' %}border-green-500
-                            {% elif comm.type == 'Email' %}border-purple-500
-                            {% else %}border-gray-500{% endif %}
-                            pl-4 py-3 bg-gray-50 rounded-r">
+                        {% for r in recent %}
+                        <div class="border-l-4 border-gray-500 pl-4 py-3 bg-gray-50 rounded-r">
                             <div class="flex justify-between items-start">
                                 <div class="flex-1">
-                                    <h4 class="font-semibold text-gray-900">{{ comm.subject or 'No Subject' }}</h4>
-                                    <p class="text-sm text-gray-600">{{ comm.client_name }} | {{ comm.type or 'Communication' }} — {{ comm.date or '' }}</p>
-                                    {% if comm.details %}
-                                    <p class="text-sm text-gray-700 mt-1">
-                                        {{ comm.details[:120] }}{% if comm.details|length > 120 %}…{% endif %}
-                                    </p>
-                                    {% endif %}
+                                    <h4 class="font-semibold text-gray-900">{{ r.name }}</h4>
+                                    <p class="text-sm text-gray-600">{{ r.client_name }} • Modified: {{ r.modifiedTime[:10] }}</p>
                                 </div>
-                                {% if comm.follow_up_required == 'Yes' %}
-                                <span class="bg-yellow-100 text-yellow-800 text-xs px-2 py-1 rounded">Follow Up</span>
-                                {% endif %}
+                                <a href="https://drive.google.com/file/d/{{ r.id }}/view"
+                                   target="_blank"
+                                   class="text-blue-600 hover:text-blue-800 text-sm">Open</a>
                             </div>
                         </div>
                         {% endfor %}
                     </div>
                 {% else %}
-                    <p class="text-gray-500 text-center py-8">No communications to display.</p>
+                    <p class="text-gray-500 text-center py-8">No communications found.</p>
                 {% endif %}
             </div>
         </div>
@@ -386,8 +370,7 @@ def communications_summary():
 </body>
 </html>
             """,
-            items=recent_communications,
-            enabled=hasattr(drive, "get_client_communications"),
+            recent=recent,
         )
     except Exception as e:
         logger.exception("Communications summary error")

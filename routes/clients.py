@@ -1,8 +1,7 @@
 # routes/clients.py
-
 """
-WealthPro CRM - Client Management Routes
-Aligned with SimpleGoogleDrive API:
+WealthPro CRM — Client Management (Drive-only)
+Works with models/google_drive.SimpleGoogleDrive:
  - list clients (get_clients_enhanced)
  - add client (create_client_enhanced_folders)
  - add task (add_task_enhanced)
@@ -18,11 +17,19 @@ from models.google_drive import SimpleGoogleDrive
 logger = logging.getLogger(__name__)
 clients_bp = Blueprint("clients", __name__)
 
+
+# ------------------------------
+# Helpers
+# ------------------------------
 def _require_creds():
     if "credentials" not in session:
         return None
     return Credentials(**session["credentials"])
 
+
+# ------------------------------
+# List clients
+# ------------------------------
 @clients_bp.route("/clients")
 def clients():
     creds = _require_creds()
@@ -33,12 +40,16 @@ def clients():
         drive = SimpleGoogleDrive(creds)
         items = drive.get_clients_enhanced()
 
-        # Decorate with folder links and safe defaults for template
+        # Decorate for template safety + links
         for c in items:
             c.setdefault("email", None)
             c.setdefault("phone", None)
-            c.setdefault("status", "active")  # lowercase to match label logic
-            c["portfolio_value"] = float(c.get("portfolio_value") or 0)
+            c.setdefault("status", "active")  # lower-case for badge logic
+            try:
+                c["portfolio_value"] = float(c.get("portfolio_value") or 0.0)
+            except Exception:
+                c["portfolio_value"] = 0.0
+
             if c.get("folder_id"):
                 c["folder_url"] = f"https://drive.google.com/drive/folders/{c['folder_id']}"
             else:
@@ -153,6 +164,9 @@ def clients():
         return f"Error: {e}", 500
 
 
+# ------------------------------
+# Add client
+# ------------------------------
 @clients_bp.route("/clients/add", methods=["GET", "POST"])
 def add_client():
     creds = _require_creds()
@@ -165,21 +179,22 @@ def add_client():
 
             first_name = (request.form.get("first_name") or "").strip()
             surname = (request.form.get("surname") or "").strip()
-            email = (request.form.get("email") or "").strip()
-            phone = (request.form.get("phone") or "").strip()
-            status = (request.form.get("status") or "active").strip().lower()
-            portfolio_value = request.form.get("portfolio_value", "0").strip()
-            _ = request.form.get("notes", "").strip()  # not persisted (no DB)
+
+            # optional form fields (not persisted anywhere — no DB)
+            _email = (request.form.get("email") or "").strip()
+            _phone = (request.form.get("phone") or "").strip()
+            _status = (request.form.get("status") or "active").strip().lower()
+            _portfolio_value = request.form.get("portfolio_value", "0").strip()
+            _notes = request.form.get("notes", "").strip()
 
             if not first_name or not surname:
-                raise ValueError("First name and surname are required")
+                return "First name and surname are required", 400
 
             display_name = f"{surname}, {first_name}"
 
             # Create Drive structure (A–Z + client + Tasks/Reviews)
-            client_folder_id = drive.create_client_enhanced_folders(display_name)
+            _client_folder_id = drive.create_client_enhanced_folders(display_name)
 
-            # Success -> redirect; list pulls directly from Drive
             return redirect(url_for("clients.clients", msg="Client created successfully"))
 
         except Exception as e:
@@ -271,7 +286,10 @@ def add_client():
         """
     )
 
-# ---------- Add Task ----------
+
+# ------------------------------
+# Add task for a client
+# ------------------------------
 @clients_bp.route("/clients/<client_id>/add_task", methods=["GET", "POST"])
 def add_task(client_id):
     creds = _require_creds()
@@ -286,7 +304,6 @@ def add_task(client_id):
             return "Client not found", 404
 
         if request.method == "POST":
-            # Build task payload for Drive text file
             title = (request.form.get("title") or "").strip()
             task_type = (request.form.get("task_type") or "").strip()
             priority = (request.form.get("priority") or "Medium").strip()
@@ -367,7 +384,10 @@ def add_task(client_id):
         logger.exception("Add task error")
         return f"Error: {e}", 500
 
-# ---------- Create Review Pack (+ task) ----------
+
+# ------------------------------
+# Create Review pack + add Review task
+# ------------------------------
 @clients_bp.route("/clients/<client_id>/review")
 def create_review(client_id):
     creds = _require_creds()
@@ -381,7 +401,7 @@ def create_review(client_id):
         if not client:
             return "Client not found", 404
 
-        # 1) Create the full Review {YEAR} pack (folders + 2 docx in Agenda & Valuation)
+        # 1) Create the full Review {YEAR} pack in Drive (folders + 2 docx in Agenda & Valuation)
         drive.create_review_pack_for_client(client)
 
         # 2) Add a Review task due in 14 days

@@ -1,125 +1,94 @@
+# routes/tasks.py
 """
-WealthPro CRM - Task Management Routes
-FULL FILE — Step 2
-- Tasks page shows two sections:
-  1) Due in next 30 days (open tasks)
-  2) Due later (>30 days) (open tasks)
-- "Mark Complete" moves Drive file Ongoing -> Completed and renames to "(Completed)"
+WealthPro CRM — Task Management (Drive-only)
+- Overview page:
+    * Due in next 30 days (open tasks)
+    * Due later (>30 days OR no date) (open tasks)
+- Complete action moves Drive file Ongoing -> Completed and prefixes name.
+- Client tasks page shows that client’s open + completed tasks.
 """
 
 import logging
 from datetime import datetime, timedelta
-from flask import Blueprint, render_template_string, request, redirect, url_for, session
+from flask import Blueprint, render_template_string, redirect, url_for, session
 from google.oauth2.credentials import Credentials
 from models.google_drive import SimpleGoogleDrive
 
 logger = logging.getLogger(__name__)
+tasks_bp = Blueprint("tasks", __name__)
 
-tasks_bp = Blueprint('tasks', __name__)
 
 # ------------------------------
-# Helpers (route-local)
+# Helpers
 # ------------------------------
+def _require_creds():
+    if "credentials" not in session:
+        return None
+    return Credentials(**session["credentials"])
+
+
 def _parse_due_date(due_str):
-    """Try multiple formats; return date or None."""
+    """Try common formats; return date or None."""
     if not due_str:
         return None
-    for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d'):
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
         try:
             return datetime.strptime(due_str.strip(), fmt).date()
-        except ValueError:
+        except Exception:
             continue
     return None
 
-def _load_all_tasks(drive):
-    """
-    Read all tasks from the Tasks sheet and return list of dicts.
-    Only relies on the drive's sheet handle & tasks spreadsheet id.
-    """
-    try:
-        if not drive.tasks_spreadsheet_id:
-            return []
-
-        result = drive.sheets_service.spreadsheets().values().get(
-            spreadsheetId=drive.tasks_spreadsheet_id,
-            range='Sheet1!A2:J'
-        ).execute()
-        values = result.get('values', []) or []
-
-        tasks = []
-        for row in values:
-            # Pad row to 10 columns
-            while len(row) < 10:
-                row.append('')
-            task = {
-                'task_id': row[0],
-                'client_id': row[1],
-                'task_type': row[2],
-                'title': row[3],
-                'description': row[4],
-                'due_date': row[5],
-                'priority': row[6],
-                'status': row[7] or 'Pending',
-                'created_date': row[8],
-                'completed_date': row[9],
-            }
-            if task['task_id']:
-                tasks.append(task)
-        return tasks
-    except Exception as e:
-        logger.error(f"Error loading all tasks: {e}")
-        return []
 
 # ------------------------------
 # Routes
 # ------------------------------
-
-@tasks_bp.route('/tasks')
+@tasks_bp.route("/tasks")
 def tasks():
     """
-    Tasks overview:
-    - Section 1: due within 30 days (status != Completed)
-    - Section 2: due later than 30 days (status != Completed)
+    Tasks overview (open tasks only):
+      - Section 1: due within 30 days
+      - Section 2: due later than 30 days OR no due date
     """
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
 
     try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
+        drive = SimpleGoogleDrive(creds)
 
         # For name rendering
         clients = drive.get_clients_enhanced()
-        client_lookup = {c['client_id']: c['display_name'] for c in clients}
+        client_lookup = {c["client_id"]: c["display_name"] for c in clients}
 
-        # Load & split tasks
-        all_tasks = _load_all_tasks(drive)
-        today = datetime.now().date()
-        cutoff = today + timedelta(days=30)
+        # Within 30 days from convenience method
+        within_30 = drive.get_upcoming_tasks(30)
 
-        within_30 = []
+        # Build "later" by scanning ongoing tasks per client and excluding those already in within_30
+        horizon = datetime.today().date() + timedelta(days=30)
+        within_ids = {t["task_id"] for t in within_30}
+
         later = []
+        for c in clients:
+            all_client_tasks = drive.get_client_tasks(c["client_id"])
+            for t in all_client_tasks:
+                if (t.get("status") or "").lower() == "completed":
+                    continue
+                if t.get("task_id") in within_ids:
+                    continue
+                due = _parse_due_date(t.get("due_date"))
+                if (due and due > horizon) or (not due):
+                    later.append(t)
 
-        for t in all_tasks:
-            if (t['status'] or '').lower() == 'completed':
-                # Completed tasks are not shown here; they remain in Drive under "Completed Tasks"
-                continue
+        # Sort for nice display
+        def _sort_key(x):
+            d = _parse_due_date(x.get("due_date"))
+            return d or datetime(9999, 12, 31).date()
 
-            due = _parse_due_date(t['due_date'])
-            if not due:
-                # No valid due date -> put in 'later' so they don't disappear
-                later.append(t)
-                continue
+        within_30.sort(key=_sort_key)
+        later.sort(key=_sort_key)
 
-            if due <= cutoff:
-                within_30.append({**t, 'due_date_obj': due})
-            else:
-                later.append({**t, 'due_date_obj': due})
-
-        within_30.sort(key=lambda x: x.get('due_date_obj') or datetime(9999, 12, 31).date())
-        later.sort(key=lambda x: x.get('due_date_obj') or datetime(9999, 12, 31).date())
-
-        return render_template_string('''
+        return render_template_string(
+            """
 <!DOCTYPE html>
 <html>
 <head>
@@ -138,7 +107,6 @@ def tasks():
                 <div class="flex items-center space-x-6">
                     <a href="/" class="hover:text-blue-200">Dashboard</a>
                     <a href="/clients" class="hover:text-blue-200">Clients</a>
-                    <a href="/factfind" class="hover:text-blue-200">Fact Find</a>
                     <a href="/tasks" class="text-white font-semibold">Tasks</a>
                 </div>
             </div>
@@ -148,7 +116,7 @@ def tasks():
     <main class="max-w-7xl mx-auto px-6 py-8">
         <div class="mb-8">
             <h1 class="text-3xl font-bold">Tasks & Reminders</h1>
-            <p class="text-gray-600 mt-2">Open tasks are listed until you mark them Completed.</p>
+            <p class="text-gray-600 mt-2">Open tasks remain visible until you mark them Completed.</p>
         </div>
 
         <!-- Section: Due in next 30 days -->
@@ -173,7 +141,7 @@ def tasks():
                                         Client: {{ client_lookup.get(task.client_id, 'Unknown') }}
                                     </p>
                                     <p class="text-sm text-gray-500">
-                                        Due: {{ task.due_date }} | Priority: {{ task.priority }} | Type: {{ task.task_type }}
+                                        Due: {{ task.due_date or 'No date' }} | Priority: {{ task.priority }} | Type: {{ task.task_type or '—' }}
                                     </p>
                                     {% if task.description %}
                                     <p class="text-sm text-gray-700 mt-1">{{ task.description }}</p>
@@ -193,10 +161,10 @@ def tasks():
             </div>
         </div>
 
-        <!-- Section: Due later (>30 days) -->
+        <!-- Section: Due later (>30 days or no date) -->
         <div class="bg-white rounded-lg shadow">
             <div class="p-6 border-b flex items-center justify-between">
-                <h3 class="text-lg font-semibold">Due later (>30 days)</h3>
+                <h3 class="text-lg font-semibold">Due later (>30 days or no date)</h3>
                 <span class="text-sm text-gray-600">Total: {{ later|length }}</span>
             </div>
             <div class="p-6">
@@ -211,7 +179,7 @@ def tasks():
                                         Client: {{ client_lookup.get(task.client_id, 'Unknown') }}
                                     </p>
                                     <p class="text-sm text-gray-500">
-                                        Due: {{ task.due_date or 'No date set' }} | Priority: {{ task.priority }} | Type: {{ task.task_type }}
+                                        Due: {{ task.due_date or 'No date set' }} | Priority: {{ task.priority }} | Type: {{ task.task_type or '—' }}
                                     </p>
                                     {% if task.description %}
                                     <p class="text-sm text-gray-700 mt-1">{{ task.description }}</p>
@@ -233,190 +201,53 @@ def tasks():
     </main>
 </body>
 </html>
-        ''', within_30=within_30, later=later, client_lookup=client_lookup)
+            """,
+            within_30=within_30,
+            later=later,
+            client_lookup=client_lookup,
+        )
 
     except Exception as e:
-        logger.error(f"Tasks error: {e}")
+        logger.exception("Tasks overview error")
         return f"Error: {e}", 500
 
 
-@tasks_bp.route('/tasks/<task_id>/complete')
+@tasks_bp.route("/tasks/<task_id>/complete")
 def complete_task_route(task_id):
-    """Mark a task complete (updates sheet and moves Drive file to Completed)."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
+    """Mark a task complete (moves Drive file & renames)."""
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
 
     try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
-
-        success = drive.complete_task(task_id)
-        if success:
-            return redirect(url_for('tasks.tasks'))
-        else:
+        drive = SimpleGoogleDrive(creds)
+        ok = drive.complete_task(task_id)
+        if not ok:
             return "Error completing task", 500
-
+        return redirect(url_for("tasks.tasks"))
     except Exception as e:
-        logger.error(f"Complete task error: {e}")
+        logger.exception("Complete task error")
         return f"Error: {e}", 500
 
 
-@tasks_bp.route('/clients/<client_id>/add_task', methods=['GET', 'POST'])
-def add_client_task(client_id):
-    """Add a new task for a specific client (creates Drive file in Ongoing Tasks)."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
-
-    try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
-
-        clients = drive.get_clients_enhanced()
-        client = next((c for c in clients if c['client_id'] == client_id), None)
-        if not client:
-            return "Client not found", 404
-
-        if request.method == 'POST':
-            task_data = {
-                'task_id': f"TSK{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                'client_id': client_id,
-                'task_type': request.form.get('task_type', ''),
-                'title': request.form.get('title', ''),
-                'description': request.form.get('description', ''),
-                'due_date': request.form.get('due_date', ''),
-                'priority': request.form.get('priority', 'Medium'),
-                'status': 'Pending',
-                'created_date': datetime.now().strftime('%Y-%m-%d'),
-                'completed_date': '',
-                'time_spent': request.form.get('time_spent', '')
-            }
-
-            success = drive.add_task_enhanced(task_data, client)
-            if success:
-                return redirect(url_for('clients.clients'))
-            else:
-                return "Error creating task", 500
-
-        return render_template_string('''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>WealthPro CRM - Add Task</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { font-family: "Inter", sans-serif; }
-        .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
-    </style>
-</head>
-<body class="bg-gray-50">
-    <nav class="gradient-wealth text-white shadow-lg">
-        <div class="max-w-7xl mx-auto px-6">
-            <div class="flex justify-between items-center h-16">
-                <h1 class="text-xl font-bold">WealthPro CRM</h1>
-                <div class="flex items-center space-x-6">
-                    <a href="/" class="hover:text-blue-200">Dashboard</a>
-                    <a href="/clients" class="hover:text-blue-200">Clients</a>
-                    <a href="/factfind" class="hover:text-blue-200">Fact Find</a>
-                    <a href="/tasks" class="hover:text-blue-200">Tasks</a>
-                </div>
-            </div>
-        </div>
-    </nav>
-
-    <main class="max-w-4xl mx-auto px-6 py-8">
-        <div class="mb-8">
-            <h1 class="text-3xl font-bold">Add Task: {{ client.display_name }}</h1>
-            <p class="text-gray-600 mt-2">Creates a task file in Google Drive → Tasks → Ongoing Tasks</p>
-        </div>
-
-        <div class="bg-white rounded-lg shadow p-8">
-            <form method="POST" class="space-y-6">
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Task Type *</label>
-                        <select name="task_type" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                            <option value="">Select Type...</option>
-                            <option value="Review">Client Review</option>
-                            <option value="Follow Up">Follow Up</option>
-                            <option value="Documentation">Documentation</option>
-                            <option value="Meeting">Meeting</option>
-                            <option value="Call">Phone Call</option>
-                            <option value="Research">Research</option>
-                            <option value="Compliance">Compliance</option>
-                            <option value="Portfolio Review">Portfolio Review</option>
-                            <option value="Other">Other</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Priority</label>
-                        <select name="priority" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                            <option value="Low">Low</option>
-                            <option value="Medium" selected>Medium</option>
-                            <option value="High">High</option>
-                        </select>
-                    </div>
-                </div>
-
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Task Title *</label>
-                    <input type="text" name="title" required placeholder="e.g., Annual review meeting" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                </div>
-
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Description</label>
-                    <textarea name="description" rows="4" placeholder="Add any additional details or notes..." class="w-full px-3 py-2 border border-gray-300 rounded-md"></textarea>
-                </div>
-
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Due Date *</label>
-                        <input type="date" name="due_date" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Time to Allocate (optional)</label>
-                        <input type="text" name="time_spent" placeholder="e.g., 30 minutes, 1 hour" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                    </div>
-                </div>
-
-                <div class="bg-blue-50 p-4 rounded-lg">
-                    <h3 class="text-sm font-medium text-blue-800 mb-2">📁 Google Drive Integration</h3>
-                    <p class="text-sm text-blue-700">This task is saved to: {{ client.display_name }} / Tasks / Ongoing Tasks</p>
-                </div>
-
-                <div class="flex justify-between">
-                    <a href="/clients" class="px-6 py-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50">Cancel</a>
-                    <button type="submit" class="px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700">Create Task</button>
-                </div>
-            </form>
-        </div>
-    </main>
-</body>
-</html>
-        ''', client=client)
-
-    except Exception as e:
-        logger.error(f"Add task error: {e}")
-        return f"Error: {e}", 500
-
-
-@tasks_bp.route('/clients/<client_id>/tasks')
+@tasks_bp.route("/clients/<client_id>/tasks")
 def client_tasks(client_id):
-    """View all tasks for a specific client (open and completed)."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
+    """Task history for a specific client (open + completed)."""
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
 
     try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
-
+        drive = SimpleGoogleDrive(creds)
         clients = drive.get_clients_enhanced()
-        client = next((c for c in clients if c['client_id'] == client_id), None)
+        client = next((c for c in clients if c["client_id"] == client_id), None)
         if not client:
             return "Client not found", 404
 
         client_tasks = drive.get_client_tasks(client_id)
 
-        return render_template_string('''
+        return render_template_string(
+            """
 <!DOCTYPE html>
 <html>
 <head>
@@ -435,7 +266,6 @@ def client_tasks(client_id):
                 <div class="flex items-center space-x-6">
                     <a href="/" class="hover:text-blue-200">Dashboard</a>
                     <a href="/clients" class="hover:text-blue-200">Clients</a>
-                    <a href="/factfind" class="hover:text-blue-200">Fact Find</a>
                     <a href="/tasks" class="hover:text-blue-200">Tasks</a>
                 </div>
             </div>
@@ -446,12 +276,6 @@ def client_tasks(client_id):
         <div class="mb-8">
             <h1 class="text-3xl font-bold">Tasks: {{ client.display_name }}</h1>
             <p class="text-gray-600 mt-2">Open tasks remain visible until completed.</p>
-        </div>
-
-        <div class="mb-6">
-            <a href="/clients/{{ client.client_id }}/add_task" class="bg-green-600 text-white px-6 py-3 rounded-lg hover:bg-green-700">
-                Add New Task
-            </a>
         </div>
 
         <div class="bg-white rounded-lg shadow">
@@ -474,12 +298,15 @@ def client_tasks(client_id):
                                         {{ task.title }}
                                     </h4>
                                     <p class="text-sm text-gray-600">
-                                        {{ task.task_type }} | Due: {{ task.due_date }} | Priority: {{ task.priority }}
+                                        {{ task.task_type or '—' }} | Due: {{ task.due_date or 'No date' }} | Priority: {{ task.priority }}
                                     </p>
                                     {% if task.description %}
                                     <p class="text-sm text-gray-700 mt-1">{{ task.description }}</p>
                                     {% endif %}
                                     <p class="text-xs text-gray-500 mt-1">Created: {{ task.created_date }}</p>
+                                    {% if task.completed_date %}
+                                    <p class="text-xs text-gray-500">Completed: {{ task.completed_date }}</p>
+                                    {% endif %}
                                 </div>
                                 <div class="flex space-x-2">
                                     <span class="bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded">{{ task.status }}</span>
@@ -504,15 +331,18 @@ def client_tasks(client_id):
         </div>
 
         <div class="mt-8">
-            <a href="/clients/{{ client.client_id }}/profile" class="bg-gray-600 text-white px-6 py-3 rounded-lg hover:bg-gray-700">
-                Back to Profile
+            <a href="/clients" class="bg-gray-600 text-white px-6 py-3 rounded-lg hover:bg-gray-700">
+                Back to Clients
             </a>
         </div>
     </main>
 </body>
 </html>
-        ''', client=client, client_tasks=client_tasks)
+            """,
+            client=client,
+            client_tasks=client_tasks,
+        )
 
     except Exception as e:
-        logger.error(f"Client tasks error: {e}")
+        logger.exception("Client tasks error")
         return f"Error: {e}", 500

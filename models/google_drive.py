@@ -244,7 +244,6 @@ class SimpleGoogleDrive:
         if root_letters:
             for letter in root_letters:
                 for child in self._list_folders(letter["id"]):
-                    # Treat as client leaf
                     add_client(child)
         else:
             # Case 2: categories under ROOT -> letters -> clients
@@ -600,7 +599,6 @@ class SimpleGoogleDrive:
         subject = (comm.get("subject") or "No Subject").strip()
         cid = comm.get("communication_id", f"COM{datetime.now().strftime('%Y%m%d%H%M%S')}")
 
-        # Build filename
         time_bit = f" {time_str}" if time_str else ""
         filename = f"{date_str}{time_bit} - {ctype} - {subject} [{cid}].txt"
 
@@ -664,7 +662,7 @@ class SimpleGoogleDrive:
                         "time": f"{time_part[:2]}:{time_part[2:]}" if len(time_part) == 4 else "",
                         "type": ctype,
                         "subject": subject,
-                        "details": "",  # body not fetched (we store in filename + text body)
+                        "details": "",
                         "outcome": "",
                         "duration": "",
                         "follow_up_required": "No",

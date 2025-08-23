@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.oauth2.credentials import Credentials
 
 from docx import Document
@@ -17,7 +17,6 @@ __all__ = ["SimpleGoogleDrive"]
 
 logger = logging.getLogger(__name__)
 
-
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -25,13 +24,11 @@ def _build_drive_service(credentials: Credentials):
     """Build Google Drive v3 service with discovery cache disabled (lower memory)."""
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
-
 def _safe_date(date_str: str) -> Optional[datetime]:
     try:
         return datetime.strptime(date_str, "%Y-%m-%d")
     except Exception:
         return None
-
 
 def _escape_drive_name(value: str) -> str:
     """
@@ -66,7 +63,7 @@ class SimpleGoogleDrive:
            A/
            ...
 
-    Each client folder will also (on demand) contain:
+    Each client folder contains:
       - Tasks/
           Ongoing Tasks/
           Completed Tasks/
@@ -80,8 +77,11 @@ class SimpleGoogleDrive:
             Review Letter/
             Client Confirmation/
             Emails/
-      - Communications/   (plain .txt entries per interaction)
+      - Communications/
+      - client_meta.txt   (saved on creation; holds status/email/phone/portfolio)
     """
+
+    META_FILENAME = "client_meta.txt"
 
     def __init__(self, credentials: Credentials):
         self.drive = _build_drive_service(credentials)
@@ -139,11 +139,49 @@ class SimpleGoogleDrive:
         created = self.drive.files().create(body=body, fields="id,name").execute()
         return created["id"]
 
+    def _find_named_file(self, parent_id: str, filename: str) -> Optional[Dict]:
+        """Find a non-folder file by exact name under a parent."""
+        safe_name = _escape_drive_name(filename)
+        query = (
+            f"'{parent_id}' in parents and "
+            "mimeType!='application/vnd.google-apps.folder' and "
+            f"name='{safe_name}' and trashed=false"
+        )
+        resp = self.drive.files().list(q=query, fields="files(id,name)", pageSize=1).execute()
+        files = resp.get("files", [])
+        return files[0] if files else None
+
     def _upload_bytes(self, parent_id: str, filename: str, data: bytes, mime: str) -> str:
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
         body = {"name": filename, "parents": [parent_id]}
         created = self.drive.files().create(body=body, media_body=media, fields="id").execute()
         return created["id"]
+
+    def _upload_or_update_text(self, parent_id: str, filename: str, text: str) -> str:
+        """Create or overwrite a small text file under a folder."""
+        existing = self._find_named_file(parent_id, filename)
+        media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")), mimetype="text/plain", resumable=False)
+        if existing:
+            updated = self.drive.files().update(
+                fileId=existing["id"], media_body=media, fields="id,name"
+            ).execute()
+            return updated["id"]
+        else:
+            meta = {"name": filename, "parents": [parent_id]}
+            created = self.drive.files().create(
+                body=meta, media_body=media, fields="id,name"
+            ).execute()
+            return created["id"]
+
+    def _download_text(self, file_id: str) -> str:
+        """Download a small text file content."""
+        fh = io.BytesIO()
+        request = self.drive.files().get_media(fileId=file_id)
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return fh.getvalue().decode("utf-8", errors="ignore")
 
     def _move_file(self, file_id: str, new_parent_id: str):
         file = self.drive.files().get(fileId=file_id, fields="parents").execute()
@@ -168,7 +206,7 @@ class SimpleGoogleDrive:
         return out
 
     def _has_client_markers(self, folder_id: str) -> bool:
-        """Heuristic: treat a folder as a client if it contains 'Tasks' or 'Reviews'."""
+        """Heuristic: treat a folder as a client if it contains 'Tasks' or 'Reviews' or 'Communications'."""
         for f in self._list_folders(folder_id):
             nm = (f.get("name") or "").strip()
             if nm in {"Tasks", "Reviews", "Communications"}:
@@ -178,11 +216,15 @@ class SimpleGoogleDrive:
     # -----------------------------
     # Client creation & listing
     # -----------------------------
-    def create_client_enhanced_folders(self, display_name: str) -> str:
+    def create_client_enhanced_folders(self, display_name: str, meta: Optional[Dict] = None) -> str:
         """
         Create the client's A–Z index under the FIRST category that has letters,
         or directly under ROOT if letters are at root.
         Returns the client folder id.
+
+        Also ensures ALL expected subfolders exist immediately:
+          Tasks/(Ongoing, Completed), Reviews/(Review <YEAR> + subfolders), Communications,
+          and writes client_meta.txt with status/email/phone/portfolio.
         """
         display_name = (display_name or "").strip()
         if not display_name:
@@ -213,31 +255,102 @@ class SimpleGoogleDrive:
         tasks_id = self._ensure_folder(client_id, "Tasks")
         self._ensure_folder(tasks_id, "Ongoing Tasks")
         self._ensure_folder(tasks_id, "Completed Tasks")
-        self._ensure_folder(client_id, "Reviews")
+        reviews_id = self._ensure_folder(client_id, "Reviews")
         self._ensure_folder(client_id, "Communications")
 
-        logger.info("Created enhanced client folder for %s", display_name)
+        # Ensure current year's Review subfolders exist (folders only)
+        try:
+            year = datetime.today().year
+            yr_id = self._ensure_folder(reviews_id, f"Review {year}")
+            for sf in [
+                "Agenda & Valuation",
+                "FF&ATR",
+                "ID&V & Sanction Search",
+                "Meeting Notes",
+                "Research",
+                "Review Letter",
+                "Client Confirmation",
+                "Emails",
+            ]:
+                self._ensure_folder(yr_id, sf)
+        except Exception as e:
+            logger.warning(f"Non-fatal: could not create review subfolders for {display_name}: {e}")
+
+        # Save meta so the dashboard can sum portfolio values
+        meta = meta or {}
+        status = (meta.get("status") or "active").strip().lower()
+        email = (meta.get("email") or "").strip()
+        phone = (meta.get("phone") or "").strip()
+        try:
+            portfolio_value = float(str(meta.get("portfolio_value", 0)).replace(",", "").strip() or 0.0)
+        except Exception:
+            portfolio_value = 0.0
+
+        meta_text = (
+            f"Display Name: {display_name}\n"
+            f"Status: {status}\n"
+            f"Email: {email}\n"
+            f"Phone: {phone}\n"
+            f"Portfolio Value: {portfolio_value}\n"
+            f"Created: {datetime.utcnow().isoformat()}Z\n"
+        )
+        self._upload_or_update_text(client_id, self.META_FILENAME, meta_text)
+
+        logger.info("Created enhanced client folder for %s (with subfolders + meta)", display_name)
         return client_id
+
+    def _read_client_meta(self, client_folder_id: str) -> Dict:
+        """Read client_meta.txt if present; return dict with status/email/phone/portfolio."""
+        try:
+            f = self._find_named_file(client_folder_id, self.META_FILENAME)
+            if not f:
+                return {}
+            text = self._download_text(f["id"])
+            out: Dict[str, str] = {}
+            for line in text.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    out[k.strip().lower()] = v.strip()
+            data: Dict[str, object] = {}
+            data["status"] = (out.get("status") or "active").lower()
+            data["email"] = out.get("email") or None
+            data["phone"] = out.get("phone") or None
+            try:
+                data["portfolio_value"] = float(str(out.get("portfolio value", 0)).replace(",", ""))
+            except Exception:
+                data["portfolio_value"] = 0.0
+            return data
+        except Exception as e:
+            logger.warning(f"Could not read client_meta.txt: {e}")
+            return {}
 
     def get_clients_enhanced(self) -> List[Dict]:
         """
-        Discover client folders robustly for both supported layouts:
+        Discover client folders robustly:
         - Letters directly under ROOT
-        - Category folders under ROOT, then letters
-        Skips category and letter folders themselves; only returns leaf client folders.
+        - Or categories under ROOT, then letters, then clients
+        Returns leaf client folders and enriches them from client_meta.txt (if present).
         """
         clients: List[Dict] = []
 
         def add_client(folder: Dict):
-            clients.append(
-                {
-                    "client_id": folder["id"],
-                    "display_name": (folder.get("name") or "").strip(),
-                    "status": "active",
-                    "folder_id": folder["id"],
-                    "portfolio_value": 0.0,
-                }
-            )
+            base = {
+                "client_id": folder["id"],
+                "display_name": (folder.get("name") or "").strip(),
+                "status": "active",
+                "folder_id": folder["id"],
+                "portfolio_value": 0.0,
+                "email": None,
+                "phone": None,
+            }
+            # Enrich from meta file (if present)
+            meta = self._read_client_meta(folder["id"])
+            if meta:
+                base["status"] = meta.get("status", base["status"])  # already lowercase
+                base["email"] = meta.get("email", base["email"])
+                base["phone"] = meta.get("phone", base["phone"])
+                base["portfolio_value"] = float(meta.get("portfolio_value", base["portfolio_value"]))
+            clients.append(base)
 
         # Case 1: letters directly under ROOT
         root_letters = self._get_letter_folders(self.root_folder_id)
@@ -462,7 +575,7 @@ class SimpleGoogleDrive:
         return upcoming
 
     # -----------------------------
-    # Review Pack
+    # Review Pack (on-demand docs)
     # -----------------------------
     def _uk_date_str(self, dt: datetime) -> str:
         try:
@@ -599,6 +712,7 @@ class SimpleGoogleDrive:
         subject = (comm.get("subject") or "No Subject").strip()
         cid = comm.get("communication_id", f"COM{datetime.now().strftime('%Y%m%d%H%M%S')}")
 
+        # Build filename
         time_bit = f" {time_str}" if time_str else ""
         filename = f"{date_str}{time_bit} - {ctype} - {subject} [{cid}].txt"
 

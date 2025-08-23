@@ -1,16 +1,12 @@
 # routes/clients.py
+
 """
-WealthPro CRM — Clients (Drive-only)
-
-Endpoints:
-  - GET  /clients                 -> list clients
-  - GET/POST /clients/add         -> add a new client (creates A–Z structure + Tasks/Reviews)
-  - GET  /clients/<client_id>/review -> create Review {YEAR} pack and add a Review task
-
-Notes:
-  - Task creation form & client-specific task history live in routes/tasks.py:
-      * /clients/<client_id>/add_task
-      * /clients/<client_id>/tasks
+WealthPro CRM - Client Management Routes
+Aligned with SimpleGoogleDrive API:
+ - list clients (get_clients_enhanced)
+ - add client (create_client_enhanced_folders)  ← now passes client meta
+ - add task (add_task_enhanced)
+ - create review pack (create_review_pack_for_client) + adds a review task
 """
 
 import logging
@@ -22,12 +18,10 @@ from models.google_drive import SimpleGoogleDrive
 logger = logging.getLogger(__name__)
 clients_bp = Blueprint("clients", __name__)
 
-
 def _require_creds():
     if "credentials" not in session:
         return None
     return Credentials(**session["credentials"])
-
 
 @clients_bp.route("/clients")
 def clients():
@@ -39,14 +33,16 @@ def clients():
         drive = SimpleGoogleDrive(creds)
         items = drive.get_clients_enhanced()
 
-        # Decorate with safe defaults and folder links for the template
+        # Decorate with folder links and safe defaults for template
         for c in items:
             c.setdefault("email", None)
             c.setdefault("phone", None)
-            c["status"] = (c.get("status") or "active").lower()
+            c.setdefault("status", "active")  # lowercase to match label logic
             c["portfolio_value"] = float(c.get("portfolio_value") or 0)
-            fid = c.get("folder_id") or c.get("client_id")
-            c["folder_url"] = f"https://drive.google.com/drive/folders/{fid}" if fid else None
+            if c.get("folder_id"):
+                c["folder_url"] = f"https://drive.google.com/drive/folders/{c['folder_id']}"
+            else:
+                c["folder_url"] = None
 
         return render_template_string(
             """
@@ -131,7 +127,6 @@ def clients():
                                     <a href="{{ client.folder_url }}" target="_blank" class="text-blue-600 hover:text-blue-800 text-sm">📁 Folder</a>
                                 {% endif %}
                                 <a href="/clients/{{ client.client_id }}/add_task" class="text-indigo-700 hover:text-indigo-900 text-sm">📝 Add Task</a>
-                                <a href="/clients/{{ client.client_id }}/tasks" class="text-green-700 hover:text-green-900 text-sm">📂 View Tasks</a>
                                 <a href="/clients/{{ client.client_id }}/review" class="text-teal-700 hover:text-teal-900 text-sm font-semibold">🔄 Review</a>
                             </div>
                         </td>
@@ -154,7 +149,7 @@ def clients():
         )
 
     except Exception as e:
-        logger.exception("Clients page error")
+        logger.exception("Clients error")
         return f"Error: {e}", 500
 
 
@@ -170,22 +165,37 @@ def add_client():
 
             first_name = (request.form.get("first_name") or "").strip()
             surname = (request.form.get("surname") or "").strip()
-            # Optional info (not persisted anywhere central since we’re Drive-only)
-            _email = (request.form.get("email") or "").strip()
-            _phone = (request.form.get("phone") or "").strip()
-            _status = (request.form.get("status") or "active").strip().lower()
-            _portfolio_value = request.form.get("portfolio_value", "0").strip()
-            _notes = request.form.get("notes", "").strip()
+            email = (request.form.get("email") or "").strip()
+            phone = (request.form.get("phone") or "").strip()
+            status = (request.form.get("status") or "active").strip().lower()
+            portfolio_value_raw = (request.form.get("portfolio_value") or "0").strip()
+            notes = request.form.get("notes", "").strip()  # not persisted elsewhere
 
             if not first_name or not surname:
-                return "First name and surname are required", 400
+                raise ValueError("First name and surname are required")
+
+            # Parse portfolio numeric
+            try:
+                portfolio_value = float(portfolio_value_raw.replace(",", ""))
+            except Exception:
+                portfolio_value = 0.0
 
             display_name = f"{surname}, {first_name}"
 
-            # Create Drive structure (A–Z + client + Tasks/Reviews)
-            _client_folder_id = drive.create_client_enhanced_folders(display_name)
+            # Create Drive structure (A–Z + client + ALL subfolders) and save meta
+            drive.create_client_enhanced_folders(
+                display_name,
+                meta={
+                    "status": status,
+                    "email": email,
+                    "phone": phone,
+                    "portfolio_value": portfolio_value,
+                },
+            )
 
+            # Success -> redirect; list pulls directly from Drive (and will read meta)
             return redirect(url_for("clients.clients", msg="Client created successfully"))
+
         except Exception as e:
             logger.exception("Add client error")
             return f"Error adding client: {e}", 500
@@ -275,12 +285,9 @@ def add_client():
         """
     )
 
-
-@clients_bp.route("/clients/<client_id>/review")
-def create_review(client_id):
-    """
-    Create the Review {YEAR} pack for a client and add a "Review" task due in 14 days.
-    """
+# ---------- Add Task ----------
+@clients_bp.route("/clients/<client_id>/add_task", methods=["GET", "POST"])
+def add_task(client_id):
     creds = _require_creds()
     if not creds:
         return redirect(url_for("auth.authorize"))
@@ -292,10 +299,106 @@ def create_review(client_id):
         if not client:
             return "Client not found", 404
 
-        # Create folder structure + two docx templates in "Agenda & Valuation"
+        if request.method == "POST":
+            # Build task payload for Drive text file
+            title = (request.form.get("title") or "").strip()
+            task_type = (request.form.get("task_type") or "").strip()
+            priority = (request.form.get("priority") or "Medium").strip()
+            due_date = (request.form.get("due_date") or "").strip()
+            description = (request.form.get("description") or "").strip()
+
+            if not title:
+                return "Title is required", 400
+
+            task = {
+                "task_id": f"TSK{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                "title": title,
+                "task_type": task_type,
+                "priority": priority,
+                "due_date": due_date,
+                "status": "Pending",
+                "description": description,
+                "created_date": datetime.now().strftime("%Y-%m-%d"),
+                "completed_date": "",
+                "time_spent": "",
+            }
+
+            drive.add_task_enhanced(task, client)
+            return redirect(url_for("clients.clients", msg="Task created"))
+
+        # GET form
+        return render_template_string(
+            """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WealthPro CRM - Add Task</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50">
+    <main class="max-w-3xl mx-auto px-6 py-8">
+        <h1 class="text-2xl font-bold mb-6">Add Task for {{ client.display_name }}</h1>
+        <form method="POST" class="bg-white shadow rounded p-6 space-y-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Title *</label>
+                <input name="title" class="w-full px-3 py-2 border rounded" required>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Type</label>
+                    <input name="task_type" class="w-full px-3 py-2 border rounded" placeholder="e.g., Review, Call">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Priority</label>
+                    <select name="priority" class="w-full px-3 py-2 border rounded">
+                        <option>High</option>
+                        <option selected>Medium</option>
+                        <option>Low</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Due Date</label>
+                    <input type="date" name="due_date" class="w-full px-3 py-2 border rounded">
+                </div>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                <textarea name="description" rows="4" class="w-full px-3 py-2 border rounded"></textarea>
+            </div>
+            <div class="flex justify-between pt-2">
+                <a href="/clients" class="px-6 py-2 border rounded text-gray-700 hover:bg-gray-50">Cancel</a>
+                <button class="px-6 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Create Task</button>
+            </div>
+        </form>
+    </main>
+</body>
+</html>
+            """,
+            client=client,
+        )
+
+    except Exception as e:
+        logger.exception("Add task error")
+        return f"Error: {e}", 500
+
+# ---------- Create Review Pack (+ task) ----------
+@clients_bp.route("/clients/<client_id>/review")
+def create_review(client_id):
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
+
+    try:
+        drive = SimpleGoogleDrive(creds)
+        clients = drive.get_clients_enhanced()
+        client = next((c for c in clients if c["client_id"] == client_id), None)
+        if not client:
+            return "Client not found", 404
+
+        # 1) Create the full Review {YEAR} pack (folders + 2 docx in Agenda & Valuation)
         drive.create_review_pack_for_client(client)
 
-        # Add a corresponding Review task to Ongoing Tasks
+        # 2) Add a Review task due in 14 days
         due_date = (datetime.today() + timedelta(days=14)).strftime("%Y-%m-%d")
         review_task = {
             "task_id": f"TSK{datetime.now().strftime('%Y%m%d%H%M%S')}",
@@ -312,6 +415,7 @@ def create_review(client_id):
         drive.add_task_enhanced(review_task, client)
 
         return redirect(url_for("clients.clients", msg="Review pack created and task added."))
+
     except Exception as e:
         logger.exception("Create review error")
         return f"Error: {e}", 500

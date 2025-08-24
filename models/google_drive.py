@@ -402,9 +402,7 @@ class SimpleGoogleDrive:
     # Soft delete / restore client (CRM-only)
     # -----------------------------
     def archive_client(self, client_id: str) -> bool:
-        """
-        Soft delete: mark Status=archived in client_meta.txt (folders remain on Drive).
-        """
+        """Soft delete: mark Status=archived in client_meta.txt (folders remain on Drive)."""
         try:
             return self._write_client_meta_fields(client_id, {"status": "archived"})
         except Exception as e:
@@ -412,9 +410,7 @@ class SimpleGoogleDrive:
             return False
 
     def restore_client(self, client_id: str) -> bool:
-        """
-        Undo soft delete: mark Status=active.
-        """
+        """Undo soft delete: mark Status=active."""
         try:
             return self._write_client_meta_fields(client_id, {"status": "active"})
         except Exception as e:
@@ -422,14 +418,17 @@ class SimpleGoogleDrive:
             return False
 
     # -----------------------------
-    # Tasks (Drive .txt files) — unchanged public behavior
+    # Tasks (Drive .txt files)
     # -----------------------------
     def _get_client_tasks_folder_ids(self, client_id: str) -> Dict[str, str]:
         tasks_id = self._ensure_folder(client_id, "Tasks")
         self._ensure_folder(tasks_id, "Ongoing Tasks")
         self._ensure_folder(tasks_id, "Completed Tasks")
-        return {"tasks": tasks_id, "ongoing": self._ensure_folder(tasks_id, "Ongoing Tasks"),
-                "completed": self._ensure_folder(tasks_id, "Completed Tasks")}
+        return {
+            "tasks": tasks_id,
+            "ongoing": self._ensure_folder(tasks_id, "Ongoing Tasks"),
+            "completed": self._ensure_folder(tasks_id, "Completed Tasks"),
+        }
 
     def add_task_enhanced(self, task: Dict, client: Dict) -> bool:
         """Save a task as a .txt file in Ongoing Tasks."""
@@ -663,6 +662,108 @@ class SimpleGoogleDrive:
             logger.error(f"delete_task failed: {e}")
             return False
 
+    def get_client_tasks(self, client_id: str) -> List[Dict]:
+        """Return all tasks for a client (Pending and Completed)."""
+        fids = self._get_client_tasks_folder_ids(client_id)
+        out: List[Dict] = []
+
+        for status, folder in (("Pending", fids["ongoing"]), ("Completed", fids["completed"])):
+            page = None
+            while True:
+                resp = self.drive.files().list(
+                    q=(
+                        f"'{folder}' in parents and "
+                        "mimeType!='application/vnd.google-apps.folder' and trashed=false"
+                    ),
+                    fields="nextPageToken, files(id,name,createdTime,modifiedTime)",
+                    pageToken=page,
+                    orderBy="name_natural",
+                ).execute()
+                for f in resp.get("files", []):
+                    meta = self._parse_task_filename(f.get("name", ""))
+                    out.append(
+                        {
+                            "task_id": f.get("id"),
+                            "client_id": client_id,
+                            "title": meta.get("title", ""),
+                            "task_type": meta.get("task_type", ""),
+                            "due_date": meta.get("due_date", ""),
+                            "priority": meta.get("priority", "Medium"),
+                            "status": status,
+                            "description": "",
+                            "created_date": (f.get("createdTime", "")[:10] or ""),
+                            "completed_date": (f.get("modifiedTime", "")[:10] if status == "Completed" else ""),
+                            "time_spent": "",
+                        }
+                    )
+                page = resp.get("nextPageToken")
+                if not page:
+                    break
+
+        def sort_key(t):
+            d = _safe_date(t.get("due_date", ""))
+            return (0 if t["status"] == "Pending" else 1, d or datetime(1970, 1, 1))
+
+        out.sort(key=sort_key)
+        return out
+
+    def get_upcoming_tasks(self, days: int = 30) -> List[Dict]:
+        """
+        Scan all clients' Ongoing Tasks and return those due within `days`.
+        They remain listed until marked Completed.
+        """
+        upcoming: List[Dict] = []
+        clients = self.get_clients_enhanced()
+        today = datetime.today().date()
+        horizon = today + timedelta(days=days)
+
+        for c in clients:
+            # skip archived clients for "upcoming"
+            if (c.get("status") or "active") == "archived":
+                continue
+
+            client_id = c["client_id"]
+            fids = self._get_client_tasks_folder_ids(client_id)
+            ongoing = fids["ongoing"]
+            page = None
+            while True:
+                resp = self.drive.files().list(
+                    q=(
+                        f"'{ongoing}' in parents and "
+                        "mimeType!='application/vnd.google-apps.folder' and trashed=false"
+                    ),
+                    fields="nextPageToken, files(id,name,createdTime)",
+                    pageToken=page,
+                    orderBy="name_natural",
+                ).execute()
+                for f in resp.get("files", []):
+                    meta = self._parse_task_filename(f.get("name", ""))
+                    dd = _safe_date(meta.get("due_date", ""))
+                    if dd:
+                        dd_date = dd.date()
+                        if today <= dd_date <= horizon:
+                            upcoming.append(
+                                {
+                                    "task_id": f.get("id"),
+                                    "client_id": client_id,
+                                    "title": meta.get("title", ""),
+                                    "task_type": meta.get("task_type", ""),
+                                    "due_date": meta.get("due_date", ""),
+                                    "priority": meta.get("priority", "Medium"),
+                                    "status": "Pending",
+                                    "description": "",
+                                    "created_date": f.get("createdTime", "")[:10],
+                                    "completed_date": "",
+                                    "time_spent": "",
+                                }
+                            )
+                page = resp.get("nextPageToken")
+                if not page:
+                    break
+
+        upcoming.sort(key=lambda t: _safe_date(t["due_date"]) or datetime(1970, 1, 1))
+        return upcoming
+
     # -----------------------------
     # Review Pack (on-demand docs)
     # -----------------------------
@@ -778,7 +879,7 @@ class SimpleGoogleDrive:
         return doc
 
     # -----------------------------
-    # Communications (unchanged APIs)
+    # Communications
     # -----------------------------
     def _get_client_communications_folder(self, client_id: str) -> str:
         """Ensure and return the Communications folder for a client."""

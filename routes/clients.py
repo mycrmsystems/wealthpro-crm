@@ -1,421 +1,268 @@
 # routes/clients.py
 
-"""
-WealthPro CRM - Client Management Routes
-Aligned with SimpleGoogleDrive API:
- - list clients (get_clients_enhanced)
- - add client (create_client_enhanced_folders)  ← now passes client meta
- - add task (add_task_enhanced)
- - create review pack (create_review_pack_for_client) + adds a review task
-"""
-
 import logging
-from datetime import datetime, timedelta
 from flask import Blueprint, render_template_string, request, redirect, url_for, session
 from google.oauth2.credentials import Credentials
 from models.google_drive import SimpleGoogleDrive
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 clients_bp = Blueprint("clients", __name__)
 
-def _require_creds():
-    if "credentials" not in session:
-        return None
-    return Credentials(**session["credentials"])
-
-@clients_bp.route("/clients")
+@clients_bp.route("/clients", methods=["GET", "POST"])
 def clients():
-    creds = _require_creds()
-    if not creds:
+    if "credentials" not in session:
         return redirect(url_for("auth.authorize"))
 
     try:
-        drive = SimpleGoogleDrive(creds)
-        items = drive.get_clients_enhanced()
+        credentials = Credentials(**session["credentials"])
+        drive = SimpleGoogleDrive(credentials)
 
-        # Decorate with folder links and safe defaults for template
-        for c in items:
-            c.setdefault("email", None)
-            c.setdefault("phone", None)
-            c.setdefault("status", "active")  # lowercase to match label logic
-            c["portfolio_value"] = float(c.get("portfolio_value") or 0)
-            if c.get("folder_id"):
-                c["folder_url"] = f"https://drive.google.com/drive/folders/{c['folder_id']}"
-            else:
-                c["folder_url"] = None
+        all_clients = drive.get_clients_enhanced()
+        show_archived = request.args.get("archived") == "1"
 
-        return render_template_string(
-            """
+        if not show_archived:
+            clients = [c for c in all_clients if (c.get("status") or "active") != "archived"]
+        else:
+            clients = all_clients
+
+        total_active_value = sum(
+            float(c.get("portfolio_value") or 0.0)
+            for c in all_clients
+            if (c.get("status") or "active") != "archived"
+        )
+
+        return render_template_string("""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WealthPro CRM - Clients</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { font-family: "Inter", sans-serif; }
-        .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
-    </style>
+  <title>WealthPro CRM - Clients</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style> body { font-family: "Inter", sans-serif; } .gradient-wealth{background:linear-gradient(135deg,#1a365d 0%,#2563eb 100%);} </style>
 </head>
 <body class="bg-gray-50">
-    <nav class="gradient-wealth text-white shadow-lg">
-        <div class="max-w-7xl mx-auto px-6">
-            <div class="flex justify-between items-center h-16">
-                <h1 class="text-xl font-bold">WealthPro CRM</h1>
-                <div class="flex items-center space-x-6">
-                    <a href="/" class="hover:text-blue-200">Dashboard</a>
-                    <a href="/clients" class="text-white font-semibold">Clients</a>
-                    <a href="/tasks" class="hover:text-blue-200">Tasks</a>
-                </div>
-            </div>
+  <nav class="gradient-wealth text-white shadow-lg">
+    <div class="max-w-7xl mx-auto px-6">
+      <div class="flex justify-between items-center h-16">
+        <h1 class="text-xl font-bold">WealthPro CRM</h1>
+        <div class="flex items-center space-x-6">
+          <a href="/" class="hover:text-blue-200">Dashboard</a>
+          <a href="/clients" class="text-white font-semibold">Clients</a>
+          <a href="/tasks" class="hover:text-blue-200">Tasks</a>
         </div>
-    </nav>
+      </div>
+    </div>
+  </nav>
 
-    <main class="max-w-7xl mx-auto px-6 py-8">
-        <div class="flex justify-between items-center mb-8">
-            <div>
-                <h1 class="text-3xl font-bold">Clients</h1>
-                <p class="text-gray-600 mt-1">Total clients: {{ clients|length }}</p>
-            </div>
-            <a href="/clients/add" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700">
-                Add New Client
-            </a>
-        </div>
-
-        {% if request.args.get('msg') %}
-        <div class="mb-6 p-4 bg-green-100 border border-green-300 text-green-800 rounded">
-            {{ request.args.get('msg') }}
-        </div>
+  <main class="max-w-7xl mx-auto px-6 py-8">
+    <div class="flex items-center justify-between mb-6">
+      <div>
+        <h1 class="text-3xl font-bold">Clients</h1>
+        <p class="text-gray-600">Total Active Portfolio Value: £{{ "{:,.2f}".format(total_active_value) }}</p>
+      </div>
+      <div class="space-x-2">
+        {% if show_archived %}
+          <a href="/clients" class="px-4 py-2 border rounded">Hide archived</a>
+        {% else %}
+          <a href="/clients?archived=1" class="px-4 py-2 border rounded">Show archived</a>
         {% endif %}
+        <a href="/clients/new" class="px-4 py-2 bg-green-600 text-white rounded">New Client</a>
+      </div>
+    </div>
 
-        <div class="bg-white rounded-lg shadow overflow-hidden">
-            <table class="min-w-full">
-                <thead class="bg-gray-50">
-                    <tr>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Client</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Contact</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Portfolio</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
-                    </tr>
-                </thead>
-                <tbody class="bg-white divide-y divide-gray-200">
-                    {% for client in clients %}
-                    <tr>
-                        <td class="px-6 py-4">
-                            <div class="font-medium text-gray-900">{{ client.display_name }}</div>
-                            <div class="text-sm text-gray-500">ID: {{ client.client_id }}</div>
-                        </td>
-                        <td class="px-6 py-4">
-                            <div class="text-sm text-gray-900">{{ client.email or 'N/A' }}</div>
-                            <div class="text-sm text-gray-500">{{ client.phone or 'N/A' }}</div>
-                        </td>
-                        <td class="px-6 py-4">
-                            <span class="px-2 py-1 text-xs rounded-full
-                                {% if client.status == 'active' %}bg-green-100 text-green-800
-                                {% elif client.status == 'deceased' %}bg-gray-100 text-gray-800
-                                {% elif client.status == 'no_longer_client' %}bg-red-100 text-red-800
-                                {% else %}bg-yellow-100 text-yellow-800{% endif %}">
-                                {{ (client.status or 'active').replace('_', ' ').title() }}
-                            </span>
-                        </td>
-                        <td class="px-6 py-4 text-sm">
-                            £{{ "{:,.0f}".format(client.portfolio_value) }}
-                        </td>
-                        <td class="px-6 py-4">
-                            <div class="flex gap-3 flex-wrap items-center">
-                                {% if client.folder_url %}
-                                    <a href="{{ client.folder_url }}" target="_blank" class="text-blue-600 hover:text-blue-800 text-sm">📁 Folder</a>
-                                {% endif %}
-                                <a href="/clients/{{ client.client_id }}/add_task" class="text-indigo-700 hover:text-indigo-900 text-sm">📝 Add Task</a>
-                                <a href="/clients/{{ client.client_id }}/review" class="text-teal-700 hover:text-teal-900 text-sm font-semibold">🔄 Review</a>
-                            </div>
-                        </td>
-                    </tr>
-                    {% else %}
-                    <tr>
-                        <td colspan="5" class="px-6 py-4 text-center text-gray-500">
-                            No clients found. <a href="/clients/add" class="text-blue-600">Add your first client</a>
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-    </main>
+    <div class="bg-white rounded shadow">
+      <div class="divide-y">
+        {% for c in clients %}
+          <div class="p-4 flex items-center justify-between">
+            <div>
+              <div class="font-semibold">
+                <a href="/clients/{{ c.client_id }}/profile" class="text-blue-700 hover:text-blue-900">{{ c.display_name }}</a>
+                {% if c.status == 'archived' %}
+                  <span class="ml-2 text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-700">Archived</span>
+                {% endif %}
+              </div>
+              <div class="text-sm text-gray-600">
+                Portfolio: £{{ "{:,.2f}".format(c.portfolio_value or 0) }} · {{ c.email or 'no email' }} · {{ c.phone or 'no phone' }}
+              </div>
+            </div>
+            <div class="space-x-2">
+              <a href="/clients/{{ c.client_id }}/profile" class="text-sm px-3 py-1 border rounded">Profile</a>
+              {% if c.status != 'archived' %}
+              <form method="POST" action="/clients/{{ c.client_id }}/delete" style="display:inline" onsubmit="return confirm('Archive this client in CRM (folders remain on Drive)?');">
+                <button class="text-sm px-3 py-1 bg-red-600 text-white rounded">Delete (CRM only)</button>
+              </form>
+              {% endif %}
+            </div>
+          </div>
+        {% endfor %}
+        {% if not clients %}
+          <div class="p-8 text-center text-gray-500">No clients found.</div>
+        {% endif %}
+      </div>
+    </div>
+  </main>
 </body>
 </html>
-            """,
-            clients=items,
-        )
+        """, clients=clients, total_active_value=total_active_value, show_archived=show_archived)
 
     except Exception as e:
-        logger.exception("Clients error")
+        logger.error(f"clients list error: {e}")
         return f"Error: {e}", 500
 
 
-@clients_bp.route("/clients/add", methods=["GET", "POST"])
-def add_client():
-    creds = _require_creds()
-    if not creds:
+@clients_bp.route("/clients/new", methods=["GET", "POST"])
+def new_client():
+    if "credentials" not in session:
         return redirect(url_for("auth.authorize"))
+    try:
+        credentials = Credentials(**session["credentials"])
+        drive = SimpleGoogleDrive(credentials)
 
-    if request.method == "POST":
-        try:
-            drive = SimpleGoogleDrive(creds)
-
-            first_name = (request.form.get("first_name") or "").strip()
-            surname = (request.form.get("surname") or "").strip()
+        if request.method == "POST":
+            display_name = (request.form.get("display_name") or "").strip()
             email = (request.form.get("email") or "").strip()
             phone = (request.form.get("phone") or "").strip()
-            status = (request.form.get("status") or "active").strip().lower()
-            portfolio_value_raw = (request.form.get("portfolio_value") or "0").strip()
-            notes = request.form.get("notes", "").strip()  # not persisted elsewhere
+            portfolio_value = (request.form.get("portfolio_value") or "").strip()
 
-            if not first_name or not surname:
-                raise ValueError("First name and surname are required")
-
-            # Parse portfolio numeric
-            try:
-                portfolio_value = float(portfolio_value_raw.replace(",", ""))
-            except Exception:
-                portfolio_value = 0.0
-
-            display_name = f"{surname}, {first_name}"
-
-            # Create Drive structure (A–Z + client + ALL subfolders) and save meta
-            drive.create_client_enhanced_folders(
+            # Create full folder structure immediately + save meta
+            client_id = drive.create_client_enhanced_folders(
                 display_name,
                 meta={
-                    "status": status,
+                    "status": "active",
                     "email": email,
                     "phone": phone,
                     "portfolio_value": portfolio_value,
                 },
             )
+            return redirect(url_for("clients.client_profile", client_id=client_id))
 
-            # Success -> redirect; list pulls directly from Drive (and will read meta)
-            return redirect(url_for("clients.clients", msg="Client created successfully"))
-
-        except Exception as e:
-            logger.exception("Add client error")
-            return f"Error adding client: {e}", 500
-
-    # GET form
-    return render_template_string(
-        """
+        return render_template_string("""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WealthPro CRM - Add Client</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { font-family: "Inter", sans-serif; }
-        .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
-    </style>
+  <title>New Client</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style> body{font-family:"Inter",sans-serif} </style>
 </head>
 <body class="bg-gray-50">
-    <nav class="gradient-wealth text-white shadow-lg">
-        <div class="max-w-7xl mx-auto px-6">
-            <div class="flex justify-between items-center h-16">
-                <h1 class="text-xl font-bold">WealthPro CRM</h1>
-                <div class="flex items-center space-x-6">
-                    <a href="/" class="hover:text-blue-200">Dashboard</a>
-                    <a href="/clients" class="hover:text-blue-200">Clients</a>
-                    <a href="/tasks" class="hover:text-blue-200">Tasks</a>
-                </div>
-            </div>
+  <main class="max-w-xl mx-auto px-6 py-10">
+    <h1 class="text-2xl font-bold mb-6">Create Client</h1>
+    <form method="POST" class="bg-white rounded shadow p-6 space-y-4">
+      <div>
+        <label class="block text-sm font-medium">Display Name *</label>
+        <input name="display_name" required class="w-full border rounded px-3 py-2">
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium">Email</label>
+          <input name="email" class="w-full border rounded px-3 py-2">
         </div>
-    </nav>
-
-    <main class="max-w-4xl mx-auto px-6 py-8">
-        <div class="mb-8">
-            <h1 class="text-3xl font-bold">Add New Client</h1>
-            <p class="text-gray-600 mt-2">Client will be filed as "Surname, First Name" in the A–Z folder system.</p>
+        <div>
+          <label class="block text-sm font-medium">Phone</label>
+          <input name="phone" class="w-full border rounded px-3 py-2">
         </div>
-
-        <div class="bg-white rounded-lg shadow p-8">
-            <form method="POST" class="space-y-6">
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">First Name *</label>
-                        <input type="text" name="first_name" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Surname *</label>
-                        <input type="text" name="surname" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                        <p class="text-xs text-gray-500 mt-1">Will display as "Surname, First Name"</p>
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Email</label>
-                        <input type="email" name="email" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Phone</label>
-                        <input type="tel" name="phone" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Status</label>
-                        <select name="status" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                            <option value="active">Active</option>
-                            <option value="prospect">Prospect</option>
-                            <option value="no_longer_client">No Longer Client</option>
-                            <option value="deceased">Deceased</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Portfolio Value (£)</label>
-                        <input type="number" name="portfolio_value" step="0.01" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                    </div>
-                </div>
-
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Notes</label>
-                    <textarea name="notes" rows="4" class="w-full px-3 py-2 border border-gray-300 rounded-md"></textarea>
-                </div>
-
-                <div class="flex justify-between">
-                    <a href="/clients" class="px-6 py-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50">Cancel</a>
-                    <button type="submit" class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Create Client</button>
-                </div>
-            </form>
-        </div>
-    </main>
+      </div>
+      <div>
+        <label class="block text-sm font-medium">Portfolio Value (£)</label>
+        <input name="portfolio_value" placeholder="e.g., 125000" class="w-full border rounded px-3 py-2">
+      </div>
+      <div class="flex justify-end">
+        <a href="/clients" class="px-4 py-2 border rounded mr-2">Cancel</a>
+        <button class="px-4 py-2 bg-green-600 text-white rounded">Create</button>
+      </div>
+    </form>
+  </main>
 </body>
 </html>
-        """
-    )
-
-# ---------- Add Task ----------
-@clients_bp.route("/clients/<client_id>/add_task", methods=["GET", "POST"])
-def add_task(client_id):
-    creds = _require_creds()
-    if not creds:
-        return redirect(url_for("auth.authorize"))
-
-    try:
-        drive = SimpleGoogleDrive(creds)
-        clients = drive.get_clients_enhanced()
-        client = next((c for c in clients if c["client_id"] == client_id), None)
-        if not client:
-            return "Client not found", 404
-
-        if request.method == "POST":
-            # Build task payload for Drive text file
-            title = (request.form.get("title") or "").strip()
-            task_type = (request.form.get("task_type") or "").strip()
-            priority = (request.form.get("priority") or "Medium").strip()
-            due_date = (request.form.get("due_date") or "").strip()
-            description = (request.form.get("description") or "").strip()
-
-            if not title:
-                return "Title is required", 400
-
-            task = {
-                "task_id": f"TSK{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                "title": title,
-                "task_type": task_type,
-                "priority": priority,
-                "due_date": due_date,
-                "status": "Pending",
-                "description": description,
-                "created_date": datetime.now().strftime("%Y-%m-%d"),
-                "completed_date": "",
-                "time_spent": "",
-            }
-
-            drive.add_task_enhanced(task, client)
-            return redirect(url_for("clients.clients", msg="Task created"))
-
-        # GET form
-        return render_template_string(
-            """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>WealthPro CRM - Add Task</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-50">
-    <main class="max-w-3xl mx-auto px-6 py-8">
-        <h1 class="text-2xl font-bold mb-6">Add Task for {{ client.display_name }}</h1>
-        <form method="POST" class="bg-white shadow rounded p-6 space-y-4">
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Title *</label>
-                <input name="title" class="w-full px-3 py-2 border rounded" required>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Type</label>
-                    <input name="task_type" class="w-full px-3 py-2 border rounded" placeholder="e.g., Review, Call">
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Priority</label>
-                    <select name="priority" class="w-full px-3 py-2 border rounded">
-                        <option>High</option>
-                        <option selected>Medium</option>
-                        <option>Low</option>
-                    </select>
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Due Date</label>
-                    <input type="date" name="due_date" class="w-full px-3 py-2 border rounded">
-                </div>
-            </div>
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
-                <textarea name="description" rows="4" class="w-full px-3 py-2 border rounded"></textarea>
-            </div>
-            <div class="flex justify-between pt-2">
-                <a href="/clients" class="px-6 py-2 border rounded text-gray-700 hover:bg-gray-50">Cancel</a>
-                <button class="px-6 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Create Task</button>
-            </div>
-        </form>
-    </main>
-</body>
-</html>
-            """,
-            client=client,
-        )
+        """)
 
     except Exception as e:
-        logger.exception("Add task error")
+        logger.error(f"new_client error: {e}")
         return f"Error: {e}", 500
 
-# ---------- Create Review Pack (+ task) ----------
-@clients_bp.route("/clients/<client_id>/review")
-def create_review(client_id):
-    creds = _require_creds()
-    if not creds:
-        return redirect(url_for("auth.authorize"))
 
+@clients_bp.route("/clients/<client_id>/profile")
+def client_profile(client_id):
+    if "credentials" not in session:
+        return redirect(url_for("auth.authorize"))
     try:
-        drive = SimpleGoogleDrive(creds)
+        credentials = Credentials(**session["credentials"])
+        drive = SimpleGoogleDrive(credentials)
+
         clients = drive.get_clients_enhanced()
         client = next((c for c in clients if c["client_id"] == client_id), None)
         if not client:
             return "Client not found", 404
 
-        # 1) Create the full Review {YEAR} pack (folders + 2 docx in Agenda & Valuation)
-        drive.create_review_pack_for_client(client)
+        # A quick deep link to the client folder in Drive (existing behavior preserved)
+        drive_link = f"https://drive.google.com/drive/folders/{client_id}"
 
-        # 2) Add a Review task due in 14 days
-        due_date = (datetime.today() + timedelta(days=14)).strftime("%Y-%m-%d")
-        review_task = {
-            "task_id": f"TSK{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            "title": "Annual Client Review",
-            "task_type": "Review",
-            "priority": "High",
-            "due_date": due_date,
-            "status": "Pending",
-            "description": "Prepare and complete the annual client review.",
-            "created_date": datetime.now().strftime("%Y-%m-%d"),
-            "completed_date": "",
-            "time_spent": "",
-        }
-        drive.add_task_enhanced(review_task, client)
+        return render_template_string("""
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Client Profile</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style> body{font-family:"Inter",sans-serif} </style>
+</head>
+<body class="bg-gray-50">
+  <main class="max-w-3xl mx-auto px-6 py-10">
+    <div class="flex items-start justify-between">
+      <div>
+        <h1 class="text-2xl font-bold">{{ client.display_name }}</h1>
+        <p class="text-gray-600">Portfolio: £{{ "{:,.2f}".format(client.portfolio_value or 0) }}</p>
+        {% if client.status == 'archived' %}
+          <p class="text-xs px-2 py-0.5 rounded bg-gray-100 inline-block mt-1">Archived (CRM)</p>
+        {% endif %}
+      </div>
+      <div class="space-x-2">
+        <a href="{{ drive_link }}" target="_blank" class="px-3 py-2 border rounded">Open Folder ↗</a>
+        {% if client.status != 'archived' %}
+        <form method="POST" action="/clients/{{ client.client_id }}/delete" style="display:inline" onsubmit="return confirm('Archive this client in CRM (folders remain on Drive)?');">
+          <button class="px-3 py-2 bg-red-600 text-white rounded">Delete (CRM only)</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
 
-        return redirect(url_for("clients.clients", msg="Review pack created and task added."))
+    <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+      <a href="/clients/{{ client.client_id }}/tasks" class="block p-4 bg-white rounded shadow hover:shadow-md">
+        <div class="font-semibold mb-1">Tasks</div>
+        <div class="text-sm text-gray-600">View tasks for this client</div>
+      </a>
+      <a href="/clients/{{ client.client_id }}/communications" class="block p-4 bg-white rounded shadow hover:shadow-md">
+        <div class="font-semibold mb-1">Communications</div>
+        <div class="text-sm text-gray-600">Log & review interactions</div>
+      </a>
+      <a href="/clients/{{ client.client_id }}/review-pack" class="block p-4 bg-white rounded shadow hover:shadow-md">
+        <div class="font-semibold mb-1">Review Pack</div>
+        <div class="text-sm text-gray-600">Create the annual review pack</div>
+      </a>
+    </div>
+  </main>
+</body>
+</html>
+        """, client=client, drive_link=drive_link)
 
     except Exception as e:
-        logger.exception("Create review error")
+        logger.error(f"client_profile error: {e}")
+        return f"Error: {e}", 500
+
+
+@clients_bp.route("/clients/<client_id>/delete", methods=["POST"])
+def delete_client_crm_only(client_id):
+    """
+    Soft-delete a client: mark as archived in CRM only. Google Drive folders remain intact.
+    """
+    if "credentials" not in session:
+        return redirect(url_for("auth.authorize"))
+    try:
+        credentials = Credentials(**session["credentials"])
+        drive = SimpleGoogleDrive(credentials)
+        ok = drive.archive_client(client_id)
+        if not ok:
+            return "Error archiving client", 500
+        return redirect(url_for("clients.clients"))
+    except Exception as e:
+        logger.error(f"delete_client_crm_only error: {e}")
         return f"Error: {e}", 500

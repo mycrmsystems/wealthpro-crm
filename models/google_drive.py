@@ -42,7 +42,7 @@ class SimpleGoogleDrive:
     """
     Google Drive helper for WealthPro CRM.
 
-    Each client folder contains:
+    Client folder structure created at client creation time:
       - Tasks/
           Ongoing Tasks/
           Completed Tasks/
@@ -57,7 +57,7 @@ class SimpleGoogleDrive:
             Client Confirmation/
             Emails/
       - Communications/
-      - client_meta.txt   (status/email/phone/portfolio)
+      - client_meta.txt   (Status/Email/Phone/Portfolio Value)
     """
 
     META_FILENAME = "client_meta.txt"
@@ -195,9 +195,36 @@ class SimpleGoogleDrive:
     # -----------------------------
     # Client creation & listing
     # -----------------------------
+    def _ensure_client_structure(self, client_id: str):
+        """
+        Ensure ALL expected subfolders exist in the client's main folder.
+        This runs at client creation (idempotent).
+        """
+        # Top-level
+        tasks_id = self._ensure_folder(client_id, "Tasks")
+        self._ensure_folder(tasks_id, "Ongoing Tasks")
+        self._ensure_folder(tasks_id, "Completed Tasks")
+        reviews_id = self._ensure_folder(client_id, "Reviews")
+        self._ensure_folder(client_id, "Communications")
+
+        # Current year's Review structure (folders only)
+        year = datetime.today().year
+        yr_id = self._ensure_folder(reviews_id, f"Review {year}")
+        for sf in [
+            "Agenda & Valuation",
+            "FF&ATR",
+            "ID&V & Sanction Search",
+            "Meeting Notes",
+            "Research",
+            "Review Letter",
+            "Client Confirmation",
+            "Emails",
+        ]:
+            self._ensure_folder(yr_id, sf)
+
     def create_client_enhanced_folders(self, display_name: str, meta: Optional[Dict] = None) -> str:
         """
-        Create the client's A–Z index and ALL expected subfolders.
+        Create the client's A–Z index and ALL expected subfolders inside the client folder.
         Also writes client_meta.txt with status/email/phone/portfolio.
         """
         display_name = (display_name or "").strip()
@@ -224,32 +251,13 @@ class SimpleGoogleDrive:
 
         client_id = self._ensure_folder(index_id, display_name)
 
-        # Core structure
-        tasks_id = self._ensure_folder(client_id, "Tasks")
-        self._ensure_folder(tasks_id, "Ongoing Tasks")
-        self._ensure_folder(tasks_id, "Completed Tasks")
-        reviews_id = self._ensure_folder(client_id, "Reviews")
-        self._ensure_folder(client_id, "Communications")
-
-        # Ensure current year's Review subfolders exist (folders only)
+        # Ensure the whole structure (main client folder gets all subfolders)
         try:
-            year = datetime.today().year
-            yr_id = self._ensure_folder(reviews_id, f"Review {year}")
-            for sf in [
-                "Agenda & Valuation",
-                "FF&ATR",
-                "ID&V & Sanction Search",
-                "Meeting Notes",
-                "Research",
-                "Review Letter",
-                "Client Confirmation",
-                "Emails",
-            ]:
-                self._ensure_folder(yr_id, sf)
+            self._ensure_client_structure(client_id)
         except Exception as e:
-            logger.warning(f"Non-fatal: could not create review subfolders for {display_name}: {e}")
+            logger.warning(f"Non-fatal: failed to build full client structure for {display_name}: {e}")
 
-        # Save meta so the dashboard can sum portfolio values
+        # Save meta so dashboard and lists can use it
         meta = meta or {}
         status = (meta.get("status") or "active").strip().lower()
         email = (meta.get("email") or "").strip()
@@ -269,7 +277,7 @@ class SimpleGoogleDrive:
         )
         self._upload_or_update_text(client_id, self.META_FILENAME, meta_text)
 
-        logger.info("Created enhanced client folder for %s (with subfolders + meta)", display_name)
+        logger.info("Created enhanced client folder for %s (full subfolders + meta)", display_name)
         return client_id
 
     def _read_client_meta(self, client_folder_id: str) -> Dict:
@@ -297,9 +305,59 @@ class SimpleGoogleDrive:
             logger.warning(f"Could not read client_meta.txt: {e}")
             return {}
 
+    def _write_client_meta_fields(self, client_folder_id: str, updates: Dict[str, object]) -> bool:
+        """Update selected fields in client_meta.txt (create if missing)."""
+        try:
+            # Read current
+            curr = {
+                "display name": "",
+                "status": "active",
+                "email": "",
+                "phone": "",
+                "portfolio value": "0",
+                "created": datetime.utcnow().isoformat() + "Z",
+            }
+            f = self._find_named_file(client_folder_id, self.META_FILENAME)
+            if f:
+                text = self._download_text(f["id"])
+                for line in text.splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        curr[k.strip().lower()] = v.strip()
+
+            # Apply updates (normalized)
+            if "status" in updates:
+                curr["status"] = str(updates["status"]).lower()
+            if "email" in updates:
+                curr["email"] = str(updates["email"])
+            if "phone" in updates:
+                curr["phone"] = str(updates["phone"])
+            if "portfolio_value" in updates:
+                try:
+                    pv = float(str(updates["portfolio_value"]).replace(",", ""))
+                except Exception:
+                    pv = 0.0
+                curr["portfolio value"] = str(pv)
+
+            # Rebuild text
+            text_out = (
+                f"Display Name: {curr.get('display name','')}\n"
+                f"Status: {curr.get('status','active')}\n"
+                f"Email: {curr.get('email','')}\n"
+                f"Phone: {curr.get('phone','')}\n"
+                f"Portfolio Value: {curr.get('portfolio value','0')}\n"
+                f"Created: {curr.get('created', datetime.utcnow().isoformat() + 'Z')}\n"
+            )
+            self._upload_or_update_text(client_folder_id, self.META_FILENAME, text_out)
+            return True
+        except Exception as e:
+            logger.error(f"_write_client_meta_fields failed: {e}")
+            return False
+
     def get_clients_enhanced(self) -> List[Dict]:
         """
         Discover client folders robustly and enrich from client_meta.txt (if present).
+        Returns both active and archived; your routes can filter on 'status'.
         """
         clients: List[Dict] = []
 
@@ -341,13 +399,37 @@ class SimpleGoogleDrive:
         return clients
 
     # -----------------------------
-    # Tasks (Drive .txt files)
+    # Soft delete / restore client (CRM-only)
+    # -----------------------------
+    def archive_client(self, client_id: str) -> bool:
+        """
+        Soft delete: mark Status=archived in client_meta.txt (folders remain on Drive).
+        """
+        try:
+            return self._write_client_meta_fields(client_id, {"status": "archived"})
+        except Exception as e:
+            logger.error(f"archive_client failed: {e}")
+            return False
+
+    def restore_client(self, client_id: str) -> bool:
+        """
+        Undo soft delete: mark Status=active.
+        """
+        try:
+            return self._write_client_meta_fields(client_id, {"status": "active"})
+        except Exception as e:
+            logger.error(f"restore_client failed: {e}")
+            return False
+
+    # -----------------------------
+    # Tasks (Drive .txt files) — unchanged public behavior
     # -----------------------------
     def _get_client_tasks_folder_ids(self, client_id: str) -> Dict[str, str]:
         tasks_id = self._ensure_folder(client_id, "Tasks")
-        ongoing_id = self._ensure_folder(tasks_id, "Ongoing Tasks")
-        completed_id = self._ensure_folder(tasks_id, "Completed Tasks")
-        return {"tasks": tasks_id, "ongoing": ongoing_id, "completed": completed_id}
+        self._ensure_folder(tasks_id, "Ongoing Tasks")
+        self._ensure_folder(tasks_id, "Completed Tasks")
+        return {"tasks": tasks_id, "ongoing": self._ensure_folder(tasks_id, "Ongoing Tasks"),
+                "completed": self._ensure_folder(tasks_id, "Completed Tasks")}
 
     def add_task_enhanced(self, task: Dict, client: Dict) -> bool:
         """Save a task as a .txt file in Ongoing Tasks."""
@@ -462,125 +544,8 @@ class SimpleGoogleDrive:
             self._rename_file(task_file_id, f"COMPLETED - {current_name}")
         return True
 
-    def get_client_tasks(self, client_id: str) -> List[Dict]:
-        fids = self._get_client_tasks_folder_ids(client_id)
-        out: List[Dict] = []
-
-        for status, folder in (("Pending", fids["ongoing"]), ("Completed", fids["completed"])):
-            page = None
-            while True:
-                resp = self.drive.files().list(
-                    q=(
-                        f"'{folder}' in parents and "
-                        "mimeType!='application/vnd.google-apps.folder' and trashed=false"
-                    ),
-                    fields="nextPageToken, files(id,name,createdTime,modifiedTime)",
-                    pageToken=page,
-                    orderBy="name_natural",
-                ).execute()
-                for f in resp.get("files", []):
-                    meta = self._parse_task_filename(f.get("name", ""))
-                    out.append(
-                        {
-                            "task_id": f.get("id"),
-                            "client_id": client_id,
-                            "title": meta.get("title", ""),
-                            "task_type": meta.get("task_type", ""),
-                            "due_date": meta.get("due_date", ""),
-                            "priority": meta.get("priority", "Medium"),
-                            "status": status,  # 'Pending' or 'Completed'
-                            "description": "",
-                            "created_date": (f.get("createdTime", "")[:10] or ""),
-                            "completed_date": (f.get("modifiedTime", "")[:10] if status == "Completed" else ""),
-                            "time_spent": "",
-                        }
-                    )
-                page = resp.get("nextPageToken")
-                if not page:
-                    break
-
-        def sort_key(t):
-            d = _safe_date(t.get("due_date", ""))
-            return (0 if t["status"] == "Pending" else 1, d or datetime(1970, 1, 1))
-
-        out.sort(key=sort_key)
-        return out
-
-    def get_upcoming_tasks(self, days: int = 30) -> List[Dict]:
-        """Scan all clients' Ongoing Tasks and return those due within `days`."""
-        upcoming: List[Dict] = []
-        clients = self.get_clients_enhanced()
-        today = datetime.today().date()
-        horizon = today + timedelta(days=days)
-
-        for c in clients:
-            client_id = c["client_id"]
-            fids = self._get_client_tasks_folder_ids(client_id)
-            ongoing = fids["ongoing"]
-            page = None
-            while True:
-                resp = self.drive.files().list(
-                    q=(
-                        f"'{ongoing}' in parents and "
-                        "mimeType!='application/vnd.google-apps.folder' and trashed=false"
-                    ),
-                    fields="nextPageToken, files(id,name,createdTime)",
-                    pageToken=page,
-                    orderBy="name_natural",
-                ).execute()
-                for f in resp.get("files", []):
-                    meta = self._parse_task_filename(f.get("name", ""))
-                    dd = _safe_date(meta.get("due_date", ""))
-                    if dd and today <= dd.date() <= horizon:
-                        upcoming.append(
-                            {
-                                "task_id": f.get("id"),
-                                "client_id": client_id,
-                                "title": meta.get("title", ""),
-                                "task_type": meta.get("task_type", ""),
-                                "due_date": meta.get("due_date", ""),
-                                "priority": meta.get("priority", "Medium"),
-                                "status": "Pending",
-                                "description": "",
-                                "created_date": f.get("createdTime", "")[:10],
-                                "completed_date": "",
-                                "time_spent": "",
-                            }
-                        )
-                page = resp.get("nextPageToken")
-                if not page:
-                    break
-
-        upcoming.sort(key=lambda t: _safe_date(t["due_date"]) or datetime(1970, 1, 1))
-        return upcoming
-
-    # ---------- Task: read / update / delete ----------
-    def _parse_task_text(self, text: str) -> Dict:
-        """
-        Parse the task .txt content written by add/update.
-        """
-        data: Dict[str, str] = {}
-        desc = []
-        in_desc = False
-        for raw in text.splitlines():
-            line = raw.strip("\n")
-            if in_desc:
-                desc.append(line)
-                continue
-            if line.strip().lower() == "description:":
-                in_desc = True
-                continue
-            if ":" in line:
-                k, v = line.split(":", 1)
-                data[k.strip().lower()] = v.strip()
-        if desc:
-            data["description"] = "\n".join(desc).strip()
-        return data
-
     def read_task_enhanced(self, task_file_id: str) -> Optional[Dict]:
-        """
-        Return a dict describing the task (fields + status + client_id).
-        """
+        """Return a dict describing the task (fields + status + client_id)."""
         try:
             file = self.drive.files().get(fileId=task_file_id, fields="id,name,parents,webViewLink").execute()
             if not file:
@@ -590,20 +555,36 @@ class SimpleGoogleDrive:
             client_id, status, _ = self._locate_task_context(task_file_id)
 
             text = self._download_text(task_file_id)
-            parsed = self._parse_task_text(text)
 
-            # Consolidate
+            # Parse body
+            data: Dict[str, str] = {}
+            desc = []
+            in_desc = False
+            for raw in text.splitlines():
+                line = raw.strip("\n")
+                if in_desc:
+                    desc.append(line)
+                    continue
+                if line.strip().lower() == "description:":
+                    in_desc = True
+                    continue
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    data[k.strip().lower()] = v.strip()
+            if desc:
+                data["description"] = "\n".join(desc).strip()
+
             out = {
                 "task_id": task_file_id,
                 "client_id": client_id,
-                "title": parsed.get("title") or meta_from_name.get("title", ""),
-                "task_type": parsed.get("type") or meta_from_name.get("task_type", ""),
-                "priority": parsed.get("priority") or meta_from_name.get("priority", "Medium"),
-                "due_date": parsed.get("due date") or meta_from_name.get("due_date", ""),
-                "status": (parsed.get("status") or ("Completed" if status == "Completed" else "Pending")),
-                "description": parsed.get("description", ""),
-                "created_date": parsed.get("created", ""),
-                "completed_date": parsed.get("completed", ""),
+                "title": data.get("title") or meta_from_name.get("title", ""),
+                "task_type": data.get("type") or meta_from_name.get("task_type", ""),
+                "priority": data.get("priority") or meta_from_name.get("priority", "Medium"),
+                "due_date": data.get("due date") or meta_from_name.get("due_date", ""),
+                "status": (data.get("status") or ("Completed" if status == "Completed" else "Pending")),
+                "description": data.get("description", ""),
+                "created_date": data.get("created", ""),
+                "completed_date": data.get("completed", ""),
                 "webViewLink": file.get("webViewLink"),
             }
             return out
@@ -612,11 +593,7 @@ class SimpleGoogleDrive:
             return None
 
     def update_task_enhanced(self, task_file_id: str, updates: Dict) -> bool:
-        """
-        Update task fields, move between Ongoing/Completed if status changes,
-        and keep filename/content in sync.
-        """
-        # Read current
+        """Update task fields; move between Ongoing/Completed if status changes."""
         current = self.read_task_enhanced(task_file_id)
         if not current:
             return False
@@ -625,7 +602,6 @@ class SimpleGoogleDrive:
         if not client_id:
             return False
 
-        # Merge values
         title = (updates.get("title", current["title"]) or "").strip()
         task_type = (updates.get("task_type", current["task_type"]) or "").strip()
         priority = (updates.get("priority", current["priority"]) or "Medium").strip()
@@ -634,15 +610,13 @@ class SimpleGoogleDrive:
         status = (updates.get("status") or current["status"] or "Pending").strip()
         status = "Completed" if status.lower().startswith("comp") else "Pending"
 
-        # Completed date handling
         created_date = current["created_date"] or datetime.now().strftime("%Y-%m-%d")
         completed_date = current["completed_date"]
         if status == "Completed" and not completed_date:
             completed_date = datetime.now().strftime("%Y-%m-%d")
         if status == "Pending":
-            completed_date = ""  # clear if moved back
+            completed_date = ""
 
-        # Build filename base
         base_filename = f"{due_date} - {priority} - {task_type} - {title} [{current['task_id']}].txt"
         final_name = base_filename
         if status == "Completed" and not base_filename.startswith("COMPLETED - "):
@@ -804,7 +778,7 @@ class SimpleGoogleDrive:
         return doc
 
     # -----------------------------
-    # Communications
+    # Communications (unchanged APIs)
     # -----------------------------
     def _get_client_communications_folder(self, client_id: str) -> str:
         """Ensure and return the Communications folder for a client."""

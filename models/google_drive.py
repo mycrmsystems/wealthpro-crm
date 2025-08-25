@@ -45,7 +45,9 @@ class SimpleGoogleDrive:
     We support:
       - Active clients (A–Z)
       - Archived clients (A–Z)
-      - Per client: Tasks (Ongoing/Completed), Reviews (Review <YEAR> + subfolders), Communications
+      - Per client: Tasks (Ongoing/Completed), Reviews (Review <YEAR>), Communications
+      - Top-level client subfolders: Agenda & Valuation, FF&ATR, ID&V & Sanction Search,
+        Meeting Notes, Research, Review Letter, Client Confirmation, Emails
       - client.json metadata per client (portfolio_value, phone, email, etc)
     """
 
@@ -149,7 +151,7 @@ class SimpleGoogleDrive:
         downloader = MediaIoBaseDownload(fh, request)
         done = False
         while not done:
-            status, done = downloader.next_chunk()
+            _, done = downloader.next_chunk()
         fh.seek(0)
         return fh.read()
 
@@ -256,9 +258,11 @@ class SimpleGoogleDrive:
     def create_client_enhanced_folders(self, display_name: str) -> str:
         """
         Create the client under an A–Z index (ACTIVE), and create core subfolders immediately:
+          - Top-level (inside client): Agenda & Valuation, FF&ATR, ID&V & Sanction Search,
+            Meeting Notes, Research, Review Letter, Client Confirmation, Emails
           - Tasks / Ongoing / Completed
-          - Reviews (Review <YEAR> + subfolders)
           - Communications
+          - Reviews (Review <YEAR> only)
           - Copy template files into Review <YEAR>
         """
         display_name = (display_name or "").strip()
@@ -270,12 +274,10 @@ class SimpleGoogleDrive:
 
         # Safety: if we somehow picked the archived category, force Active Clients
         try:
-            # Fetch the chosen category/folder name to double-check
             chosen = self.drive.files().get(fileId=parent_for_letters, fields="id,name").execute()
             if (chosen.get("name") or "").strip().lower() == "archived clients":
                 parent_for_letters = self._ensure_category_with_letters("Active Clients")
         except Exception:
-            # If a lookup fails, fall back to Active Clients explicitly
             parent_for_letters = self._ensure_category_with_letters("Active Clients")
 
         first = display_name[0].upper()
@@ -284,18 +286,8 @@ class SimpleGoogleDrive:
         client_id = self._ensure_folder(index_id, display_name)
 
         # === Ensure ALL required subfolders exist (idempotent) ===
-        # Tasks
-        tasks_id = self._ensure_folder(client_id, "Tasks")
-        self._ensure_folder(tasks_id, "Ongoing Tasks")
-        self._ensure_folder(tasks_id, "Completed Tasks")
 
-        # Communications
-        self._ensure_folder(client_id, "Communications")
-
-        # Reviews with current YEAR + subfolders
-        reviews_root = self._ensure_folder(client_id, "Reviews")
-        year = datetime.today().year
-        review_year_id = self._ensure_folder(reviews_root, f"Review {year}")
+        # Top-level review-related working folders at client root
         for sf in [
             "Agenda & Valuation",
             "FF&ATR",
@@ -306,9 +298,22 @@ class SimpleGoogleDrive:
             "Client Confirmation",
             "Emails",
         ]:
-            self._ensure_folder(review_year_id, sf)
+            self._ensure_folder(client_id, sf)
 
-        # Copy templates (best-effort; do not fail creation on copy issues)
+        # Tasks
+        tasks_id = self._ensure_folder(client_id, "Tasks")
+        self._ensure_folder(tasks_id, "Ongoing Tasks")
+        self._ensure_folder(tasks_id, "Completed Tasks")
+
+        # Communications
+        self._ensure_folder(client_id, "Communications")
+
+        # Reviews with current YEAR (no additional subfolders here)
+        reviews_root = self._ensure_folder(client_id, "Reviews")
+        year = datetime.today().year
+        review_year_id = self._ensure_folder(reviews_root, f"Review {year}")
+
+        # Copy templates (best-effort)
         self._copy_review_templates(review_year_id)
 
         logger.info("Created enhanced client folder for %s", display_name)
@@ -611,7 +616,7 @@ class SimpleGoogleDrive:
         return upcoming
 
     # -----------------------------
-    # Review Pack
+    # Review pack (on-demand)
     # -----------------------------
     def _uk_date_str(self, dt: datetime) -> str:
         try:
@@ -620,6 +625,10 @@ class SimpleGoogleDrive:
             return dt.strftime("%d %B %Y")
 
     def create_review_pack_for_client(self, client: Dict) -> Dict[str, str]:
+        """
+        Build Review <YEAR> structure and create two Word docs in 'Agenda & Valuation'
+        (kept for the separate 'Create Review' action).
+        """
         client_id = client.get("client_id") or client.get("folder_id")
         display_name = client.get("display_name") or "Client"
         if not client_id:
@@ -629,6 +638,7 @@ class SimpleGoogleDrive:
         reviews_root = self._ensure_folder(client_id, "Reviews")
         yr_id = self._ensure_folder(reviews_root, f"Review {year}")
 
+        # For the on-demand review pack, create these inside the YEAR folder:
         subfolders = [
             "Agenda & Valuation",
             "FF&ATR",

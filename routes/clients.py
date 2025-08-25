@@ -3,9 +3,10 @@
 """
 WealthPro CRM - Client Management Routes
  - /clients list with Drive folder link + Archive button
- - /clients/archived list of archived clients
- - /clients/add (creates full subfolders at creation time)
+ - /clients/archived list of archived clients with Restore button
+ - /clients/add (creates full subfolders & copies review template files)
  - /clients/<client_id>/archive (soft delete -> move to Archived Clients A–Z)
+ - /clients/<client_id>/restore (move back to active A–Z)
  - /clients/<client_id>/add_task
  - /clients/<client_id>/review
  - /clients/<client_id>/tasks
@@ -35,7 +36,6 @@ def clients():
         drive = SimpleGoogleDrive(creds)
         items = drive.get_clients_enhanced()
 
-        # Decorate with folder links and safe defaults
         for c in items:
             c.setdefault("email", None)
             c.setdefault("phone", None)
@@ -128,7 +128,7 @@ def clients():
                                 <a href="/clients/{{ client.client_id }}/tasks" class="text-gray-700 hover:text-gray-900 text-sm">📋 Tasks</a>
                                 <a href="/clients/{{ client.client_id }}/archive?name={{ client.display_name | urlencode }}"
                                    class="text-sm danger hover:underline"
-                                   onclick="return confirm('Archive this client? This will move their folder to Archived Clients in Google Drive (nothing is deleted).');">
+                                   onclick="return confirm('Archive this client? This moves their folder to Archived Clients in Google Drive (nothing is deleted).');">
                                    🗑️ Archive
                                 </a>
                             </div>
@@ -171,9 +171,13 @@ def clients_archived():
 <head>
     <title>WealthPro CRM - Archived Clients</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: "Inter", sans-serif; }
+        .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
+    </style>
 </head>
 <body class="bg-gray-50">
-    <nav class="gradient-wealth text-white shadow-lg" style="background:linear-gradient(135deg,#1a365d 0%,#2563eb 100%);">
+    <nav class="gradient-wealth text-white shadow-lg">
         <div class="max-w-7xl mx-auto px-6">
             <div class="flex justify-between items-center h-16">
                 <h1 class="text-xl font-bold">WealthPro CRM</h1>
@@ -200,6 +204,7 @@ def clients_archived():
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Client</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
                         <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Folder</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
                     </tr>
                 </thead>
                 <tbody class="bg-white divide-y divide-gray-200">
@@ -215,10 +220,17 @@ def clients_archived():
                         <td class="px-6 py-4">
                             <a href="{{ client.folder_url }}" target="_blank" class="text-blue-600 hover:text-blue-800 text-sm">📁 Open Folder</a>
                         </td>
+                        <td class="px-6 py-4">
+                            <a href="/clients/{{ client.client_id }}/restore?name={{ client.display_name | urlencode }}"
+                               class="text-sm text-green-700 hover:underline"
+                               onclick="return confirm('Restore this client to Active A–Z?');">
+                               ♻️ Restore
+                            </a>
+                        </td>
                     </tr>
                     {% else %}
                     <tr>
-                        <td colspan="3" class="px-6 py-4 text-center text-gray-500">
+                        <td colspan="4" class="px-6 py-4 text-center text-gray-500">
                             No archived clients yet.
                         </td>
                     </tr>
@@ -244,9 +256,8 @@ def archive_client(client_id):
     if not creds:
         return redirect(url_for("auth.authorize"))
 
-    name = request.args.get("name", "").strip()  # display_name passed from link
+    name = request.args.get("name", "").strip()
     if not name:
-        # As a fallback, try to look up the name
         try:
             drive = SimpleGoogleDrive(creds)
             clients = drive.get_clients_enhanced()
@@ -267,6 +278,38 @@ def archive_client(client_id):
         logger.exception("Archive client error")
         return f"Error: {e}", 500
 
+@clients_bp.route("/clients/<client_id>/restore")
+def restore_client(client_id):
+    """
+    Restore: move the client's Drive folder from 'Archived Clients' back to the active A–Z area.
+    """
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
+
+    name = request.args.get("name", "").strip()
+    if not name:
+        # Try lookup in archived list
+        try:
+            drive = SimpleGoogleDrive(creds)
+            archived = drive.get_archived_clients_enhanced()
+            c = next((x for x in archived if x["client_id"] == client_id), None)
+            if c:
+                name = c["display_name"]
+        except Exception:
+            name = ""
+
+    try:
+        drive = SimpleGoogleDrive(creds)
+        ok = drive.restore_client(client_id, name or "Client")
+        if ok:
+            return redirect(url_for("clients.clients", msg="Client restored to Active."))
+        else:
+            return "Error restoring client", 500
+    except Exception as e:
+        logger.exception("Restore client error")
+        return f"Error: {e}", 500
+
 # ---------- Add Client ----------
 @clients_bp.route("/clients/add", methods=["GET", "POST"])
 def add_client():
@@ -285,7 +328,7 @@ def add_client():
 
             display_name = f"{surname}, {first_name}"
 
-            # Create Drive structure (A–Z + client + Tasks/Reviews/Communications)
+            # Create Drive structure (A–Z + client + Tasks/Reviews/Communications + Review <YEAR> + copy templates)
             drive.create_client_enhanced_folders(display_name)
 
             return redirect(url_for("clients.clients", msg="Client created successfully"))
@@ -352,114 +395,6 @@ def add_client():
 </html>
         """
     )
-
-# ---------- Add Task ----------
-@clients_bp.route("/clients/<client_id>/add_task", methods=["GET", "POST"])
-def add_task(client_id):
-    creds = _require_creds()
-    if not creds:
-        return redirect(url_for("auth.authorize"))
-
-    try:
-        drive = SimpleGoogleDrive(creds)
-        clients = drive.get_clients_enhanced()
-        client = next((c for c in clients if c["client_id"] == client_id), None)
-        if not client:
-            return "Client not found", 404
-
-        if request.method == "POST":
-            title = (request.form.get("title") or "").strip()
-            task_type = (request.form.get("task_type") or "").strip()
-            priority = (request.form.get("priority") or "Medium").strip()
-            due_date = (request.form.get("due_date") or "").strip()
-            description = (request.form.get("description") or "").strip()
-
-            if not title:
-                return "Title is required", 400
-
-            task = {
-                "task_id": f"TSK{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                "title": title,
-                "task_type": task_type,
-                "priority": priority,
-                "due_date": due_date,
-                "status": "Pending",
-                "description": description,
-                "created_date": datetime.now().strftime("%Y-%m-%d"),
-                "completed_date": "",
-                "time_spent": "",
-            }
-
-            drive.add_task_enhanced(task, client)
-            return redirect(url_for("clients.clients", msg="Task created"))
-
-        return render_template_string(
-            """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>WealthPro CRM - Add Task</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-50">
-    <main class="max-w-3xl mx-auto px-6 py-8">
-        <h1 class="text-2xl font-bold mb-6">Add Task for {{ client.display_name }}</h1>
-        <form method="POST" class="bg-white shadow rounded p-6 space-y-4">
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Title *</label>
-                <input name="title" class="w-full px-3 py-2 border rounded" required>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Type</label>
-                    <select name="task_type" class="w-full px-3 py-2 border rounded">
-                        <option value="">Select...</option>
-                        <option>Review</option>
-                        <option>Follow Up</option>
-                        <option>Documentation</option>
-                        <option>Meeting</option>
-                        <option>Call</option>
-                        <option>Research</option>
-                        <option>Compliance</option>
-                        <option>Portfolio Review</option>
-                        <option>Other</option>
-                    </select>
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Priority</label>
-                    <select name="priority" class="w-full px-3 py-2 border rounded">
-                        <option>High</option>
-                        <option selected>Medium</option>
-                        <option>Low</option>
-                    </select>
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Due Date</label>
-                    <input type="date" name="due_date" class="w-full px-3 py-2 border rounded">
-                </div>
-            </div>
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
-                <textarea name="description" rows="4" class="w-full px-3 py-2 border rounded"></textarea>
-            </div>
-            <div class="bg-blue-50 p-3 rounded">
-                <p class="text-xs text-blue-700">💾 Saves to Google Drive → {{ client.display_name }} / Tasks / Ongoing Tasks</p>
-            </div>
-            <div class="flex justify-between pt-2">
-                <a href="/clients" class="px-6 py-2 border rounded text-gray-700 hover:bg-gray-50">Cancel</a>
-                <button class="px-6 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Create Task</button>
-            </div>
-        </form>
-    </main>
-</body>
-</html>
-            """,
-            client=client,
-        )
-
-    except Exception as e:
-        logger.exception("Add task error")
-        return f"Error: {e}", 500
 
 # ---------- Create Review Pack (+ task) ----------
 @clients_bp.route("/clients/<client_id>/review")

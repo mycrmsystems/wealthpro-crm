@@ -4,7 +4,7 @@ import os
 import io
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -43,26 +43,27 @@ class SimpleGoogleDrive:
 
     Supported root structures:
 
-    A) Letters directly under ROOT:
-       ROOT
-         A/
-           Alice Smith/
-         ...
-         Z/
+    A) Letters directly under ROOT
+    B) Categories under ROOT (e.g., "Active Clients", "Archived Clients") → A–Z → client folders
 
-    B) Categories under ROOT, then letters:
-       ROOT
-         Active Clients/
-           A/
-             Alice Smith/
-         Archived Clients/
-           A/
-             (archived clients)
-         ...
-
-    We will add/ensure an 'Archived Clients' area with A–Z
-    when you archive a client.
+    We create/maintain:
+      - Tasks / Ongoing Tasks / Completed Tasks
+      - Reviews (and Review <YEAR> + subfolders)
+      - Communications
+      - Archived Clients (with A–Z) for soft deletion
     """
+
+    # Hard-coded template file IDs to copy into each new client's Review <YEAR> folder
+    REVIEW_TEMPLATE_FILE_IDS: Tuple[str, ...] = (
+        "1L29jumEfL9sXKXMdJWh29y1s1NMGJM1p",
+        "1OO14cuKnQDwAIQ7SPCTPn8qXbJLDkUTn",
+        "1Oj_Ct3wZLD0OJwbRqVq4UG0uS-RIyK7V",
+        "1TfoX1wOfoB41Ltq0FHQcU_wY-GR-TSGd",
+        "19-j1FcRsWX08nC9LzLiHifS4od70ayxZ",
+        "1iHv51o6ASsFU1Kak2uzrpLMSii21CM2G",
+        "1XGvp7TTjaZIZ9wrqLgJvZ2FQNEA5yT2i",
+        "1z2Ddo7F3YwjGtpvsOfKbvKgcOVJn6JDu",
+    )
 
     def __init__(self, credentials: Credentials):
         self.drive = _build_drive_service(credentials)
@@ -136,6 +137,21 @@ class SimpleGoogleDrive:
     def _rename_file(self, file_id: str, new_name: str):
         self.drive.files().update(fileId=file_id, body={"name": new_name}, fields="id,name").execute()
 
+    def _copy_file(self, src_file_id: str, new_name: Optional[str], parent_id: str) -> Optional[str]:
+        """
+        Copy a Drive file into parent_id. Returns new file id or None if copy fails.
+        Requires the current user/app to have at least reader access to src.
+        """
+        try:
+            meta = {"parents": [parent_id]}
+            if new_name:
+                meta["name"] = new_name
+            copied = self.drive.files().copy(fileId=src_file_id, body=meta, fields="id").execute()
+            return copied.get("id")
+        except Exception as e:
+            logger.error(f"Copy template failed for {src_file_id}: {e}")
+            return None
+
     # -----------------------------
     # Folder discovery helpers
     # -----------------------------
@@ -161,46 +177,50 @@ class SimpleGoogleDrive:
     # -----------------------------
     def _ensure_category_with_letters(self, category_name: str) -> str:
         """
-        Ensure a top-level category exists at ROOT with A–Z subfolders.
+        Ensure a top-level category exists at ROOT with A–Z + '#' subfolders.
         Returns the category folder id.
         """
         cat_id = self._ensure_folder(self.root_folder_id, category_name)
-        # Ensure A–Z (and optionally '#')
         for code in range(ord('A'), ord('Z') + 1):
             self._ensure_folder(cat_id, chr(code))
-        # Optional bucket for non-letters
         self._ensure_folder(cat_id, "#")
         return cat_id
+
+    def _determine_active_letters_parent(self) -> str:
+        """
+        Where new/active clients should be filed:
+        - If there are A–Z folders directly under ROOT, use ROOT.
+        - Else, if a category under ROOT has A–Z (e.g. 'Active Clients'), use that category.
+        - Else, create 'Active Clients' with A–Z and use it.
+        """
+        root_letters = self._get_letter_folders(self.root_folder_id)
+        if root_letters:
+            return self.root_folder_id
+
+        # Look for any category with A–Z
+        for cat in self._list_folders(self.root_folder_id):
+            if self._get_letter_folders(cat["id"]):
+                return cat["id"]
+
+        # Nothing? Create a clean "Active Clients" area
+        return self._ensure_category_with_letters("Active Clients")
 
     # -----------------------------
     # Client creation & listing
     # -----------------------------
     def create_client_enhanced_folders(self, display_name: str) -> str:
         """
-        Create the client under an A–Z index (either at root or inside the first category
-        that contains A–Z). Also creates the core subfolders immediately:
+        Create the client under an A–Z index and create the core subfolders immediately:
           - Tasks / Ongoing Tasks / Completed Tasks
-          - Reviews
+          - Reviews (and Review <YEAR> + standard subfolders)
           - Communications
+          - Also copy standard review template files into Review <YEAR>
         """
         display_name = (display_name or "").strip()
         if not display_name:
             raise ValueError("display_name required")
 
-        # Prefer letters directly under ROOT
-        root_letters = self._get_letter_folders(self.root_folder_id)
-
-        parent_for_letters = None
-        if root_letters:
-            parent_for_letters = self.root_folder_id
-        else:
-            # Find a category (e.g., "Active Clients") that contains A–Z
-            for cat in self._list_folders(self.root_folder_id):
-                if self._get_letter_folders(cat["id"]):
-                    parent_for_letters = cat["id"]
-                    break
-            if parent_for_letters is None:
-                parent_for_letters = self.root_folder_id
+        parent_for_letters = self._determine_active_letters_parent()
 
         first = display_name[0].upper()
         index_letter = first if first.isalpha() else "#"
@@ -212,11 +232,37 @@ class SimpleGoogleDrive:
         tasks_id = self._ensure_folder(client_id, "Tasks")
         self._ensure_folder(tasks_id, "Ongoing Tasks")
         self._ensure_folder(tasks_id, "Completed Tasks")
-        self._ensure_folder(client_id, "Reviews")
-        self._ensure_folder(client_id, "Communications")
+        reviews_root = self._ensure_folder(client_id, "Reviews")
+        communications_id = self._ensure_folder(client_id, "Communications")
+
+        # Build Review <YEAR> + typical subfolders
+        year = datetime.today().year
+        review_year_id = self._ensure_folder(reviews_root, f"Review {year}")
+        for sf in [
+            "Agenda & Valuation",
+            "FF&ATR",
+            "ID&V & Sanction Search",
+            "Meeting Notes",
+            "Research",
+            "Review Letter",
+            "Client Confirmation",
+            "Emails",
+        ]:
+            self._ensure_folder(review_year_id, sf)
+
+        # Copy provided template files into Review <YEAR>
+        self._copy_review_templates(review_year_id)
 
         logger.info("Created enhanced client folder for %s", display_name)
         return client_id
+
+    def _copy_review_templates(self, dest_folder_id: str):
+        """
+        Copy each template file (by ID) into the destination folder.
+        The name is inherited from the source file (unless Google requires new name).
+        """
+        for fid in self.REVIEW_TEMPLATE_FILE_IDS:
+            self._copy_file(fid, None, dest_folder_id)
 
     def _collect_archived_client_ids(self) -> set:
         """Return a set of folder IDs that are archived."""
@@ -229,7 +275,6 @@ class SimpleGoogleDrive:
                 archived_ids.add(child["id"])
         # Also include any clients directly under category (just in case)
         for child in self._list_folders(archived_cat["id"]):
-            # skip the A–Z letter folders themselves (single-letter names)
             nm = (child.get("name") or "").strip()
             if not (len(nm) == 1 and nm.isalpha() and nm.upper() == nm):
                 archived_ids.add(child["id"])
@@ -238,7 +283,7 @@ class SimpleGoogleDrive:
     def get_clients_enhanced(self) -> List[Dict]:
         """
         Active clients only (exclude 'Archived Clients' subtree).
-        Returns list of dicts with: client_id, display_name, status, folder_id, portfolio_value (default 0.0)
+        Returns: client_id, display_name, status, folder_id, portfolio_value (default 0.0)
         """
         archived_ids = self._collect_archived_client_ids()
         clients: List[Dict] = []
@@ -256,16 +301,13 @@ class SimpleGoogleDrive:
                 }
             )
 
-        # Case 1: letters directly under ROOT
         root_letters = self._get_letter_folders(self.root_folder_id)
         if root_letters:
             for letter in root_letters:
                 for child in self._list_folders(letter["id"]):
                     add_client(child)
         else:
-            # Case 2: categories under ROOT -> letters -> clients
             for category in self._list_folders(self.root_folder_id):
-                # Skip the 'Archived Clients' category entirely for active list
                 if (category.get("name") or "").strip().lower() == "archived clients":
                     continue
                 letters = self._get_letter_folders(category["id"])
@@ -281,9 +323,7 @@ class SimpleGoogleDrive:
         return clients
 
     def get_archived_clients_enhanced(self) -> List[Dict]:
-        """
-        List archived clients (those under 'Archived Clients' category A–Z).
-        """
+        """List archived clients (those under 'Archived Clients' category A–Z)."""
         out: List[Dict] = []
         archived_cat = self._ensure_category_with_letters("Archived Clients")
 
@@ -302,7 +342,7 @@ class SimpleGoogleDrive:
             for child in self._list_folders(letter["id"]):
                 add_client(child)
 
-        # Also catch any client-like folders directly under the category (defensive)
+        # Defensive catch for client-like folders directly under the category
         for child in self._list_folders(archived_cat):
             nm = (child.get("name") or "").strip()
             if not (len(nm) == 1 and nm.isalpha() and nm.upper() == nm):
@@ -316,17 +356,27 @@ class SimpleGoogleDrive:
         """
         Soft-delete (archive) a client by moving their folder under:
           ROOT / Archived Clients / <A–Z> / <Client Name>
-        Does not delete any data.
         """
         if not client_id or not display_name:
             return False
-
         archived_cat = self._ensure_category_with_letters("Archived Clients")
         first = display_name[0].upper()
         index_letter = first if first.isalpha() else "#"
         letter_id = self._ensure_folder(archived_cat, index_letter)
+        self._move_file(client_id, letter_id)
+        return True
 
-        # Move the client folder
+    def restore_client(self, client_id: str, display_name: str) -> bool:
+        """
+        Restore a client from 'Archived Clients' back to the active A–Z location
+        (same placement logic used for creation).
+        """
+        if not client_id or not display_name:
+            return False
+        active_parent = self._determine_active_letters_parent()
+        first = display_name[0].upper()
+        index_letter = first if first.isalpha() else "#"
+        letter_id = self._ensure_folder(active_parent, index_letter)
         self._move_file(client_id, letter_id)
         return True
 
@@ -530,7 +580,7 @@ class SimpleGoogleDrive:
         return upcoming
 
     # -----------------------------
-    # Review Pack
+    # Review Pack (kept intact for existing flows)
     # -----------------------------
     def _uk_date_str(self, dt: datetime) -> str:
         try:
@@ -539,7 +589,10 @@ class SimpleGoogleDrive:
             return dt.strftime("%d %B %Y")   # Windows fallback
 
     def create_review_pack_for_client(self, client: Dict) -> Dict[str, str]:
-        """Build Review <YEAR> structure and create two Word docs in 'Agenda & Valuation'."""
+        """
+        Build Review <YEAR> structure and create two Word docs in 'Agenda & Valuation'.
+        (Kept for routes that call this explicitly.)
+        """
         client_id = client.get("client_id") or client.get("folder_id")
         display_name = client.get("display_name") or "Client"
         if not client_id:
@@ -667,7 +720,6 @@ class SimpleGoogleDrive:
         subject = (comm.get("subject") or "No Subject").strip()
         cid = comm.get("communication_id", f"COM{datetime.now().strftime('%Y%m%d%H%M%S')}")
 
-        # Build filename
         time_bit = f" {time_str}" if time_str else ""
         filename = f"{date_str}{time_bit} - {ctype} - {subject} [{cid}].txt"
 
@@ -703,7 +755,7 @@ class SimpleGoogleDrive:
                    "mimeType!='application/vnd.google-apps.folder' and trashed=false"),
                 fields="nextPageToken, files(id,name,createdTime,modifiedTime)",
                 pageToken=page,
-                orderBy="name desc",  # filenames start with date, so sort by name
+                orderBy="name desc",
             ).execute()
             for f in resp.get("files", []):
                 name = f.get("name", "")

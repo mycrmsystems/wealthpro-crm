@@ -7,7 +7,9 @@ Aligned with SimpleGoogleDrive API:
  - add client (create_client_enhanced_folders)
  - add task (add_task_enhanced)
  - create review pack (create_review_pack_for_client) + adds a review task
- - refresh structure (ensure standard subfolders + current year's Review folder)
+
+Adds:
+ - per-client Refresh button (no Drive mutations; just reloads CRM view)
 """
 
 import logging
@@ -39,14 +41,16 @@ def clients():
             c.setdefault("email", None)
             c.setdefault("phone", None)
             c.setdefault("status", "active")  # lowercase to match label logic
-            c["portfolio_value"] = float(c.get("portfolio_value") or 0)
+            # ensure numeric for formatting (won't change Drive)
+            try:
+                c["portfolio_value"] = float(c.get("portfolio_value") or 0)
+            except Exception:
+                c["portfolio_value"] = 0.0
+
             if c.get("folder_id"):
                 c["folder_url"] = f"https://drive.google.com/drive/folders/{c['folder_id']}"
             else:
                 c["folder_url"] = None
-
-        # Message passthrough
-        msg = request.args.get('msg') or ""
 
         return render_template_string(
             """
@@ -75,25 +79,19 @@ def clients():
     </nav>
 
     <main class="max-w-7xl mx-auto px-6 py-8">
-        <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-8">
+        <div class="flex justify-between items-center mb-8">
             <div>
                 <h1 class="text-3xl font-bold">Clients</h1>
                 <p class="text-gray-600 mt-1">Total clients: {{ clients|length }}</p>
             </div>
-            <div class="flex gap-3">
-                <a href="/clients/refresh" class="bg-slate-600 text-white px-4 py-3 rounded-lg hover:bg-slate-700"
-                   title="Non-destructively ensure all standard subfolders exist for every client">
-                    Refresh Structure
-                </a>
-                <a href="/clients/add" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700">
-                    Add New Client
-                </a>
-            </div>
+            <a href="/clients/add" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700">
+                Add New Client
+            </a>
         </div>
 
-        {% if msg %}
+        {% if request.args.get('msg') %}
         <div class="mb-6 p-4 bg-green-100 border border-green-300 text-green-800 rounded">
-            {{ msg }}
+            {{ request.args.get('msg') }}
         </div>
         {% endif %}
 
@@ -138,6 +136,9 @@ def clients():
                                 {% endif %}
                                 <a href="/clients/{{ client.client_id }}/add_task" class="text-indigo-700 hover:text-indigo-900 text-sm">📝 Add Task</a>
                                 <a href="/clients/{{ client.client_id }}/review" class="text-teal-700 hover:text-teal-900 text-sm font-semibold">🔄 Review</a>
+                                <!-- NEW: per-client refresh (no Drive changes) -->
+                                <a href="/clients/{{ client.client_id }}/refresh"
+                                   class="text-gray-700 hover:text-gray-900 text-sm">↻ Refresh</a>
                             </div>
                         </td>
                     </tr>
@@ -186,7 +187,7 @@ def add_client():
 
             display_name = f"{surname}, {first_name}"
 
-            # Create Drive structure (A–Z + client + Tasks/Reviews/Communications + core folders)
+            # Create Drive structure (A–Z + client + Tasks/Reviews)
             client_folder_id = drive.create_client_enhanced_folders(display_name)
 
             # Success -> redirect; list pulls directly from Drive
@@ -391,7 +392,7 @@ def create_review(client_id):
         if not client:
             return "Client not found", 404
 
-        # 1) Create the full Review {YEAR} pack (folders + 2 docx in Agenda & Valuation)
+        # 1) Create the full Review {YEAR} pack (folders + docs)
         drive.create_review_pack_for_client(client)
 
         # 2) Add a Review task due in 14 days
@@ -416,18 +417,18 @@ def create_review(client_id):
         logger.exception("Create review error")
         return f"Error: {e}", 500
 
-# ---------- Refresh all client structures (non-destructive) ----------
-@clients_bp.route("/clients/refresh")
-def refresh_clients_structure():
+# ---------- NEW: Per-client refresh (no Drive mutations) ----------
+@clients_bp.route("/clients/<client_id>/refresh")
+def refresh_client(client_id):
+    """
+    Lightweight 'refresh' that just reloads the Clients page.
+    We already read fresh data on each request; this route exists
+    so you have a per-client Refresh button with a confirmation message.
+    It does NOT change or recreate anything in Google Drive.
+    """
     creds = _require_creds()
     if not creds:
         return redirect(url_for("auth.authorize"))
 
-    try:
-        drive = SimpleGoogleDrive(creds)
-        summary = drive.refresh_all_clients_structure()
-        msg = f"Refreshed structure for {summary.get('clients_updated', 0)} of {summary.get('clients_seen', 0)} clients."
-        return redirect(url_for("clients.clients", msg=msg))
-    except Exception as e:
-        logger.exception("Refresh structure error")
-        return f"Error: {e}", 500
+    # No data change; simply redirect back with a message
+    return redirect(url_for("clients.clients", msg="Client view refreshed"))

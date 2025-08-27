@@ -156,6 +156,42 @@ class SimpleGoogleDrive:
     def _rename_file(self, file_id: str, new_name: str):
         self.drive.files().update(fileId=file_id, body={"name": new_name}, fields="id,name").execute()
 
+    def _get_file_meta(self, file_id: str, fields: str = "id,name,parents"):
+        return self.drive.files().get(fileId=file_id, fields=fields).execute()
+
+    def _copy_file_to_folder(self, template_file_id: str, dest_parent_id: str, new_name: str):
+        body = {"name": new_name, "parents": [dest_parent_id]}
+        return self.drive.files().copy(fileId=template_file_id, body=body, fields="id,name").execute()
+
+    # -----------------------------
+    # Template discovery (no env vars required)
+    # -----------------------------
+    def _find_docx_by_name_contains(self, terms: List[str]) -> Optional[str]:
+        """
+        Search user's Drive for a single DOCX whose name contains all `terms`.
+        Returns file id or None.
+        """
+        if not terms:
+            return None
+        q_parts = [f"name contains '{_escape_drive_name(t)}'" for t in terms]
+        q = " and ".join(q_parts) + " and mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document' and trashed=false"
+        resp = self.drive.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+        files = resp.get("files", [])
+        return files[0]["id"] if files else None
+
+    def _copy_template_if_found(self, search_terms: List[str], dest_parent_id: str, new_name: str) -> bool:
+        """
+        Try to find a template by 'name contains' terms and copy it into dest.
+        """
+        tid = self._find_docx_by_name_contains(search_terms)
+        if tid:
+            try:
+                self._copy_file_to_folder(tid, dest_parent_id, new_name)
+                return True
+            except Exception as e:
+                logger.warning(f"Template copy failed ({search_terms}): {e}")
+        return False
+
     # -----------------------------
     # Folder discovery helpers
     # -----------------------------
@@ -176,33 +212,46 @@ class SimpleGoogleDrive:
                 return True
         return False
 
+    # --- Categories (Active / Archived) ---
+    def _ensure_category_with_letters(self, category_name: str) -> str:
+        """
+        Ensure a category folder under ROOT with A–Z (and '#') children; return category id.
+        """
+        cat_id = self._ensure_folder(self.root_folder_id, category_name)
+        for ch in list("ABCDEFGHIJKLMNOPQRSTUVWXYZ#"):
+            self._ensure_folder(cat_id, ch)
+        return cat_id
+
     # -----------------------------
     # Client creation & listing
     # -----------------------------
     def create_client_enhanced_folders(self, display_name: str) -> str:
         """
-        Create the client's A–Z index under the FIRST category that has letters,
-        or directly under ROOT if letters are at root.
+        Create the client's A–Z index, preferring 'Active Clients' if present,
+        otherwise following the existing structure.
         Returns the client folder id.
         """
         display_name = (display_name or "").strip()
         if not display_name:
             raise ValueError("display_name required")
 
-        # Prefer letters directly under ROOT
-        root_letters = self._get_letter_folders(self.root_folder_id)
-
-        parent_for_letters = None
-        if root_letters:
-            parent_for_letters = self.root_folder_id
+        # Prefer 'Active Clients' category if it exists
+        active_cat = self._find_child_folder(self.root_folder_id, "Active Clients")
+        if active_cat:
+            parent_for_letters = active_cat["id"]
         else:
-            # Find a category (e.g., "Active Clients") that contains A–Z
-            for cat in self._list_folders(self.root_folder_id):
-                if self._get_letter_folders(cat["id"]):
-                    parent_for_letters = cat["id"]
-                    break
-            if parent_for_letters is None:
+            # If letters directly under root, use root; else pick first category that has letters
+            root_letters = self._get_letter_folders(self.root_folder_id)
+            if root_letters:
                 parent_for_letters = self.root_folder_id
+            else:
+                parent_for_letters = None
+                for cat in self._list_folders(self.root_folder_id):
+                    if self._get_letter_folders(cat["id"]):
+                        parent_for_letters = cat["id"]
+                        break
+                if parent_for_letters is None:
+                    parent_for_letters = self.root_folder_id
 
         first = display_name[0].upper()
         index_letter = first if first.isalpha() else "#"
@@ -226,42 +275,74 @@ class SimpleGoogleDrive:
         - Letters directly under ROOT
         - Category folders under ROOT, then letters
         Skips category and letter folders themselves; only returns leaf client folders.
+        Also sets 'status' to 'archived' if found under 'Archived Clients', else 'active'.
         """
         clients: List[Dict] = []
 
-        def add_client(folder: Dict):
+        def add_client(folder: Dict, status: str):
             clients.append(
                 {
                     "client_id": folder["id"],
                     "display_name": (folder.get("name") or "").strip(),
-                    "status": "active",
+                    "status": status,  # 'active' or 'archived' here; your templates still work
                     "folder_id": folder["id"],
                     "portfolio_value": 0.0,
                 }
             )
 
-        # Case 1: letters directly under ROOT
+        # Case 1: letters directly under ROOT (treat as active)
         root_letters = self._get_letter_folders(self.root_folder_id)
         if root_letters:
             for letter in root_letters:
                 for child in self._list_folders(letter["id"]):
-                    # Treat as client leaf
-                    add_client(child)
+                    add_client(child, "active")
         else:
             # Case 2: categories under ROOT -> letters -> clients
             for category in self._list_folders(self.root_folder_id):
+                cat_name = (category.get("name") or "").strip().lower()
+                cat_status = "archived" if cat_name == "archived clients" else "active"
                 letters = self._get_letter_folders(category["id"])
                 if letters:
                     for letter in letters:
                         for child in self._list_folders(letter["id"]):
-                            add_client(child)
+                            add_client(child, cat_status)
                 else:
-                    # If a category actually holds clients directly
                     if self._has_client_markers(category["id"]):
-                        add_client(category)
+                        add_client(category, cat_status)
 
         clients.sort(key=lambda c: (c["display_name"] or "").lower())
         return clients
+
+    # -----------------------------
+    # Archive / Restore clients (Drive only, no data deletion)
+    # -----------------------------
+    def archive_client(self, client_id: str) -> bool:
+        """Move a client folder to Archived Clients / A–Z. Does not delete data."""
+        try:
+            meta = self._get_file_meta(client_id, "id,name")
+            name = meta.get("name", "") or "Client"
+            letter = name[0].upper() if name and name[0].isalpha() else "#"
+            archived_cat = self._ensure_category_with_letters("Archived Clients")
+            target_letter = self._ensure_folder(archived_cat, letter)
+            self._move_file(client_id, target_letter)
+            return True
+        except Exception as e:
+            logger.error(f"Archive client failed: {e}")
+            return False
+
+    def restore_client(self, client_id: str) -> bool:
+        """Move a client folder back to Active Clients / A–Z."""
+        try:
+            meta = self._get_file_meta(client_id, "id,name")
+            name = meta.get("name", "") or "Client"
+            letter = name[0].upper() if name and name[0].isalpha() else "#"
+            active_cat = self._ensure_category_with_letters("Active Clients")
+            target_letter = self._ensure_folder(active_cat, letter)
+            self._move_file(client_id, target_letter)
+            return True
+        except Exception as e:
+            logger.error(f"Restore client failed: {e}")
+            return False
 
     # -----------------------------
     # Tasks
@@ -500,21 +581,25 @@ class SimpleGoogleDrive:
         agenda_val = created["Agenda & Valuation"]
         today_str = self._uk_date_str(datetime.today())
 
-        # Agenda doc
-        agenda_doc = self._build_agenda_doc(display_name, today_str)
-        self._upload_docx(
-            agenda_val,
-            f"Meeting Agenda – {display_name} – {year}.docx",
-            agenda_doc,
-        )
+        # --- Try to copy your templates; fallback to built-ins if not found ---
+        agenda_name = f"Meeting Agenda – {display_name} – {year}.docx"
+        valuation_name = f"Valuation Summary – {display_name} – {year}.docx"
 
-        # Valuation doc
-        val_doc = self._build_valuation_doc(display_name, today_str)
-        self._upload_docx(
-            agenda_val,
-            f"Valuation Summary – {display_name} – {year}.docx",
-            val_doc,
+        copied_agenda = (
+            self._copy_template_if_found(["Meeting Agenda", "Template"], agenda_val, agenda_name)
+            or self._copy_template_if_found(["Meeting Agenda"], agenda_val, agenda_name)
         )
+        if not copied_agenda:
+            agenda_doc = self._build_agenda_doc(display_name, today_str)
+            self._upload_docx(agenda_val, agenda_name, agenda_doc)
+
+        copied_valuation = (
+            self._copy_template_if_found(["Valuation", "Template"], agenda_val, valuation_name)
+            or self._copy_template_if_found(["Valuation"], agenda_val, valuation_name)
+        )
+        if not copied_valuation:
+            val_doc = self._build_valuation_doc(display_name, today_str)
+            self._upload_docx(agenda_val, valuation_name, val_doc)
 
         return created
 
@@ -531,13 +616,9 @@ class SimpleGoogleDrive:
         self.drive.files().create(body=meta, media_body=media, fields="id,name").execute()
 
     # -----------------------------
-    # Word document builders (UPDATED)
+    # Word document builders (fallback styling)
     # -----------------------------
     def _apply_body_font(self, doc: Document, name: str = "Calibri", size_pt: int = 11):
-        """
-        Best-effort set a consistent body font. (python-docx doesn't allow a true
-        global default; we apply to the Normal style.)
-        """
         try:
             style = doc.styles["Normal"]
             font = style.font
@@ -571,19 +652,11 @@ class SimpleGoogleDrive:
             doc.add_paragraph("")
 
     def _build_agenda_doc(self, client_display_name: str, date_str: str) -> Document:
-        """
-        Professional-looking agenda: centered title, client/date subtitle,
-        clear bold section headings, and clean list items.
-        """
         doc = Document()
         self._apply_body_font(doc, "Calibri", 11)
-
-        # Title + subtitle
         self._add_title(doc, "Client Review Meeting Agenda")
         self._add_subtitle(doc, f"{client_display_name}  •  {date_str}")
         self._add_spacer(doc)
-
-        # Sections (kept simple, easy to edit after generation)
         self._add_section_heading(doc, "Agenda Items")
         items = [
             "Welcome & meeting objectives",
@@ -596,45 +669,32 @@ class SimpleGoogleDrive:
         ]
         for i, it in enumerate(items, start=1):
             doc.add_paragraph(f"{i}. {it}")
-
         self._add_spacer(doc, 2)
-
         self._add_section_heading(doc, "Notes")
         doc.add_paragraph("")
-
         return doc
 
     def _build_valuation_doc(self, client_display_name: str, date_str: str) -> Document:
-        """
-        Matching visual style to the agenda: same font, heading sizes, spacing.
-        Provides a simple table the user can complete.
-        """
         doc = Document()
         self._apply_body_font(doc, "Calibri", 11)
-
-        # Title + subtitle
         self._add_title(doc, "Valuation Summary")
         self._add_subtitle(doc, f"{client_display_name}  •  {date_str}")
         self._add_spacer(doc)
 
-        # Table
         table = doc.add_table(rows=1, cols=3)
         hdr = table.rows[0].cells
         hdr[0].text = "Plan / Account"
         hdr[1].text = "Provider"
         hdr[2].text = "Value (£)"
 
-        # Starter editable row
         row = table.add_row().cells
         row[0].text = ""
         row[1].text = ""
         row[2].text = ""
 
         self._add_spacer(doc)
-
         self._add_section_heading(doc, "Total Value")
         doc.add_paragraph("£")
-
         return doc
 
     # -----------------------------
@@ -661,7 +721,6 @@ class SimpleGoogleDrive:
         subject = (comm.get("subject") or "No Subject").strip()
         cid = comm.get("communication_id", f"COM{datetime.now().strftime('%Y%m%d%H%M%S')}")
 
-        # Build filename
         time_bit = f" {time_str}" if time_str else ""
         filename = f"{date_str}{time_bit} - {ctype} - {subject} [{cid}].txt"
 
@@ -699,12 +758,10 @@ class SimpleGoogleDrive:
                 ),
                 fields="nextPageToken, files(id,name,createdTime,modifiedTime)",
                 pageToken=page,
-                orderBy="name desc",  # filenames start with date, so sort by name
+                orderBy="name desc",
             ).execute()
             for f in resp.get("files", []):
                 name = f.get("name", "")
-                # Best-effort parse from filename
-                # Format: YYYY-MM-DD [HHMM] - Type - Subject [COMid].txt
                 date_part = ""
                 time_part = ""
                 ctype = ""

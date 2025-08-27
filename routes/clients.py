@@ -1,17 +1,5 @@
 # routes/clients.py
 
-"""
-WealthPro CRM - Client Management Routes
-Aligned with SimpleGoogleDrive API:
- - list clients (get_clients_enhanced)
- - add client (create_client_enhanced_folders)
- - add task (add_task_enhanced)
- - create review pack (create_review_pack_for_client) + adds a review task
-
-Adds:
- - per-client Refresh button (no Drive mutations; just reloads CRM view)
-"""
-
 import logging
 from datetime import datetime, timedelta
 from flask import Blueprint, render_template_string, request, redirect, url_for, session
@@ -41,12 +29,7 @@ def clients():
             c.setdefault("email", None)
             c.setdefault("phone", None)
             c.setdefault("status", "active")  # lowercase to match label logic
-            # ensure numeric for formatting (won't change Drive)
-            try:
-                c["portfolio_value"] = float(c.get("portfolio_value") or 0)
-            except Exception:
-                c["portfolio_value"] = 0.0
-
+            c["portfolio_value"] = float(c.get("portfolio_value") or 0)
             if c.get("folder_id"):
                 c["folder_url"] = f"https://drive.google.com/drive/folders/{c['folder_id']}"
             else:
@@ -136,9 +119,12 @@ def clients():
                                 {% endif %}
                                 <a href="/clients/{{ client.client_id }}/add_task" class="text-indigo-700 hover:text-indigo-900 text-sm">📝 Add Task</a>
                                 <a href="/clients/{{ client.client_id }}/review" class="text-teal-700 hover:text-teal-900 text-sm font-semibold">🔄 Review</a>
-                                <!-- NEW: per-client refresh (no Drive changes) -->
-                                <a href="/clients/{{ client.client_id }}/refresh"
-                                   class="text-gray-700 hover:text-gray-900 text-sm">↻ Refresh</a>
+
+                                {% if client.status == 'archived' %}
+                                    <a href="/clients/{{ client.client_id }}/restore" class="text-green-700 hover:text-green-900 text-sm font-semibold">♻️ Restore</a>
+                                {% else %}
+                                    <a href="/clients/{{ client.client_id }}/archive" class="text-red-700 hover:text-red-900 text-sm">🗑️ Archive</a>
+                                {% endif %}
                             </div>
                         </td>
                     </tr>
@@ -187,7 +173,7 @@ def add_client():
 
             display_name = f"{surname}, {first_name}"
 
-            # Create Drive structure (A–Z + client + Tasks/Reviews)
+            # Create Drive structure (A–Z + client + Tasks/Reviews/Comms) under Active Clients if present
             client_folder_id = drive.create_client_enhanced_folders(display_name)
 
             # Success -> redirect; list pulls directly from Drive
@@ -197,7 +183,7 @@ def add_client():
             logger.exception("Add client error")
             return f"Error adding client: {e}", 500
 
-    # GET form
+    # GET form (kept as-is, full form)
     return render_template_string(
         """
 <!DOCTYPE html>
@@ -227,7 +213,7 @@ def add_client():
     <main class="max-w-4xl mx-auto px-6 py-8">
         <div class="mb-8">
             <h1 class="text-3xl font-bold">Add New Client</h1>
-            <p class="text-gray-600 mt-2">Client will be filed as "Surname, First Name" in the A–Z folder system.</p>
+            <p class="text-gray-600 mt-2">Client will be filed as "Surname, First Name" in the A–Z system.</p>
         </div>
 
         <div class="bg-white rounded-lg shadow p-8">
@@ -253,7 +239,7 @@ def add_client():
                     <div>
                         <label class="block text-sm font-medium text-gray-700 mb-2">Status</label>
                         <select name="status" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                            <option value="active">Active</option>
+                            <option value="active" selected>Active</option>
                             <option value="prospect">Prospect</option>
                             <option value="no_longer_client">No Longer Client</option>
                             <option value="deceased">Deceased</option>
@@ -282,103 +268,7 @@ def add_client():
         """
     )
 
-# ---------- Add Task ----------
-@clients_bp.route("/clients/<client_id>/add_task", methods=["GET", "POST"])
-def add_task(client_id):
-    creds = _require_creds()
-    if not creds:
-        return redirect(url_for("auth.authorize"))
-
-    try:
-        drive = SimpleGoogleDrive(creds)
-        clients = drive.get_clients_enhanced()
-        client = next((c for c in clients if c["client_id"] == client_id), None)
-        if not client:
-            return "Client not found", 404
-
-        if request.method == "POST":
-            # Build task payload for Drive text file
-            title = (request.form.get("title") or "").strip()
-            task_type = (request.form.get("task_type") or "").strip()
-            priority = (request.form.get("priority") or "Medium").strip()
-            due_date = (request.form.get("due_date") or "").strip()
-            description = (request.form.get("description") or "").strip()
-
-            if not title:
-                return "Title is required", 400
-
-            task = {
-                "task_id": f"TSK{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                "title": title,
-                "task_type": task_type,
-                "priority": priority,
-                "due_date": due_date,
-                "status": "Pending",
-                "description": description,
-                "created_date": datetime.now().strftime("%Y-%m-%d"),
-                "completed_date": "",
-                "time_spent": "",
-            }
-
-            drive.add_task_enhanced(task, client)
-            return redirect(url_for("clients.clients", msg="Task created"))
-
-        # GET form
-        return render_template_string(
-            """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>WealthPro CRM - Add Task</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-50">
-    <main class="max-w-3xl mx-auto px-6 py-8">
-        <h1 class="text-2xl font-bold mb-6">Add Task for {{ client.display_name }}</h1>
-        <form method="POST" class="bg-white shadow rounded p-6 space-y-4">
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Title *</label>
-                <input name="title" class="w-full px-3 py-2 border rounded" required>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Type</label>
-                    <input name="task_type" class="w-full px-3 py-2 border rounded" placeholder="e.g., Review, Call">
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Priority</label>
-                    <select name="priority" class="w-full px-3 py-2 border rounded">
-                        <option>High</option>
-                        <option selected>Medium</option>
-                        <option>Low</option>
-                    </select>
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Due Date</label>
-                    <input type="date" name="due_date" class="w-full px-3 py-2 border rounded">
-                </div>
-            </div>
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
-                <textarea name="description" rows="4" class="w-full px-3 py-2 border rounded"></textarea>
-            </div>
-            <div class="flex justify-between pt-2">
-                <a href="/clients" class="px-6 py-2 border rounded text-gray-700 hover:bg-gray-50">Cancel</a>
-                <button class="px-6 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Create Task</button>
-            </div>
-        </form>
-    </main>
-</body>
-</html>
-            """,
-            client=client,
-        )
-
-    except Exception as e:
-        logger.exception("Add task error")
-        return f"Error: {e}", 500
-
-# ---------- Create Review Pack (+ task) ----------
+# ---------- Review Pack (unchanged behavior; uses templates if found) ----------
 @clients_bp.route("/clients/<client_id>/review")
 def create_review(client_id):
     creds = _require_creds()
@@ -392,10 +282,9 @@ def create_review(client_id):
         if not client:
             return "Client not found", 404
 
-        # 1) Create the full Review {YEAR} pack (folders + docs)
         drive.create_review_pack_for_client(client)
 
-        # 2) Add a Review task due in 14 days
+        # Also add a Review task due in 14 days (kept from your build)
         due_date = (datetime.today() + timedelta(days=14)).strftime("%Y-%m-%d")
         review_task = {
             "task_id": f"TSK{datetime.now().strftime('%Y%m%d%H%M%S')}",
@@ -411,24 +300,37 @@ def create_review(client_id):
         }
         drive.add_task_enhanced(review_task, client)
 
-        return redirect(url_for("clients.clients", msg="Review pack created and task added."))
+        return redirect(url_for("clients.clients", msg="Review pack created (agenda/valuation added)."))
 
     except Exception as e:
         logger.exception("Create review error")
         return f"Error: {e}", 500
 
-# ---------- NEW: Per-client refresh (no Drive mutations) ----------
-@clients_bp.route("/clients/<client_id>/refresh")
-def refresh_client(client_id):
-    """
-    Lightweight 'refresh' that just reloads the Clients page.
-    We already read fresh data on each request; this route exists
-    so you have a per-client Refresh button with a confirmation message.
-    It does NOT change or recreate anything in Google Drive.
-    """
+# ---------- Archive / Restore (Drive only) ----------
+@clients_bp.route("/clients/<client_id>/archive")
+def archive_client(client_id):
     creds = _require_creds()
     if not creds:
         return redirect(url_for("auth.authorize"))
+    try:
+        drive = SimpleGoogleDrive(creds)
+        ok = drive.archive_client(client_id)
+        msg = "Client archived" if ok else "Archive failed"
+        return redirect(url_for("clients.clients", msg=msg))
+    except Exception as e:
+        logger.exception("Archive client error")
+        return f"Error: {e}", 500
 
-    # No data change; simply redirect back with a message
-    return redirect(url_for("clients.clients", msg="Client view refreshed"))
+@clients_bp.route("/clients/<client_id>/restore")
+def restore_client(client_id):
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
+    try:
+        drive = SimpleGoogleDrive(creds)
+        ok = drive.restore_client(client_id)
+        msg = "Client restored" if ok else "Restore failed"
+        return redirect(url_for("clients.clients", msg=msg))
+    except Exception as e:
+        logger.exception("Restore client error")
+        return f"Error: {e}", 500

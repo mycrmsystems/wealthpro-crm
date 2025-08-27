@@ -67,35 +67,29 @@ class SimpleGoogleDrive:
            ...
 
     Each client folder will also (on demand) contain:
-      - <top-level client>
-          Tasks/
-            Ongoing Tasks/
-            Completed Tasks/
-          Reviews/
-          Communications/
-          (and additional standard subfolders we maintain)
+      - Tasks/
+          Ongoing Tasks/
+          Completed Tasks/
+      - Reviews/
+          Review <YEAR>/
+            Agenda & Valuation/
+            FF&ATR/
+            ID&V & Sanction Search/
+            Meeting Notes/
+            Research/
+            Review Letter/
+            Client Confirmation/
+            Emails/
+      - Communications/   (plain .txt entries per interaction)
     """
-
-    # Standard subfolders we non-destructively ensure at the *client root*
-    CORE_CLIENT_SUBFOLDERS = [
-        "Agenda & Valuation",
-        "FF&ATR",
-        "ID&V & Sanction Search",
-        "Meeting Notes",
-        "Research",
-        "Review Letter",
-        "Client Confirmation",
-        "Emails",
-        "Communications",   # kept here for clarity (also ensured explicitly)
-        "Tasks",            # ensured with children
-        "Reviews"           # parent for per-year review folders
-    ]
 
     def __init__(self, credentials: Credentials):
         self.drive = _build_drive_service(credentials)
         self.root_folder_id = os.environ.get("GDRIVE_ROOT_FOLDER_ID", "").strip()
         if not self.root_folder_id:
             raise RuntimeError("GDRIVE_ROOT_FOLDER_ID is not set. Please set it in Render env vars.")
+        # Optional: custom agenda template (Google Drive File ID of a .docx)
+        self.agenda_template_file_id = os.environ.get("REVIEW_AGENDA_TEMPLATE_FILE_ID", "").strip()
         logger.info("Google Drive ready.")
 
     # -----------------------------
@@ -163,6 +157,14 @@ class SimpleGoogleDrive:
     def _rename_file(self, file_id: str, new_name: str):
         self.drive.files().update(fileId=file_id, body={"name": new_name}, fields="id,name").execute()
 
+    def _copy_file(self, source_file_id: str, new_name: str, parent_id: str) -> str:
+        """
+        Make a server-side copy of a Drive file into parent_id with a new name.
+        """
+        body = {"name": new_name, "parents": [parent_id]}
+        copied = self.drive.files().copy(fileId=source_file_id, body=body, fields="id,name").execute()
+        return copied["id"]
+
     # -----------------------------
     # Folder discovery helpers
     # -----------------------------
@@ -176,7 +178,7 @@ class SimpleGoogleDrive:
         return out
 
     def _has_client_markers(self, folder_id: str) -> bool:
-        """Heuristic: treat a folder as a client if it contains 'Tasks' or 'Reviews' or 'Communications'."""
+        """Heuristic: treat a folder as a client if it contains 'Tasks' or 'Reviews'."""
         for f in self._list_folders(folder_id):
             nm = (f.get("name") or "").strip()
             if nm in {"Tasks", "Reviews", "Communications"}:
@@ -217,8 +219,12 @@ class SimpleGoogleDrive:
 
         client_id = self._ensure_folder(index_id, display_name)
 
-        # Ensure the standard structure
-        self.ensure_client_core_structure(client_id)
+        # Core structure
+        tasks_id = self._ensure_folder(client_id, "Tasks")
+        self._ensure_folder(tasks_id, "Ongoing Tasks")
+        self._ensure_folder(tasks_id, "Completed Tasks")
+        self._ensure_folder(client_id, "Reviews")
+        self._ensure_folder(client_id, "Communications")
 
         logger.info("Created enhanced client folder for %s", display_name)
         return client_id
@@ -265,57 +271,6 @@ class SimpleGoogleDrive:
 
         clients.sort(key=lambda c: (c["display_name"] or "").lower())
         return clients
-
-    # -----------------------------
-    # Structure ensuring / Refresh
-    # -----------------------------
-    def ensure_client_core_structure(self, client_id: str):
-        """
-        NON-DESTRUCTIVE: Ensure all standard client subfolders exist at the client root,
-        plus the nested structure for Tasks and Reviews.
-        """
-        # Top level standard folders
-        for name in self.CORE_CLIENT_SUBFOLDERS:
-            self._ensure_folder(client_id, name)
-
-        # Tasks children
-        tasks_id = self._ensure_folder(client_id, "Tasks")
-        self._ensure_folder(tasks_id, "Ongoing Tasks")
-        self._ensure_folder(tasks_id, "Completed Tasks")
-
-        # Reviews parent (per-year handled separately)
-        self._ensure_folder(client_id, "Reviews")
-
-        # Communications (also at top-level)
-        self._ensure_folder(client_id, "Communications")
-
-    def ensure_review_year(self, client_id: str, year: Optional[int] = None) -> str:
-        """
-        Ensure Reviews/Review <YEAR> exists. Returns the year folder id.
-        """
-        if year is None:
-            year = datetime.today().year
-        reviews_id = self._ensure_folder(client_id, "Reviews")
-        return self._ensure_folder(reviews_id, f"Review {year}")
-
-    def refresh_all_clients_structure(self) -> Dict[str, int]:
-        """
-        NON-DESTRUCTIVE: For every client:
-          - Ensure top-level standard subfolders exist
-          - Ensure Reviews/Review <current year> exists
-        Returns a summary dict.
-        """
-        clients = self.get_clients_enhanced()
-        updated = 0
-        for c in clients:
-            cid = c["client_id"]
-            try:
-                self.ensure_client_core_structure(cid)
-                self.ensure_review_year(cid)
-                updated += 1
-            except Exception as e:
-                logger.error(f"Refresh structure failed for {c.get('display_name')} ({cid}): {e}")
-        return {"clients_seen": len(clients), "clients_updated": updated}
 
     # -----------------------------
     # Tasks
@@ -518,7 +473,7 @@ class SimpleGoogleDrive:
         return upcoming
 
     # -----------------------------
-    # Review Pack (docx creators)
+    # Review Pack
     # -----------------------------
     def _uk_date_str(self, dt: datetime) -> str:
         try:
@@ -554,15 +509,20 @@ class SimpleGoogleDrive:
         agenda_val = created["Agenda & Valuation"]
         today_str = self._uk_date_str(datetime.today())
 
-        # Agenda doc
-        agenda_doc = self._build_agenda_doc(display_name, today_str)
-        self._upload_docx(
-            agenda_val,
-            f"Meeting Agenda – {display_name} – {year}.docx",
-            agenda_doc,
-        )
+        # --- Agenda: use custom template if provided, else build default ---
+        agenda_filename = f"Meeting Agenda – {display_name} – {year}.docx"
+        if self.agenda_template_file_id:
+            try:
+                self._copy_file(self.agenda_template_file_id, agenda_filename, agenda_val)
+            except Exception as e:
+                logger.error(f"Failed to copy custom agenda template: {e}. Falling back to default.")
+                agenda_doc = self._build_agenda_doc(display_name, today_str)
+                self._upload_docx(agenda_val, agenda_filename, agenda_doc)
+        else:
+            agenda_doc = self._build_agenda_doc(display_name, today_str)
+            self._upload_docx(agenda_val, agenda_filename, agenda_doc)
 
-        # Valuation doc
+        # Valuation doc (same as before)
         val_doc = self._build_valuation_doc(display_name, today_str)
         self._upload_docx(
             agenda_val,
@@ -585,7 +545,7 @@ class SimpleGoogleDrive:
         self.drive.files().create(body=meta, media_body=media, fields="id,name").execute()
 
     # -----------------------------
-    # Word document builders
+    # Word document builders (fallbacks when no custom template set)
     # -----------------------------
     def _build_agenda_doc(self, client_display_name: str, date_str: str) -> Document:
         doc = Document()
@@ -719,7 +679,7 @@ class SimpleGoogleDrive:
                         "time": f"{time_part[:2]}:{time_part[2:]}" if len(time_part) == 4 else "",
                         "type": ctype,
                         "subject": subject,
-                        "details": "",
+                        "details": "",  # body not fetched (we store in filename + text body)
                         "outcome": "",
                         "duration": "",
                         "follow_up_required": "No",

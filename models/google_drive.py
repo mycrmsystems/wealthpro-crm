@@ -12,6 +12,7 @@ from google.oauth2.credentials import Credentials
 
 from docx import Document
 from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 __all__ = ["SimpleGoogleDrive"]
 
@@ -88,8 +89,6 @@ class SimpleGoogleDrive:
         self.root_folder_id = os.environ.get("GDRIVE_ROOT_FOLDER_ID", "").strip()
         if not self.root_folder_id:
             raise RuntimeError("GDRIVE_ROOT_FOLDER_ID is not set. Please set it in Render env vars.")
-        # Optional: custom agenda template (Google Drive File ID of a .docx)
-        self.agenda_template_file_id = os.environ.get("REVIEW_AGENDA_TEMPLATE_FILE_ID", "").strip()
         logger.info("Google Drive ready.")
 
     # -----------------------------
@@ -156,14 +155,6 @@ class SimpleGoogleDrive:
 
     def _rename_file(self, file_id: str, new_name: str):
         self.drive.files().update(fileId=file_id, body={"name": new_name}, fields="id,name").execute()
-
-    def _copy_file(self, source_file_id: str, new_name: str, parent_id: str) -> str:
-        """
-        Make a server-side copy of a Drive file into parent_id with a new name.
-        """
-        body = {"name": new_name, "parents": [parent_id]}
-        copied = self.drive.files().copy(fileId=source_file_id, body=body, fields="id,name").execute()
-        return copied["id"]
 
     # -----------------------------
     # Folder discovery helpers
@@ -509,20 +500,15 @@ class SimpleGoogleDrive:
         agenda_val = created["Agenda & Valuation"]
         today_str = self._uk_date_str(datetime.today())
 
-        # --- Agenda: use custom template if provided, else build default ---
-        agenda_filename = f"Meeting Agenda – {display_name} – {year}.docx"
-        if self.agenda_template_file_id:
-            try:
-                self._copy_file(self.agenda_template_file_id, agenda_filename, agenda_val)
-            except Exception as e:
-                logger.error(f"Failed to copy custom agenda template: {e}. Falling back to default.")
-                agenda_doc = self._build_agenda_doc(display_name, today_str)
-                self._upload_docx(agenda_val, agenda_filename, agenda_doc)
-        else:
-            agenda_doc = self._build_agenda_doc(display_name, today_str)
-            self._upload_docx(agenda_val, agenda_filename, agenda_doc)
+        # Agenda doc
+        agenda_doc = self._build_agenda_doc(display_name, today_str)
+        self._upload_docx(
+            agenda_val,
+            f"Meeting Agenda – {display_name} – {year}.docx",
+            agenda_doc,
+        )
 
-        # Valuation doc (same as before)
+        # Valuation doc
         val_doc = self._build_valuation_doc(display_name, today_str)
         self._upload_docx(
             agenda_val,
@@ -545,50 +531,110 @@ class SimpleGoogleDrive:
         self.drive.files().create(body=meta, media_body=media, fields="id,name").execute()
 
     # -----------------------------
-    # Word document builders (fallbacks when no custom template set)
+    # Word document builders (UPDATED)
     # -----------------------------
-    def _build_agenda_doc(self, client_display_name: str, date_str: str) -> Document:
-        doc = Document()
+    def _apply_body_font(self, doc: Document, name: str = "Calibri", size_pt: int = 11):
+        """
+        Best-effort set a consistent body font. (python-docx doesn't allow a true
+        global default; we apply to the Normal style.)
+        """
+        try:
+            style = doc.styles["Normal"]
+            font = style.font
+            font.name = name
+            font.size = Pt(size_pt)
+        except Exception:
+            pass
+
+    def _add_title(self, doc: Document, text: str):
         p = doc.add_paragraph()
-        r = p.add_run("Client Review Meeting Agenda")
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = p.add_run(text)
         r.bold = True
         r.font.size = Pt(16)
-        doc.add_paragraph(f"Client: {client_display_name}")
-        doc.add_paragraph(f"Date: {date_str}")
-        doc.add_paragraph("")
+
+    def _add_subtitle(self, doc: Document, text: str):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = p.add_run(text)
+        r.bold = False
+        r.font.size = Pt(11)
+
+    def _add_section_heading(self, doc: Document, text: str):
+        p = doc.add_paragraph()
+        r = p.add_run(text)
+        r.bold = True
+        r.font.size = Pt(12)
+
+    def _add_spacer(self, doc: Document, lines: int = 1):
+        for _ in range(lines):
+            doc.add_paragraph("")
+
+    def _build_agenda_doc(self, client_display_name: str, date_str: str) -> Document:
+        """
+        Professional-looking agenda: centered title, client/date subtitle,
+        clear bold section headings, and clean list items.
+        """
+        doc = Document()
+        self._apply_body_font(doc, "Calibri", 11)
+
+        # Title + subtitle
+        self._add_title(doc, "Client Review Meeting Agenda")
+        self._add_subtitle(doc, f"{client_display_name}  •  {date_str}")
+        self._add_spacer(doc)
+
+        # Sections (kept simple, easy to edit after generation)
+        self._add_section_heading(doc, "Agenda Items")
         items = [
-            "1. Welcome & objectives",
-            "2. Personal & financial updates",
-            "3. Investment performance & valuation",
-            "4. Risk profile (ATR) & capacity",
-            "5. Charges & costs",
-            "6. Portfolio changes / recommendations",
-            "7. Action points & next steps",
+            "Welcome & meeting objectives",
+            "Personal and financial updates",
+            "Investment performance & valuation",
+            "Risk profile (ATR) & capacity for loss",
+            "Charges & costs",
+            "Portfolio changes / recommendations",
+            "Action points & next steps",
         ]
-        for it in items:
-            doc.add_paragraph(it)
+        for i, it in enumerate(items, start=1):
+            doc.add_paragraph(f"{i}. {it}")
+
+        self._add_spacer(doc, 2)
+
+        self._add_section_heading(doc, "Notes")
+        doc.add_paragraph("")
+
         return doc
 
     def _build_valuation_doc(self, client_display_name: str, date_str: str) -> Document:
+        """
+        Matching visual style to the agenda: same font, heading sizes, spacing.
+        Provides a simple table the user can complete.
+        """
         doc = Document()
-        p = doc.add_paragraph()
-        r = p.add_run("Valuation Summary")
-        r.bold = True
-        r.font.size = Pt(16)
-        doc.add_paragraph(f"Client: {client_display_name}")
-        doc.add_paragraph(f"Date: {date_str}")
-        doc.add_paragraph("")
+        self._apply_body_font(doc, "Calibri", 11)
+
+        # Title + subtitle
+        self._add_title(doc, "Valuation Summary")
+        self._add_subtitle(doc, f"{client_display_name}  •  {date_str}")
+        self._add_spacer(doc)
+
+        # Table
         table = doc.add_table(rows=1, cols=3)
         hdr = table.rows[0].cells
         hdr[0].text = "Plan / Account"
         hdr[1].text = "Provider"
         hdr[2].text = "Value (£)"
+
+        # Starter editable row
         row = table.add_row().cells
         row[0].text = ""
         row[1].text = ""
         row[2].text = ""
-        doc.add_paragraph("")
-        doc.add_paragraph("Total Value: £")
+
+        self._add_spacer(doc)
+
+        self._add_section_heading(doc, "Total Value")
+        doc.add_paragraph("£")
+
         return doc
 
     # -----------------------------
@@ -679,7 +725,7 @@ class SimpleGoogleDrive:
                         "time": f"{time_part[:2]}:{time_part[2:]}" if len(time_part) == 4 else "",
                         "type": ctype,
                         "subject": subject,
-                        "details": "",  # body not fetched (we store in filename + text body)
+                        "details": "",
                         "outcome": "",
                         "duration": "",
                         "follow_up_required": "No",

@@ -152,8 +152,10 @@ def clients():
         drive = SimpleGoogleDrive(credentials)
         clients = drive.get_clients_enhanced()
 
-        # annotate archived flag for each client
+        # add folder_url & archived flag
         for c in clients:
+            fid = c.get('folder_id') or c.get('client_id')
+            c['folder_url'] = f"https://drive.google.com/drive/folders/{fid}" if fid else None
             c['is_archived'] = _is_archived(drive, c['client_id'])
 
         return render_template_string("""
@@ -218,6 +220,10 @@ def clients():
                     </div>
 
                     <div class="flex flex-wrap items-center gap-2">
+                        {% if c.folder_url %}
+                        <a href="{{ c.folder_url }}" target="_blank" rel="noopener"
+                           class="px-3 py-1 text-sm bg-white border border-blue-300 text-blue-700 rounded hover:bg-blue-50">📁 Folder</a>
+                        {% endif %}
                         <a href="/clients/{{ c.client_id }}/profile" class="px-3 py-1 text-sm bg-blue-100 text-blue-800 rounded hover:bg-blue-200">Profile</a>
                         <a href="/clients/{{ c.client_id }}/refresh" class="px-3 py-1 text-sm bg-gray-100 rounded hover:bg-gray-200">Refresh</a>
                         <a href="/clients/{{ c.client_id }}/add_task" class="px-3 py-1 text-sm bg-green-100 text-green-800 rounded hover:bg-green-200">Add Task</a>
@@ -335,6 +341,8 @@ def client_profile(client_id):
         if not client:
             return "Client not found", 404
 
+        fid = client.get('folder_id') or client.get('client_id')
+        client['folder_url'] = f"https://drive.google.com/drive/folders/{fid}" if fid else None
         client['is_archived'] = _is_archived(drive, client['client_id'])
 
         return render_template_string("""
@@ -368,7 +376,9 @@ def client_profile(client_id):
             {% endif %}
         </div>
         <div class="flex gap-2">
-            <a href="{{ client.folder_url }}" target="_blank" rel="noopener" class="px-4 py-2 bg-blue-100 text-blue-800 rounded hover:bg-blue-200">Open Folder</a>
+            {% if client.folder_url %}
+            <a href="{{ client.folder_url }}" target="_blank" rel="noopener" class="px-4 py-2 bg-blue-100 text-blue-800 rounded hover:bg-blue-200">📁 Open Folder</a>
+            {% endif %}
             <a href="/clients/{{ client.client_id }}/refresh" class="px-4 py-2 bg-gray-100 rounded hover:bg-gray-200">Refresh</a>
         </div>
     </div>

@@ -2,6 +2,7 @@
 
 import os
 import io
+import re
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -44,6 +45,25 @@ def _escape_drive_name(value: str) -> str:
     return (value or "").replace("'", "’")
 
 
+def _drive_folder_url(folder_id: str) -> str:
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+# Subfolders you asked to live directly under the main client folder
+MAIN_CLIENT_SUBFOLDERS = [
+    "FF&ATR",
+    "ID&V & Sanction Search",
+    "Meeting Notes",
+    "Research",
+    "Review Letter",
+    "Client Confirmation",
+    "Emails",
+    "Communications",
+    "Tasks",        # has Ongoing/Completed inside
+    "Reviews",      # holds yearly review folders inside
+]
+
+
 # -----------------------------
 # Main class
 # -----------------------------
@@ -73,20 +93,16 @@ class SimpleGoogleDrive:
            ...
 
     Each client folder will also (on demand) contain:
-      - Tasks/
+      - (Main root) FF&ATR, ID&V & Sanction Search, Meeting Notes, Research, Review Letter, Client Confirmation, Emails,
+        Communications, Tasks, Reviews
+      - (Tasks/)
           Ongoing Tasks/
           Completed Tasks/
-      - Reviews/
+      - (Reviews/)
           Review <YEAR>/
             Agenda & Valuation/
-            FF&ATR/
-            ID&V & Sanction Search/
-            Meeting Notes/
-            Research/
-            Review Letter/
-            Client Confirmation/
-            Emails/
-      - Communications/   (plain .txt entries per interaction)
+            (docs go here)
+      - (Communications/)
     """
 
     def __init__(self, credentials: Credentials):
@@ -174,12 +190,10 @@ class SimpleGoogleDrive:
         return out
 
     def _has_client_markers(self, folder_id: str) -> bool:
-        """Heuristic: treat a folder as a client if it contains 'Tasks' or 'Reviews' (or Communications)."""
-        for f in self._list_folders(folder_id):
-            nm = (f.get("name") or "").strip()
-            if nm in {"Tasks", "Reviews", "Communications"}:
-                return True
-        return False
+        """Heuristic: treat a folder as a client if it contains key subfolders."""
+        names = { (f.get("name") or "").strip() for f in self._list_folders(folder_id) }
+        markers = {"Tasks", "Reviews", "Communications"}
+        return bool(names & markers)
 
     # -----------------------------
     # Client creation & listing
@@ -215,22 +229,21 @@ class SimpleGoogleDrive:
 
         client_id = self._ensure_folder(index_id, display_name)
 
-        # Core structure
+        # Ensure main subfolders at client root
+        for name in MAIN_CLIENT_SUBFOLDERS:
+            self._ensure_folder(client_id, name)
+
+        # Ensure tasks internals
         tasks_id = self._ensure_folder(client_id, "Tasks")
         self._ensure_folder(tasks_id, "Ongoing Tasks")
         self._ensure_folder(tasks_id, "Completed Tasks")
-        self._ensure_folder(client_id, "Reviews")
-        self._ensure_folder(client_id, "Communications")
 
-        logger.info("Created enhanced client folder for %s", display_name)
+        logger.info("Created client folder with main subfolders for %s", display_name)
         return client_id
 
     def get_clients_enhanced(self) -> List[Dict]:
         """
-        Discover client folders robustly for both supported layouts:
-        - Letters directly under ROOT
-        - Category folders under ROOT, then letters
-        Skips category and letter folders themselves; only returns leaf client folders.
+        Discover client folders robustly for both supported layouts.
         """
         clients: List[Dict] = []
 
@@ -241,7 +254,8 @@ class SimpleGoogleDrive:
                     "display_name": (folder.get("name") or "").strip(),
                     "status": "active",
                     "folder_id": folder["id"],
-                    "portfolio_value": 0.0,
+                    "folder_url": _drive_folder_url(folder["id"]),
+                    "portfolio_value": self._get_client_portfolio_value(folder["id"]),
                 }
             )
 
@@ -260,12 +274,50 @@ class SimpleGoogleDrive:
                         for child in self._list_folders(letter["id"]):
                             add_client(child)
                 else:
-                    # If a category actually holds clients directly
                     if self._has_client_markers(category["id"]):
                         add_client(category)
 
         clients.sort(key=lambda c: (c["display_name"] or "").lower())
         return clients
+
+    # -----------------------------
+    # Optional: portfolio value reader
+    # -----------------------------
+    def _get_client_portfolio_value(self, client_id: str) -> float:
+        """
+        Optional, non-breaking:
+        If a file named 'Portfolio Value.txt' exists in the client root and contains a line like:
+            Total: 123456.78
+        we'll use that. Otherwise 0.0.
+        """
+        try:
+            resp = self.drive.files().list(
+                q=(
+                    f"'{client_id}' in parents and "
+                    "mimeType!='application/vnd.google-apps.folder' and "
+                    "name='Portfolio Value.txt' and trashed=false"
+                ),
+                fields="files(id,name)",
+                pageSize=1,
+            ).execute()
+            files = resp.get("files", [])
+            if not files:
+                return 0.0
+
+            file_id = files[0]["id"]
+            # download content
+            data = self.drive.files().get_media(fileId=file_id).execute()
+            text = data.decode("utf-8", errors="ignore")
+            m = re.search(r"Total:\s*([0-9.,]+)", text)
+            if m:
+                raw = m.group(1).replace(",", "")
+                return float(raw)
+        except Exception as e:
+            logger.warning(f"Portfolio value read failed for client {client_id}: {e}")
+        return 0.0
+
+    def get_total_portfolio_value(self) -> float:
+        return sum(c.get("portfolio_value", 0.0) for c in self.get_clients_enhanced())
 
     # -----------------------------
     # Tasks
@@ -487,24 +539,12 @@ class SimpleGoogleDrive:
         reviews_root = self._ensure_folder(client_id, "Reviews")
         yr_id = self._ensure_folder(reviews_root, f"Review {year}")
 
-        subfolders = [
-            "Agenda & Valuation",
-            "FF&ATR",
-            "ID&V & Sanction Search",
-            "Meeting Notes",
-            "Research",
-            "Review Letter",
-            "Client Confirmation",
-            "Emails",
-        ]
-        created = {"review_year_id": yr_id}
-        for sf in subfolders:
-            created[sf] = self._ensure_folder(yr_id, sf)
+        # yearly subfolder where the two docs live
+        agenda_val = self._ensure_folder(yr_id, "Agenda & Valuation")
 
-        agenda_val = created["Agenda & Valuation"]
         today_str = self._uk_date_str(datetime.today())
 
-        # Agenda doc (styled to match your uploaded version)
+        # Agenda (updated style)
         agenda_doc = self._build_agenda_doc(display_name, today_str)
         self._upload_docx(
             agenda_val,
@@ -512,7 +552,7 @@ class SimpleGoogleDrive:
             agenda_doc,
         )
 
-        # Valuation doc (styled to visually match the agenda)
+        # Valuation (updated style to match agenda)
         val_doc = self._build_valuation_doc(display_name, today_str)
         self._upload_docx(
             agenda_val,
@@ -520,7 +560,10 @@ class SimpleGoogleDrive:
             val_doc,
         )
 
-        return created
+        return {
+            "review_year_id": yr_id,
+            "agenda_val_id": agenda_val,
+        }
 
     def _upload_docx(self, parent_id: str, filename: str, document: Document):
         stream = io.BytesIO()
@@ -535,14 +578,9 @@ class SimpleGoogleDrive:
         self.drive.files().create(body=meta, media_body=media, fields="id,name").execute()
 
     # -----------------------------
-    # Word document builders (styled)
+    # Word document builders (styled clearly)
     # -----------------------------
     def _apply_base_style(self, doc: Document):
-        """
-        Apply a clean, professional default look to match the agenda feel:
-        - Calibri 11 body
-        - Reasonable margins
-        """
         # Margins
         for section in doc.sections:
             section.top_margin = Inches(1)
@@ -560,10 +598,9 @@ class SimpleGoogleDrive:
         p = doc.add_paragraph()
         run = p.add_run(text)
         run.bold = True
-        run.font.size = Pt(16)
+        run.font.size = Pt(18)  # make this clearly different so you see the change
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        # add a little space after
-        p.paragraph_format.space_after = Pt(12)
+        p.paragraph_format.space_after = Pt(16)
 
     def _add_label_value(self, doc: Document, label: str, value: str):
         p = doc.add_paragraph()
@@ -574,29 +611,20 @@ class SimpleGoogleDrive:
         val_run.font.size = Pt(11)
 
     def _add_divider(self, doc: Document):
-        # A subtle divider line effect by using a paragraph border
         p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         p.paragraph_format.space_before = Pt(6)
-        p.paragraph_format.space_after = Pt(6)
-
+        p.paragraph_format.space_after = Pt(10)
         p_pr = p._p.get_or_add_pPr()
         pbdr = OxmlElement("w:pBdr")
         bottom = OxmlElement("w:bottom")
         bottom.set(qn("w:val"), "single")
-        bottom.set(qn("w:sz"), "6")      # thin line
+        bottom.set(qn("w:sz"), "8")
         bottom.set(qn("w:space"), "1")
         bottom.set(qn("w:color"), "auto")
         pbdr.append(bottom)
         p_pr.append(pbdr)
 
     def _build_agenda_doc(self, client_display_name: str, date_str: str) -> Document:
-        """
-        Agenda styled to match your uploaded look:
-        - Centered bold title (16pt)
-        - Label/Value lines for Client and Date
-        - Tidy numbered list of agenda items
-        """
         doc = Document()
         self._apply_base_style(doc)
 
@@ -614,8 +642,6 @@ class SimpleGoogleDrive:
             "Portfolio changes / recommendations",
             "Action points & next steps",
         ]
-
-        # Numbered list (simple)
         for idx, it in enumerate(items, start=1):
             p = doc.add_paragraph()
             run = p.add_run(f"{idx}. {it}")
@@ -625,12 +651,6 @@ class SimpleGoogleDrive:
         return doc
 
     def _build_valuation_doc(self, client_display_name: str, date_str: str) -> Document:
-        """
-        Valuation styled to visually match the agenda:
-        - Same heading style
-        - Same label/value lines
-        - Clean 3-column table and total line
-        """
         doc = Document()
         self._apply_base_style(doc)
 
@@ -639,6 +659,7 @@ class SimpleGoogleDrive:
         self._add_label_value(doc, "Date", date_str)
         self._add_divider(doc)
 
+        # simple clean table
         table = doc.add_table(rows=1, cols=3)
         table.style = "Table Grid"
         hdr = table.rows[0].cells
@@ -646,17 +667,17 @@ class SimpleGoogleDrive:
         hdr[1].text = "Provider"
         hdr[2].text = "Value (£)"
 
-        # Provide one empty editable row
+        # one starter row
         row = table.add_row().cells
         row[0].text = ""
         row[1].text = ""
         row[2].text = ""
 
-        # Space then total
         doc.add_paragraph()
+
         total_p = doc.add_paragraph()
-        total_label = total_p.add_run("Total Value: ")
-        total_label.bold = True
+        total_lbl = total_p.add_run("Total Value: ")
+        total_lbl.bold = True
         total_val = total_p.add_run("£")
         total_val.bold = False
 
@@ -666,14 +687,9 @@ class SimpleGoogleDrive:
     # Communications
     # -----------------------------
     def _get_client_communications_folder(self, client_id: str) -> str:
-        """Ensure and return the Communications folder for a client."""
         return self._ensure_folder(client_id, "Communications")
 
     def add_communication_enhanced(self, comm: Dict, client: Dict) -> bool:
-        """
-        Save a communication entry as a .txt file in Communications/.
-        Filename: YYYY-MM-DD HHMM - Type - Subject [COMxxxxxxxx].txt
-        """
         client_id = client.get("client_id") or client.get("folder_id")
         if not client_id:
             raise ValueError("client client_id/folder_id missing")
@@ -686,7 +702,6 @@ class SimpleGoogleDrive:
         subject = (comm.get("subject") or "No Subject").strip()
         cid = comm.get("communication_id", f"COM{datetime.now().strftime('%Y%m%d%H%M%S')}")
 
-        # Build filename
         time_bit = f" {time_str}" if time_str else ""
         filename = f"{date_str}{time_bit} - {ctype} - {subject} [{cid}].txt"
 
@@ -711,7 +726,6 @@ class SimpleGoogleDrive:
         return True
 
     def get_client_communications(self, client_id: str) -> List[Dict]:
-        """Return communications for a client, newest first by filename (date)."""
         folder_id = self._get_client_communications_folder(client_id)
 
         out: List[Dict] = []
@@ -724,12 +738,10 @@ class SimpleGoogleDrive:
                 ),
                 fields="nextPageToken, files(id,name,createdTime,modifiedTime)",
                 pageToken=page,
-                orderBy="name desc",  # filenames start with date, so sort by name
+                orderBy="name desc",
             ).execute()
             for f in resp.get("files", []):
                 name = f.get("name", "")
-                # Best-effort parse from filename
-                # Format: YYYY-MM-DD [HHMM] - Type - Subject [COMid].txt
                 date_part = ""
                 time_part = ""
                 ctype = ""

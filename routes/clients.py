@@ -1,164 +1,55 @@
 # routes/clients.py
 
+"""
+WealthPro CRM - Client Management Routes
+Includes:
+ - list clients (get_clients_enhanced) with Google Folder link
+ - add client (create_client_enhanced_folders)
+ - create review pack (+ task remains in routes/tasks if you use it)
+ - archive / restore client (Drive folder moved, data intact)
+ - per-client CRM-only refresh action (does not touch Drive)
+"""
+
 import logging
-from typing import Optional
+from datetime import datetime, timedelta
 from flask import Blueprint, render_template_string, request, redirect, url_for, session
 from google.oauth2.credentials import Credentials
 from models.google_drive import SimpleGoogleDrive
 
 logger = logging.getLogger(__name__)
+clients_bp = Blueprint("clients", __name__)
 
-clients_bp = Blueprint('clients', __name__)
+def _require_creds():
+    if "credentials" not in session:
+        return None
+    return Credentials(**session["credentials"])
 
-
-# ------------------------------
-# Drive helpers (route-local)
-# ------------------------------
-def _list_folders(drive_service, parent_id: str):
-    folders = []
-    page = None
-    q = (
-        f"'{parent_id}' in parents and "
-        "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    )
-    while True:
-        resp = drive_service.files().list(
-            q=q, fields="nextPageToken, files(id,name)", pageToken=page, pageSize=1000
-        ).execute()
-        folders.extend(resp.get("files", []))
-        page = resp.get("nextPageToken")
-        if not page:
-            break
-    return folders
-
-
-def _get_letter_folders(drive_service, parent_id: str):
-    out = []
-    for f in _list_folders(drive_service, parent_id):
-        nm = (f.get("name") or "").strip()
-        if len(nm) == 1 and nm.isalpha() and nm.upper() == nm:
-            out.append(f)
-    return out
-
-
-def _ensure_folder(drive_service, parent_id: str, name: str) -> str:
-    safe = (name or "").replace("'", "’")
-    q = (
-        f"'{parent_id}' in parents and "
-        "mimeType='application/vnd.google-apps.folder' and "
-        f"name='{safe}' and trashed=false"
-    )
-    resp = drive_service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
-    files = resp.get("files", [])
-    if files:
-        return files[0]["id"]
-    body = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-    created = drive_service.files().create(body=body, fields="id,name").execute()
-    return created["id"]
-
-
-def _get_parent(drive_service, file_id: str) -> Optional[str]:
-    meta = drive_service.files().get(fileId=file_id, fields="id,parents").execute()
-    parents = meta.get("parents") or []
-    return parents[0] if parents else None
-
-
-def _get_ancestor_names(drive_service, file_id: str, max_hops: int = 6):
-    names = []
-    current = _get_parent(drive_service, file_id)
-    hops = 0
-    while current and hops < max_hops:
-        meta = drive_service.files().get(fileId=current, fields="id,name,parents").execute()
-        names.append(meta.get("name") or "")
-        parents = meta.get("parents") or []
-        current = parents[0] if parents else None
-        hops += 1
-    return names  # from immediate parent upwards
-
-
-def _is_archived(drive: SimpleGoogleDrive, client_folder_id: str) -> bool:
-    # If any ancestor is named "Archived Clients", treat as archived
-    names = _get_ancestor_names(drive.drive, client_folder_id)
-    return any(n.strip().lower() == "archived clients" for n in names)
-
-
-def _ensure_category_letter(drive: SimpleGoogleDrive, category_name: str, display_name: str) -> str:
-    """
-    Ensure a category, then its A–Z letter folder, and return the letter folder id.
-    """
-    root = drive.root_folder_id
-    category_id = _ensure_folder(drive.drive, root, category_name)
-
-    first = (display_name[:1] or "#").upper()
-    letter = first if first.isalpha() else "#"
-    letter_id = _ensure_folder(drive.drive, category_id, letter)
-    return letter_id
-
-
-def _active_letter_destination(drive: SimpleGoogleDrive, display_name: str) -> str:
-    """
-    Find where active clients live:
-      - If letters directly under ROOT, use ROOT.
-      - Else find first category with A–Z (not 'Archived Clients'), and use that.
-      - Else fall back to ROOT.
-    Then ensure the letter and return its id.
-    """
-    root = drive.root_folder_id
-    # letters at root?
-    letters = _get_letter_folders(drive.drive, root)
-    if letters:
-        first = (display_name[:1] or "#").upper()
-        letter = first if first.isalpha() else "#"
-        return _ensure_folder(drive.drive, root, letter)
-
-    # otherwise, find first category that contains letters (not Archived Clients)
-    for cat in _list_folders(drive.drive, root):
-        nm = (cat.get("name") or "").strip()
-        if nm.lower() == "archived clients":
-            continue
-        if _get_letter_folders(drive.drive, cat["id"]):
-            first = (display_name[:1] or "#").upper()
-            letter = first if first.isalpha() else "#"
-            return _ensure_folder(drive.drive, cat["id"], letter)
-
-    # fallback: root
-    first = (display_name[:1] or "#").upper()
-    letter = first if first.isalpha() else "#"
-    return _ensure_folder(drive.drive, root, letter)
-
-
-def _move_folder(drive_service, folder_id: str, new_parent_id: str):
-    meta = drive_service.files().get(fileId=folder_id, fields="id,parents").execute()
-    prev = ",".join(meta.get("parents", [])) if meta.get("parents") else ""
-    drive_service.files().update(
-        fileId=folder_id,
-        addParents=new_parent_id,
-        removeParents=prev,
-        fields="id,parents"
-    ).execute()
-
-
-# ------------------------------
-# Routes
-# ------------------------------
-@clients_bp.route('/clients')
+@clients_bp.route("/clients")
 def clients():
-    """List clients with full action set on each row."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
 
     try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
-        clients = drive.get_clients_enhanced()
+        drive = SimpleGoogleDrive(creds)
+        items = drive.get_clients_enhanced()
 
-        # add folder_url & archived flag
-        for c in clients:
-            fid = c.get('folder_id') or c.get('client_id')
-            c['folder_url'] = f"https://drive.google.com/drive/folders/{fid}" if fid else None
-            c['is_archived'] = _is_archived(drive, c['client_id'])
+        # Decorate with folder links and safe defaults for template
+        for c in items:
+            c.setdefault("email", None)
+            c.setdefault("phone", None)
+            c.setdefault("status", "active")
+            try:
+                c["portfolio_value"] = float(c.get("portfolio_value") or 0)
+            except Exception:
+                c["portfolio_value"] = 0.0
+            if c.get("folder_id"):
+                c["folder_url"] = f"https://drive.google.com/drive/folders/{c['folder_id']}"
+            else:
+                c["folder_url"] = None
 
-        return render_template_string("""
+        return render_template_string(
+            """
 <!DOCTYPE html>
 <html>
 <head>
@@ -167,317 +58,296 @@ def clients():
     <style>
         body { font-family: "Inter", sans-serif; }
         .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
-        .chip { font-size: 12px; padding: 2px 8px; border-radius: 9999px; }
+        .pill { padding: 2px 8px; border-radius: 9999px; font-size: 12px; display:inline-block;}
     </style>
 </head>
 <body class="bg-gray-50">
-<nav class="gradient-wealth text-white shadow-lg">
-    <div class="max-w-7xl mx-auto px-6">
-        <div class="flex justify-between items-center h-16">
-            <h1 class="text-xl font-bold">WealthPro CRM</h1>
-            <div class="flex items-center space-x-6">
-                <a href="/" class="hover:text-blue-200">Dashboard</a>
-                <a href="/clients" class="text-white font-semibold">Clients</a>
-                <a href="/tasks" class="hover:text-blue-200">Tasks</a>
+    <nav class="gradient-wealth text-white shadow-lg">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="flex justify-between items-center h-16">
+                <h1 class="text-xl font-bold">WealthPro CRM</h1>
+                <div class="flex items-center space-x-6">
+                    <a href="/" class="hover:text-blue-200">Dashboard</a>
+                    <a href="/clients" class="text-white font-semibold">Clients</a>
+                    <a href="/tasks" class="hover:text-blue-200">Tasks</a>
+                </div>
             </div>
         </div>
-    </div>
-</nav>
+    </nav>
 
-<main class="max-w-7xl mx-auto px-6 py-8">
-    <div class="flex items-center justify-between mb-6">
-        <div>
-            <h1 class="text-3xl font-bold">Clients</h1>
-            <p class="text-gray-600">Active and archived clients. Use actions at right.</p>
+    <main class="max-w-7xl mx-auto px-6 py-8">
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-3xl font-bold">Clients</h1>
+                <p class="text-gray-600 mt-1">Total clients: {{ clients|length }}</p>
+            </div>
+            <a href="/clients/add" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700">
+                Add New Client
+            </a>
         </div>
-        <a href="/clients/new" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Add Client</a>
-    </div>
 
-    <div class="bg-white rounded-lg shadow">
-        <div class="p-6 border-b flex justify-between items-center">
-            <h3 class="text-lg font-semibold">All Clients</h3>
-            <span class="text-sm text-gray-600">Total: {{ clients|length }}</span>
+        {% if request.args.get('msg') %}
+        <div class="mb-6 p-4 bg-green-100 border border-green-300 text-green-800 rounded">
+            {{ request.args.get('msg') }}
         </div>
-        <div class="p-6">
-            {% if clients %}
-            <div class="divide-y">
-                {% for c in clients %}
-                <div class="py-4 flex items-center justify-between">
+        {% endif %}
+
+        <div class="bg-white rounded-lg shadow overflow-hidden">
+            <table class="min-w-full">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Client</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Portfolio</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    {% for client in clients %}
+                    <tr>
+                        <td class="px-6 py-4">
+                            <div class="font-medium text-gray-900">{{ client.display_name }}</div>
+                            <div class="text-sm text-gray-500">ID: {{ client.client_id }}</div>
+                        </td>
+                        <td class="px-6 py-4">
+                            <span class="pill
+                                {% if client.status == 'active' %}bg-green-100 text-green-800
+                                {% elif client.status == 'archived' %}bg-gray-100 text-gray-800
+                                {% elif client.status == 'deceased' %}bg-gray-200 text-gray-800
+                                {% elif client.status == 'no_longer_client' %}bg-red-100 text-red-800
+                                {% else %}bg-yellow-100 text-yellow-800{% endif %}">
+                                {{ (client.status or 'active').replace('_',' ').title() }}
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 text-sm">
+                            £{{ "{:,.0f}".format(client.portfolio_value) }}
+                        </td>
+                        <td class="px-6 py-4">
+                            <div class="flex gap-3 flex-wrap items-center">
+                                {% if client.folder_url %}
+                                    <a href="{{ client.folder_url }}" target="_blank" class="text-blue-600 hover:text-blue-800 text-sm">📁 Google Folder</a>
+                                {% endif %}
+                                <a href="/clients/{{ client.client_id }}/add_task" class="text-indigo-700 hover:text-indigo-900 text-sm">📝 Add Task</a>
+                                <a href="/clients/{{ client.client_id }}/review" class="text-teal-700 hover:text-teal-900 text-sm font-semibold">🔄 Create Review Pack</a>
+                                <a href="/clients/{{ client.client_id }}/refresh" class="text-gray-700 hover:text-gray-900 text-sm">🔃 Refresh (CRM)</a>
+                                {% if client.status == 'active' %}
+                                  <a href="/clients/{{ client.client_id }}/archive" class="text-orange-700 hover:text-orange-900 text-sm">🗄️ Archive</a>
+                                {% elif client.status == 'archived' %}
+                                  <a href="/clients/{{ client.client_id }}/restore" class="text-green-700 hover:text-green-900 text-sm">♻️ Restore</a>
+                                {% endif %}
+                            </div>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="4" class="px-6 py-4 text-center text-gray-500">
+                            No clients found. <a href="/clients/add" class="text-blue-600">Add your first client</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </main>
+</body>
+</html>
+            """,
+            clients=items,
+        )
+    except Exception as e:
+        logger.exception("Clients error")
+        return f"Error: {e}", 500
+
+
+@clients_bp.route("/clients/add", methods=["GET", "POST"])
+def add_client():
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
+
+    if request.method == "POST":
+        try:
+            drive = SimpleGoogleDrive(creds)
+
+            first_name = (request.form.get("first_name") or "").strip()
+            surname = (request.form.get("surname") or "").strip()
+            email = (request.form.get("email") or "").strip()
+            phone = (request.form.get("phone") or "").strip()
+            status = (request.form.get("status") or "active").strip().lower()
+            portfolio_value = request.form.get("portfolio_value", "0").strip()
+
+            if not first_name or not surname:
+                raise ValueError("First name and surname are required")
+
+            display_name = f"{surname}, {first_name}"
+
+            # Create Drive structure (A–Z + client + ALL core subfolders)
+            client_folder_id = drive.create_client_enhanced_folders(display_name)
+
+            # Optional: seed profile.json with initial portfolio_value if provided
+            try:
+                pv = float(portfolio_value or 0)
+            except Exception:
+                pv = 0.0
+            profile = drive.read_profile(client_folder_id)
+            # Put initial value as a single line item if non-zero (user can edit later)
+            if pv > 0:
+                profile["investments"] = profile.get("investments", [])
+                profile["investments"].append({"name": "Initial Entry", "provider": "", "value": pv})
+                profile["computed_total"] = pv
+                drive.write_profile(client_folder_id, profile)
+
+            return redirect(url_for("clients.clients", msg="Client created successfully"))
+
+        except Exception as e:
+            logger.exception("Add client error")
+            return f"Error adding client: {e}", 500
+
+    # GET form
+    return render_template_string(
+        """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WealthPro CRM - Add Client</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: "Inter", sans-serif; }
+        .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <nav class="gradient-wealth text-white shadow-lg">
+        <div class="max-w-7xl mx-auto px-6">
+            <div class="flex justify-between items-center h-16">
+                <h1 class="text-xl font-bold">WealthPro CRM</h1>
+                <div class="flex items-center space-x-6">
+                    <a href="/" class="hover:text-blue-200">Dashboard</a>
+                    <a href="/clients" class="hover:text-blue-200">Clients</a>
+                    <a href="/tasks" class="hover:text-blue-200">Tasks</a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-4xl mx-auto px-6 py-8">
+        <div class="mb-8">
+            <h1 class="text-3xl font-bold">Add New Client</h1>
+            <p class="text-gray-600 mt-2">Client will be filed as "Surname, First Name" in the A–Z folder system.</p>
+        </div>
+
+        <div class="bg-white rounded-lg shadow p-8">
+            <form method="POST" class="space-y-6">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <div>
-                        <div class="flex items-center gap-3">
-                            <div class="font-semibold text-gray-900">{{ c.display_name }}</div>
-                            {% if c.is_archived %}
-                                <span class="chip bg-yellow-100 text-yellow-800">Archived</span>
-                            {% endif %}
-                        </div>
-                        <div class="text-sm text-gray-600 mt-1">
-                            Folder:
-                            <a href="{{ c.folder_url }}" class="text-blue-600 underline" target="_blank" rel="noopener">Open in Drive</a>
-                        </div>
-                        {% if c.portfolio_value is not none %}
-                        <div class="text-sm text-gray-600">Portfolio: £{{ "%.2f"|format(c.portfolio_value) }}</div>
-                        {% endif %}
+                        <label class="block text-sm font-medium text-gray-700 mb-2">First Name *</label>
+                        <input type="text" name="first_name" required class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
                     </div>
-
-                    <div class="flex flex-wrap items-center gap-2">
-                        {% if c.folder_url %}
-                        <a href="{{ c.folder_url }}" target="_blank" rel="noopener"
-                           class="px-3 py-1 text-sm bg-white border border-blue-300 text-blue-700 rounded hover:bg-blue-50">📁 Folder</a>
-                        {% endif %}
-                        <a href="/clients/{{ c.client_id }}/profile" class="px-3 py-1 text-sm bg-blue-100 text-blue-800 rounded hover:bg-blue-200">Profile</a>
-                        <a href="/clients/{{ c.client_id }}/refresh" class="px-3 py-1 text-sm bg-gray-100 rounded hover:bg-gray-200">Refresh</a>
-                        <a href="/clients/{{ c.client_id }}/add_task" class="px-3 py-1 text-sm bg-green-100 text-green-800 rounded hover:bg-green-200">Add Task</a>
-                        <a href="/clients/{{ c.client_id }}/tasks" class="px-3 py-1 text-sm bg-green-50 text-green-700 rounded hover:bg-green-100">Tasks</a>
-                        <a href="/clients/{{ c.client_id }}/communications" class="px-3 py-1 text-sm bg-purple-100 text-purple-800 rounded hover:bg-purple-200">Communications</a>
-                        <a href="/clients/{{ c.client_id }}/review/create" class="px-3 py-1 text-sm bg-amber-100 text-amber-800 rounded hover:bg-amber-200">Create Review</a>
-                        {% if c.is_archived %}
-                            <a href="/clients/{{ c.client_id }}/restore" class="px-3 py-1 text-sm bg-teal-100 text-teal-800 rounded hover:bg-teal-200">Restore</a>
-                        {% else %}
-                            <a href="/clients/{{ c.client_id }}/archive" class="px-3 py-1 text-sm bg-red-100 text-red-800 rounded hover:bg-red-200">Archive</a>
-                        {% endif %}
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Surname *</label>
+                        <input type="text" name="surname" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                        <p class="text-xs text-gray-500 mt-1">Will display as "Surname, First Name"</p>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Email</label>
+                        <input type="email" name="email" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Phone</label>
+                        <input type="tel" name="phone" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Status</label>
+                        <select name="status" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            <option value="active" selected>Active</option>
+                            <option value="prospect">Prospect</option>
+                            <option value="no_longer_client">No Longer Client</option>
+                            <option value="deceased">Deceased</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Initial Portfolio Value (£)</label>
+                        <input type="number" name="portfolio_value" step="0.01" class="w-full px-3 py-2 border border-gray-300 rounded-md" placeholder="Optional">
                     </div>
                 </div>
-                {% endfor %}
-            </div>
-            {% else %}
-            <div class="text-gray-500 text-center py-8">No clients yet.</div>
-            {% endif %}
+
+                <div class="flex justify-between">
+                    <a href="/clients" class="px-6 py-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50">Cancel</a>
+                    <button type="submit" class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Create Client</button>
+                </div>
+            </form>
         </div>
-    </div>
-</main>
+    </main>
 </body>
 </html>
-        """, clients=clients)
+        """
+    )
 
-    except Exception as e:
-        logger.error(f"Clients error: {e}")
-        return f"Error: {e}", 500
-
-
-@clients_bp.route('/clients/new', methods=['GET', 'POST'])
-def new_client():
-    """Create a new client – Drive subfolders handled by model."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
-
-    try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
-
-        if request.method == 'POST':
-            display_name = request.form.get('display_name', '').strip()
-            if not display_name:
-                return "Client name required", 400
-
-            drive.create_client_enhanced_folders(display_name)
-            return redirect(url_for('clients.clients'))
-
-        return render_template_string("""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>WealthPro CRM - New Client</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style> body { font-family: "Inter", sans-serif; } .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); } </style>
-</head>
-<body class="bg-gray-50">
-<nav class="gradient-wealth text-white shadow-lg">
-    <div class="max-w-7xl mx-auto px-6">
-        <div class="flex justify-between items-center h-16">
-            <h1 class="text-xl font-bold">WealthPro CRM</h1>
-            <div class="flex items-center space-x-6">
-                <a href="/" class="hover:text-blue-200">Dashboard</a>
-                <a href="/clients" class="text-white font-semibold">Clients</a>
-            </div>
-        </div>
-    </div>
-</nav>
-
-<main class="max-w-xl mx-auto px-6 py-8">
-    <h1 class="text-2xl font-bold mb-4">Add Client</h1>
-    <form method="POST" class="space-y-4 bg-white p-6 rounded-lg shadow">
-        <div>
-            <label class="block text-sm font-medium text-gray-700 mb-1">Client Name *</label>
-            <input type="text" name="display_name" required class="w-full px-3 py-2 border rounded-md" placeholder="e.g., Alice Smith">
-        </div>
-        <div class="flex justify-between">
-            <a href="/clients" class="px-4 py-2 border rounded">Cancel</a>
-            <button type="submit" class="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700">Create</button>
-        </div>
-    </form>
-</main>
-</body>
-</html>
-        """)
-
-    except Exception as e:
-        logger.error(f"New client error: {e}")
-        return f"Error: {e}", 500
-
-
-@clients_bp.route('/clients/<client_id>/refresh')
-def refresh_client(client_id):
-    """Per-client CRM refresh (does NOT touch Drive contents)."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
-    try:
-        return redirect(url_for('clients.clients'))
-    except Exception as e:
-        logger.error(f"Refresh client error: {e}")
-        return f"Error: {e}", 500
-
-
-@clients_bp.route('/clients/<client_id>/profile')
-def client_profile(client_id):
-    """Minimal profile with quick links."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
-
-    try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
-        clients = drive.get_clients_enhanced()
-        client = next((c for c in clients if c['client_id'] == client_id), None)
-        if not client:
-            return "Client not found", 404
-
-        fid = client.get('folder_id') or client.get('client_id')
-        client['folder_url'] = f"https://drive.google.com/drive/folders/{fid}" if fid else None
-        client['is_archived'] = _is_archived(drive, client['client_id'])
-
-        return render_template_string("""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>WealthPro CRM - Client Profile</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style> body { font-family: "Inter", sans-serif; } .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); } </style>
-</head>
-<body class="bg-gray-50">
-<nav class="gradient-wealth text-white shadow-lg">
-    <div class="max-w-7xl mx-auto px-6">
-        <div class="flex justify-between items-center h-16">
-            <h1 class="text-xl font-bold">WealthPro CRM</h1>
-            <div class="flex items-center space-x-6">
-                <a href="/" class="hover:text-blue-200">Dashboard</a>
-                <a href="/clients" class="text-white font-semibold">Clients</a>
-            </div>
-        </div>
-    </div>
-</nav>
-
-<main class="max-w-5xl mx-auto px-6 py-8">
-    <div class="flex items-center justify-between mb-6">
-        <div>
-            <h1 class="text-3xl font-bold">{{ client.display_name }}</h1>
-            <p class="text-gray-600">Portfolio: £{{ "%.2f"|format(client.portfolio_value or 0) }}</p>
-            {% if client.is_archived %}
-            <p class="text-yellow-700 mt-1">This client is archived.</p>
-            {% endif %}
-        </div>
-        <div class="flex gap-2">
-            {% if client.folder_url %}
-            <a href="{{ client.folder_url }}" target="_blank" rel="noopener" class="px-4 py-2 bg-blue-100 text-blue-800 rounded hover:bg-blue-200">📁 Open Folder</a>
-            {% endif %}
-            <a href="/clients/{{ client.client_id }}/refresh" class="px-4 py-2 bg-gray-100 rounded hover:bg-gray-200">Refresh</a>
-        </div>
-    </div>
-
-    <div class="bg-white rounded-lg shadow p-6">
-        <div class="flex flex-wrap gap-2">
-            <a href="/clients/{{ client.client_id }}/add_task" class="px-3 py-1 text-sm bg-green-100 text-green-800 rounded hover:bg-green-200">Add Task</a>
-            <a href="/clients/{{ client.client_id }}/tasks" class="px-3 py-1 text-sm bg-green-50 text-green-700 rounded hover:bg-green-100">Tasks</a>
-            <a href="/clients/{{ client.client_id }}/communications" class="px-3 py-1 text-sm bg-purple-100 text-purple-800 rounded hover:bg-purple-200">Communications</a>
-            <a href="/clients/{{ client.client_id }}/review/create" class="px-3 py-1 text-sm bg-amber-100 text-amber-800 rounded hover:bg-amber-200">Create Review</a>
-            {% if client.is_archived %}
-                <a href="/clients/{{ client.client_id }}/restore" class="px-3 py-1 text-sm bg-teal-100 text-teal-800 rounded hover:bg-teal-200">Restore</a>
-            {% else %}
-                <a href="/clients/{{ client.client_id }}/archive" class="px-3 py-1 text-sm bg-red-100 text-red-800 rounded hover:bg-red-200">Archive</a>
-            {% endif %}
-        </div>
-    </div>
-
-    <div class="mt-8">
-        <a href="/clients" class="px-4 py-2 border rounded">Back to Clients</a>
-    </div>
-</main>
-</body>
-</html>
-        """, client=client)
-
-    except Exception as e:
-        logger.error(f"Client profile error: {e}")
-        return f"Error: {e}", 500
-
-
-@clients_bp.route('/clients/<client_id>/archive')
-def archive_client(client_id):
-    """Move the client folder to 'Archived Clients' A–Z. Data is NOT deleted."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
-
-    try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
-
-        # fetch client name
-        all_clients = drive.get_clients_enhanced()
-        client = next((c for c in all_clients if c['client_id'] == client_id), None)
-        if not client:
-            return "Client not found", 404
-
-        # Ensure category + letter
-        letter_parent = _ensure_category_letter(drive, "Archived Clients", client['display_name'])
-        _move_folder(drive.drive, client_id, letter_parent)
-
-        return redirect(url_for('clients.clients'))
-    except Exception as e:
-        logger.error(f"Archive client error: {e}")
-        return f"Error: {e}", 500
-
-
-@clients_bp.route('/clients/<client_id>/restore')
-def restore_client(client_id):
-    """Restore the client folder back to the active A–Z structure."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
-
-    try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
-
-        # fetch client name
-        all_clients = drive.get_clients_enhanced()
-        client = next((c for c in all_clients if c['client_id'] == client_id), None)
-        if not client:
-            return "Client not found", 404
-
-        letter_parent = _active_letter_destination(drive, client['display_name'])
-        _move_folder(drive.drive, client_id, letter_parent)
-
-        return redirect(url_for('clients.clients'))
-    except Exception as e:
-        logger.error(f"Restore client error: {e}")
-        return f"Error: {e}", 500
-
-
-@clients_bp.route('/clients/<client_id>/review/create')
+# ---------- Create Review Pack (+ optional task) ----------
+@clients_bp.route("/clients/<client_id>/review")
 def create_review(client_id):
-    """Create current year review pack and docs for this client."""
-    if 'credentials' not in session:
-        return redirect(url_for('auth.authorize'))
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
 
     try:
-        credentials = Credentials(**session['credentials'])
-        drive = SimpleGoogleDrive(credentials)
-
+        drive = SimpleGoogleDrive(creds)
         clients = drive.get_clients_enhanced()
-        client = next((c for c in clients if c['client_id'] == client_id), None)
+        client = next((c for c in clients if c["client_id"] == client_id), None)
         if not client:
             return "Client not found", 404
 
         drive.create_review_pack_for_client(client)
-        return redirect(url_for('clients.client_profile', client_id=client_id))
+        return redirect(url_for("clients.clients", msg="Review pack created."))
     except Exception as e:
-        logger.error(f"Create review error: {e}")
+        logger.exception("Create review error")
+        return f"Error: {e}", 500
+
+# ---------- Archive / Restore ----------
+@clients_bp.route("/clients/<client_id>/archive")
+def archive_client(client_id):
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
+    try:
+        drive = SimpleGoogleDrive(creds)
+        # We need display_name to place under correct letter
+        clients = drive.get_clients_enhanced()
+        client = next((c for c in clients if c["client_id"] == client_id), None)
+        if not client:
+            return "Client not found", 404
+        drive.archive_client(client_id, client["display_name"])
+        return redirect(url_for("clients.clients", msg="Client archived (Drive folder kept)."))
+    except Exception as e:
+        logger.exception("Archive client error")
+        return f"Error: {e}", 500
+
+@clients_bp.route("/clients/<client_id>/restore")
+def restore_client(client_id):
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
+    try:
+        drive = SimpleGoogleDrive(creds)
+        clients = drive.get_clients_enhanced()
+        client = next((c for c in clients if c["client_id"] == client_id), None)
+        if not client:
+            return "Client not found", 404
+        drive.restore_client(client_id, client["display_name"])
+        return redirect(url_for("clients.clients", msg="Client restored to Active."))
+    except Exception as e:
+        logger.exception("Restore client error")
+        return f"Error: {e}", 500
+
+# ---------- Per-client CRM Refresh (no Drive writes) ----------
+@clients_bp.route("/clients/<client_id>/refresh")
+def refresh_client(client_id):
+    creds = _require_creds()
+    if not creds:
+        return redirect(url_for("auth.authorize"))
+    try:
+        # Intentionally a no-op to Drive: just redirect back with a message.
+        return redirect(url_for("clients.clients", msg="Client view refreshed."))
+    except Exception as e:
+        logger.exception("Refresh client error")
         return f"Error: {e}", 500

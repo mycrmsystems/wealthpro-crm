@@ -1,124 +1,106 @@
-"""
-WealthPro CRM - Main Application File
-FILE 1 of 8 - Upload this as app.py
-"""
-
+# app.py
 import os
 import logging
 from datetime import datetime
 from flask import Flask, jsonify
-
-# Jinja: make undefined safe for format strings
 from jinja2.runtime import Undefined
 
+# -----------------------------
+# SafeUndefined for Jinja (won't crash on missing keys/attrs)
+# -----------------------------
 class SafeUndefined(Undefined):
-    """Undefined that won't crash when used with format specs like {:,.2f}."""
-    def __str__(self):
+    def _fail_with_undefined_error(self, *args, **kwargs):
         return ""
-    def __format__(self, spec):
-        # If a template tries to do e.g. {{ value|default(0):.2f }} or similar,
-        # returning empty string avoids "Unsupported format string for Undefined".
-        return ""
+    __add__ = __radd__ = __mul__ = __rmul__ = __div__ = __rdiv__ = __truediv__ = __rtruediv__ = (
+        __floordiv__
+    ) = __rfloordiv__ = __mod__ = __rmod__ = __pos__ = __neg__ = __call__ = __getitem__ = (
+        __getattr__
+    ) = _fail_with_undefined_error
 
-# -----------------------------------------------------------------------------
-# Flask setup
-# -----------------------------------------------------------------------------
+# -----------------------------
+# App factory
+# -----------------------------
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-here')
-app.config['SESSION_COOKIE_SECURE'] = False
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret")
 
-# Make Jinja tolerant to missing values that are formatted
+# Jinja: use SafeUndefined
 app.jinja_env.undefined = SafeUndefined
 
-# Optional: a couple of safe filters for templates
-@app.template_filter("coalesce")
-def coalesce_filter(value, default=""):
-    """Return value if it's truthy (and not Undefined), else default."""
-    try:
-        if value is None:
-            return default
-        s = str(value)
-        return s if s != "" else default
-    except Exception:
-        return default
+# -----------------------------
+# Template filters (kept from your original)
+# -----------------------------
+def coalesce(*args):
+    """Return first non-empty/non-None value."""
+    for a in args:
+        if a not in (None, "", [], {}, ()):
+            return a
+    return ""
 
-@app.template_filter("fmtdate")
-def fmtdate_filter(value, fmt="%d %b %Y"):
-    """Safely format a date/datetime or date-string; return '' on failure."""
-    if not value:
-        return ""
+def fmtdate(value, in_fmt="%Y-%m-%d", out_fmt="%d %b %Y"):
+    """Format date strings safely."""
     try:
+        if not value:
+            return ""
         if isinstance(value, datetime):
-            return value.strftime(fmt)
-        # try common string formats
-        for f in ("%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%fZ"):
-            try:
-                dt = datetime.strptime(str(value), f)
-                return dt.strftime(fmt)
-            except Exception:
-                continue
-        # last resort: just return the original string
-        return str(value)
+            return value.strftime(out_fmt)
+        dt = datetime.strptime(str(value), in_fmt)
+        return dt.strftime(out_fmt)
     except Exception:
-        return ""
+        return str(value or "")
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
+app.add_template_filter(coalesce, "coalesce")
+app.add_template_filter(fmtdate, "fmtdate")
+
+# -----------------------------
+# Logging (kept)
+# -----------------------------
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(levelname)s:%(name)s:%(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# Blueprints
-# -----------------------------------------------------------------------------
+# -----------------------------
+# Blueprints (existing)
+# -----------------------------
 from routes.auth import auth_bp
 from routes.clients import clients_bp
 from routes.tasks import tasks_bp
 from routes.communications import communications_bp
-from routes.portfolio import portfolio_bp   # ✅ NEW
 
-# Register blueprints (route modules)
+# -----------------------------
+# NEW Blueprints (add these)
+# -----------------------------
+from routes.portfolio import portfolio_bp
+from routes.client_details import client_details_bp
+
+# -----------------------------
+# Register blueprints
+# -----------------------------
 app.register_blueprint(auth_bp)
 app.register_blueprint(clients_bp)
 app.register_blueprint(tasks_bp)
 app.register_blueprint(communications_bp)
-app.register_blueprint(portfolio_bp)        # ✅ NEW
 
-# -----------------------------------------------------------------------------
-# Health check route (polled by Render)
-# -----------------------------------------------------------------------------
-@app.route('/health')
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat() + 'Z',
-        'service': 'WealthPro CRM'
-    })
+# New ones
+app.register_blueprint(portfolio_bp)
+app.register_blueprint(client_details_bp)
 
-# -----------------------------------------------------------------------------
-# Test route
-# -----------------------------------------------------------------------------
-@app.route('/test')
+# -----------------------------
+# Health & test routes (kept)
+# -----------------------------
+@app.route("/health")
+def health():
+    return jsonify(status="ok", service="wealthpro-crm", time=datetime.utcnow().isoformat() + "Z")
+
+@app.route("/test")
 def test():
-    from flask import session
-    connected = 'credentials' in session
-    return f"""
-<h1>WealthPro CRM Test</h1>
-<p>✅ Flask working</p>
-<p>✅ Render deployment successful</p>
-<p>🔗 Google Drive connected: {'Yes' if connected else 'No'}</p>
-<p><a href="/">Go to Dashboard</a></p>
-"""
+    return "OK"
 
-# -----------------------------------------------------------------------------
-# Serve
-# -----------------------------------------------------------------------------
-PORT = int(os.environ.get('PORT', 10000))
-HOST = '0.0.0.0'
-
-if __name__ == '__main__':
-    logger.info(f"Starting WealthPro CRM on {HOST}:{PORT}")
-    # debug=False is important on Render; the worker is gunicorn in production
-    app.run(host=HOST, port=PORT, debug=False)
+# -----------------------------
+# Local dev entrypoint (kept)
+# -----------------------------
+if __name__ == "__main__":
+    # For local development only (Render uses gunicorn)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")

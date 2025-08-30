@@ -50,26 +50,11 @@ class SimpleGoogleDrive:
     """
     Google Drive helper for WealthPro CRM.
 
-    Supported root structures:
+    Root layouts supported:
+      - A–Z letters directly under ROOT, or
+      - Categories under ROOT (e.g., 'Active Clients', 'Archived Clients') then A–Z.
 
-    A) Letters directly under ROOT:
-       ROOT
-         A/
-           Client/
-         B/
-         ...
-         Z/
-
-    B) Categories then letters:
-       ROOT
-         Active Clients/
-           A/
-             Client/
-         Archived Clients/
-           A/
-             Client/
-
-    Each client folder (top-level) will contain:
+    Each client folder contains:
       - Documents/
       - Communications/
       - ID&V & Sanction Search/
@@ -155,6 +140,13 @@ class SimpleGoogleDrive:
         created = self.drive.files().create(body=body, fields="id,name,parents").execute()
         return created["id"]
 
+    def _upload_bytes(self, parent_id: str, filename: str, data: bytes, mime: str) -> str:
+        """Create a file from bytes under parent_id."""
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+        body = {"name": filename, "parents": [parent_id]}
+        created = self.drive.files().create(body=body, media_body=media, fields="id,name,parents").execute()
+        return created["id"]
+
     def _move_id_to_parent(self, file_or_folder_id: str, new_parent_id: str):
         obj = self.drive.files().get(fileId=file_or_folder_id, fields="parents").execute()
         prev = ",".join(obj.get("parents", [])) if obj.get("parents") else ""
@@ -176,7 +168,6 @@ class SimpleGoogleDrive:
         return len(letters) > 0
 
     def _ensure_category(self, name: str) -> str:
-        """Ensure a category folder (e.g., 'Active Clients', 'Archived Clients') under root."""
         return self._ensure_folder(self.root_folder_id, name)
 
     def _ensure_letter_under(self, parent_id: str, letter: str) -> str:
@@ -184,7 +175,6 @@ class SimpleGoogleDrive:
         return self._ensure_folder(parent_id, letter)
 
     def _active_parent_for_letters(self) -> str:
-        # Prefer letters directly under ROOT; else 'Active Clients' category under root
         if self._letters_at_root():
             return self.root_folder_id
         return self._ensure_category("Active Clients")
@@ -203,7 +193,7 @@ class SimpleGoogleDrive:
     # -----------------------------
     def ensure_client_core_subfolders(self, client_id: str):
         """Create/ensure the expected top-level subfolders under a client folder."""
-        documents = self._ensure_folder(client_id, "Documents")
+        self._ensure_folder(client_id, "Documents")
         self._ensure_folder(client_id, "Communications")
         self._ensure_folder(client_id, "ID&V & Sanction Search")
         tasks = self._ensure_folder(client_id, "Tasks")
@@ -211,7 +201,6 @@ class SimpleGoogleDrive:
         self._ensure_folder(tasks, "Completed Tasks")
         self._ensure_folder(client_id, "Reviews")
         cdata = self._ensure_folder(client_id, "Client Data")
-        # Ensure profile.json exists (empty stub if missing)
         self._ensure_profile_json(cdata)
 
     def create_client_enhanced_folders(self, display_name: str) -> str:
@@ -230,7 +219,6 @@ class SimpleGoogleDrive:
         return client_id
 
     def _is_client_folder(self, folder_id: str) -> bool:
-        """Heuristic: treat as client if it has at least one of the known subfolders."""
         names = {f.get("name", "") for f in self._list_folders(folder_id)}
         markers = {"Tasks", "Reviews", "Documents", "Communications", "Client Data"}
         return len(names & markers) > 0
@@ -247,18 +235,18 @@ class SimpleGoogleDrive:
                 if not _is_letter(letter.get("name", "")):
                     continue
                 for child in self._list_folders(letter["id"]):
-                    if self._is_client_folder(child["id"]) or True:
-                        display_name = (child.get("name") or "").strip()
-                        portfolio_value = self._compute_portfolio_value(child["id"])
-                        clients.append(
-                            {
-                                "client_id": child["id"],
-                                "display_name": display_name,
-                                "status": status,
-                                "folder_id": child["id"],
-                                "portfolio_value": portfolio_value,
-                            }
-                        )
+                    # Treat as client leaf
+                    display_name = (child.get("name") or "").strip()
+                    portfolio_value = self._compute_portfolio_value(child["id"])
+                    clients.append(
+                        {
+                            "client_id": child["id"],
+                            "display_name": display_name,
+                            "status": status,
+                            "folder_id": child["id"],
+                            "portfolio_value": portfolio_value,
+                        }
+                    )
 
         # Active space
         if self._letters_at_root():
@@ -267,7 +255,7 @@ class SimpleGoogleDrive:
             active_cat = self._ensure_category("Active Clients")
             add_clients_from_letter_parent(active_cat, "active")
 
-        # Archived space (if present)
+        # Archived space
         archived_cat = self._ensure_category("Archived Clients")
         add_clients_from_letter_parent(archived_cat, "archived")
 
@@ -288,7 +276,6 @@ class SimpleGoogleDrive:
         return cdata, None
 
     def _ensure_profile_json(self, client_data_folder_id: str):
-        # If missing, create an empty structure
         existing = [f for f in self._list_files(client_data_folder_id) if (f.get("name","").lower() == "profile.json")]
         if existing:
             return
@@ -296,7 +283,6 @@ class SimpleGoogleDrive:
             "investments": [],
             "pensions": [],
             "notes": "",
-            # Optionally, a cached computed_total for quick display (kept in sync on edit screens)
             "computed_total": 0.0
         }
         data = json.dumps(stub, indent=2).encode("utf-8")
@@ -328,7 +314,6 @@ class SimpleGoogleDrive:
             cdata = self._get_client_data_folder(client_id)
         blob = json.dumps(profile, indent=2).encode("utf-8")
         if file_id:
-            # Replace by creating new binary and using update with uploadType
             media = MediaIoBaseUpload(io.BytesIO(blob), mimetype="application/json", resumable=False)
             self.drive.files().update(fileId=file_id, media_body=media).execute()
         else:
@@ -351,7 +336,7 @@ class SimpleGoogleDrive:
         return float(total)
 
     # -----------------------------
-    # Tasks (Drive-based)
+    # Tasks
     # -----------------------------
     def _get_client_tasks_folder_ids(self, client_id: str) -> Dict[str, str]:
         tasks_id = self._ensure_folder(client_id, "Tasks")
@@ -403,7 +388,6 @@ class SimpleGoogleDrive:
         if not file:
             return False
 
-        # climb up to find 'Tasks' then the client folder
         parent = (file.get("parents") or [None])[0]
         client_id = None
 
@@ -499,7 +483,7 @@ class SimpleGoogleDrive:
 
         for c in clients:
             if c.get("status") == "archived":
-                continue  # ignore archived clients for upcoming
+                continue
             client_id = c["client_id"]
             fids = self._get_client_tasks_folder_ids(client_id)
             ongoing = fids["ongoing"]
@@ -539,6 +523,96 @@ class SimpleGoogleDrive:
         return upcoming
 
     # -----------------------------
+    # Communications
+    # -----------------------------
+    def _get_client_communications_folder(self, client_id: str) -> str:
+        return self._ensure_folder(client_id, "Communications")
+
+    def add_communication_enhanced(self, comm: Dict, client: Dict) -> bool:
+        """
+        Save a communication entry as a .txt file in Communications/.
+        Filename: YYYY-MM-DD HHMM - Type - Subject [COMxxxxxxxx].txt
+        """
+        client_id = client.get("client_id") or client.get("folder_id")
+        if not client_id:
+            raise ValueError("client client_id/folder_id missing")
+
+        folder_id = self._get_client_communications_folder(client_id)
+
+        date_str = (comm.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
+        time_str = (comm.get("time") or "").replace(":", "")
+        ctype = (comm.get("type") or "").strip()
+        subject = (comm.get("subject") or "No Subject").strip()
+        cid = comm.get("communication_id", f"COM{datetime.now().strftime('%Y%m%d%H%M%S')}")
+
+        time_bit = f" {time_str}" if time_str else ""
+        filename = f"{date_str}{time_bit} - {ctype} - {subject} [{cid}].txt"
+
+        lines = [
+            f"Communication ID: {cid}",
+            f"Client ID: {client_id}",
+            f"Date: {date_str}",
+            f"Time: {comm.get('time','')}",
+            f"Type: {ctype}",
+            f"Subject: {subject}",
+            f"Duration: {comm.get('duration','')}",
+            f"Outcome: {comm.get('outcome','')}",
+            f"Follow Up Required: {comm.get('follow_up_required','No')}",
+            f"Follow Up Date: {comm.get('follow_up_date','')}",
+            f"Created By: {comm.get('created_by','')}",
+            "",
+            "Details:",
+            (comm.get("details", "") or "").strip(),
+        ]
+        content = ("\n".join(lines)).encode("utf-8")
+        self._upload_bytes(folder_id, filename, content, "text/plain")
+        return True
+
+    def get_client_communications(self, client_id: str) -> List[Dict]:
+        folder_id = self._get_client_communications_folder(client_id)
+        out: List[Dict] = []
+        page = None
+        while True:
+            resp = self.drive.files().list(
+                q=(f"'{folder_id}' in parents and "
+                   "mimeType!='application/vnd.google-apps.folder' and trashed=false"),
+                fields="nextPageToken, files(id,name,createdTime,modifiedTime)",
+                pageToken=page,
+                orderBy="name desc",
+            ).execute()
+            for f in resp.get("files", []):
+                name = f.get("name", "")
+                date_part, time_part, ctype, subject = "", "", "", ""
+                if " - " in name:
+                    head, *rest = name.split(" - ")
+                    date_part = head[:10]
+                    if len(head) > 10:
+                        time_part = head[11:15]
+                    if rest:
+                        ctype = rest[0]
+                    if len(rest) >= 2:
+                        subject = rest[1].rsplit(" [", 1)[0]
+                out.append(
+                    {
+                        "file_id": f.get("id"),
+                        "date": date_part,
+                        "time": f"{time_part[:2]}:{time_part[2:]}" if len(time_part) == 4 else "",
+                        "type": ctype,
+                        "subject": subject,
+                        "details": "",
+                        "outcome": "",
+                        "duration": "",
+                        "follow_up_required": "No",
+                        "follow_up_date": "",
+                        "created_time": f.get("createdTime", "")[:10],
+                    }
+                )
+            page = resp.get("nextPageToken")
+            if not page:
+                break
+        return out
+
+    # -----------------------------
     # Archive / Restore
     # -----------------------------
     def archive_client(self, client_id: str, display_name: str) -> bool:
@@ -556,7 +630,7 @@ class SimpleGoogleDrive:
         return True
 
     # -----------------------------
-    # Review pack (unchanged content logic)
+    # Review pack (kept simple)
     # -----------------------------
     def _uk_date_str(self, dt: datetime) -> str:
         try:
@@ -592,11 +666,11 @@ class SimpleGoogleDrive:
         agenda_val = created["Agenda & Valuation"]
         today_str = self._uk_date_str(datetime.today())
 
-        # Agenda doc (styled, simple)
+        # Agenda doc
         agenda_doc = self._build_agenda_doc(display_name, today_str)
         self._upload_docx(agenda_val, f"Meeting Agenda – {display_name} – {year}.docx", agenda_doc)
 
-        # Valuation doc (styled, simple)
+        # Valuation doc
         val_doc = self._build_valuation_doc(display_name, today_str)
         self._upload_docx(agenda_val, f"Valuation Summary – {display_name} – {year}.docx", val_doc)
 
@@ -615,7 +689,7 @@ class SimpleGoogleDrive:
         self.drive.files().create(body=meta, media_body=media, fields="id,name").execute()
 
     # -----------------------------
-    # Word document builders (kept simple & consistent)
+    # Word document builders
     # -----------------------------
     def _build_agenda_doc(self, client_display_name: str, date_str: str) -> Document:
         doc = Document()
@@ -657,7 +731,6 @@ class SimpleGoogleDrive:
         hdr[1].text = "Provider"
         hdr[2].text = "Value (£)"
 
-        # starter row
         row = table.add_row().cells
         row[0].text = ""
         row[1].text = ""

@@ -77,12 +77,14 @@ from routes.auth import auth_bp
 from routes.clients import clients_bp
 from routes.tasks import tasks_bp
 from routes.communications import communications_bp
+from routes.portfolio import portfolio_bp   # ✅ NEW
 
 # Register blueprints (route modules)
 app.register_blueprint(auth_bp)
 app.register_blueprint(clients_bp)
 app.register_blueprint(tasks_bp)
 app.register_blueprint(communications_bp)
+app.register_blueprint(portfolio_bp)        # ✅ NEW
 
 # -----------------------------------------------------------------------------
 # Health check route (polled by Render)

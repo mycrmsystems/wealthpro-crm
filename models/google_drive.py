@@ -1,3 +1,5 @@
+# models/google_drive.py
+
 import os
 import io
 import json
@@ -16,6 +18,7 @@ __all__ = ["SimpleGoogleDrive"]
 
 logger = logging.getLogger(__name__)
 
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -23,35 +26,40 @@ def _build_drive_service(credentials: Credentials):
     """Build Google Drive v3 service with discovery cache disabled (lower memory)."""
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
+
 def _safe_date(date_str: str) -> Optional[datetime]:
     try:
         return datetime.strptime(date_str, "%Y-%m-%d")
     except Exception:
         return None
 
+
 def _escape_drive_name(value: str) -> str:
-    """Make a name safe for a Drive v3 query single-quoted string (avoid plain apostrophes)."""
+    """
+    Make a name safe for a Drive v3 query single-quoted string.
+    Replace ASCII apostrophe ' with typographic ’ so we avoid backslash escaping.
+    """
     return (value or "").replace("'", "’")
 
-def _to_float(x) -> float:
+
+def _float_safe(x) -> float:
     try:
         return float(x)
     except Exception:
         return 0.0
 
-# -----------------------------
-# Main class
-# -----------------------------
+
 class SimpleGoogleDrive:
     """
     Google Drive helper for WealthPro CRM.
 
-    Root layouts supported:
+    Supported root structures (both work):
 
     A) Letters directly under ROOT:
        ROOT
          A/
            Alice Smith/
+         B/
          ...
          Z/
 
@@ -60,16 +68,28 @@ class SimpleGoogleDrive:
          Active Clients/
            A/
              Alice Smith/
+           B/
+           ...
          Archived Clients/
            A/
            ...
 
-    Each client folder contains:
+    Each client folder will also (on demand) contain:
       - Tasks/
           Ongoing Tasks/
           Completed Tasks/
       - Reviews/
-      - Products/                 (this file adds it)
+          Review <YEAR>/
+            Agenda & Valuation/
+            FF&ATR/
+            ID&V & Sanction Search/
+            Meeting Notes/
+            Research/
+            Review Letter/
+            Client Confirmation/
+            Emails/
+      - Products/
+          products.json        (client’s products in CRM)
     """
 
     def __init__(self, credentials: Credentials):
@@ -129,27 +149,51 @@ class SimpleGoogleDrive:
         return created["id"]
 
     def _upload_bytes(self, parent_id: str, filename: str, data: bytes, mime: str) -> str:
-        """Create a new file with bytes content."""
         media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
         body = {"name": filename, "parents": [parent_id]}
         created = self.drive.files().create(body=body, media_body=media, fields="id").execute()
         return created["id"]
 
-    def _update_file_bytes(self, file_id: str, data: bytes, mime: str) -> None:
-        """Replace the content of an existing file with bytes."""
-        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
-        self.drive.files().update(fileId=file_id, media_body=media).execute()
+    def _find_child_file(self, parent_id: str, name: str) -> Optional[Dict]:
+        safe_name = _escape_drive_name(name)
+        q = (
+            f"'{parent_id}' in parents and trashed=false and "
+            "mimeType!='application/vnd.google-apps.folder' and "
+            f"name='{safe_name}'"
+        )
+        resp = self.drive.files().list(
+            q=q, fields="files(id,name,mimeType,parents)", pageSize=1
+        ).execute()
+        files = resp.get("files", [])
+        return files[0] if files else None
 
-    def _download_text(self, file_id: str) -> str:
-        """Download a file as text (utf-8)."""
+    def _create_or_update_file(self, parent_id: str, filename: str, data: bytes, mime: str) -> str:
+        """Create file if missing, otherwise update contents."""
+        existing = self._find_child_file(parent_id, filename)
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+        if existing:
+            self.drive.files().update(
+                fileId=existing["id"], media_body=media, fields="id"
+            ).execute()
+            return existing["id"]
+        return self._upload_bytes(parent_id, filename, data, mime)
+
+    def _read_file_bytes(self, file_id: str) -> bytes:
         request = self.drive.files().get_media(fileId=file_id)
         fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
+        downloader = MediaIoBaseDownload(fd=fh, request=request)
         done = False
         while not done:
             status, done = downloader.next_chunk()
         fh.seek(0)
-        return fh.read().decode("utf-8", errors="ignore")
+        return fh.read()
+
+    def _trash_file_or_folder(self, file_id: str):
+        """Safer than hard delete; sends to Drive trash."""
+        try:
+            self.drive.files().update(fileId=file_id, body={"trashed": True}).execute()
+        except Exception as e:
+            logger.warning(f"Failed to trash {file_id}: {e}")
 
     def _move_file(self, file_id: str, new_parent_id: str):
         file = self.drive.files().get(fileId=file_id, fields="parents").execute()
@@ -174,12 +218,18 @@ class SimpleGoogleDrive:
         return out
 
     def _has_client_markers(self, folder_id: str) -> bool:
-        """Heuristic: treat a folder as a client if it contains 'Tasks' or 'Reviews' or 'Products'."""
+        """Heuristic: treat a folder as a client if it contains key subfolders."""
         for f in self._list_folders(folder_id):
             nm = (f.get("name") or "").strip()
             if nm in {"Tasks", "Reviews", "Products"}:
                 return True
         return False
+
+    def _remove_legacy_communications(self, client_id: str):
+        """Trash a legacy 'Communications' folder if present under client."""
+        for f in self._list_folders(client_id):
+            if (f.get("name") or "").strip() == "Communications":
+                self._trash_file_or_folder(f["id"])
 
     # -----------------------------
     # Client creation & listing
@@ -220,28 +270,31 @@ class SimpleGoogleDrive:
         self._ensure_folder(tasks_id, "Ongoing Tasks")
         self._ensure_folder(tasks_id, "Completed Tasks")
         self._ensure_folder(client_id, "Reviews")
-        self._ensure_folder(client_id, "Products")  # NEW
+        self._ensure_folder(client_id, "Products")  # NEW: always present
+
+        # Remove any old Communications folder safely
+        self._remove_legacy_communications(client_id)
 
         logger.info("Created enhanced client folder for %s", display_name)
         return client_id
 
     def get_clients_enhanced(self) -> List[Dict]:
         """
-        Discover client folders robustly and also populate each client's portfolio_value
-        as the sum of their Products values (so dashboards & lists work without changing routes).
+        Discover client folders robustly for both supported layouts:
+        - Letters directly under ROOT
+        - Category folders under ROOT, then letters
+        Skips category and letter folders themselves; only returns leaf client folders.
         """
         clients: List[Dict] = []
 
         def add_client(folder: Dict):
-            cid = folder["id"]
-            total_val = self._sum_products_for_client(cid)
             clients.append(
                 {
-                    "client_id": cid,
+                    "client_id": folder["id"],
                     "display_name": (folder.get("name") or "").strip(),
                     "status": "active",
-                    "folder_id": cid,
-                    "portfolio_value": float(total_val),  # used by lists/dashboards
+                    "folder_id": folder["id"],
+                    "portfolio_value": 0.0,  # legacy field; AUM now derived from Products
                 }
             )
 
@@ -251,6 +304,8 @@ class SimpleGoogleDrive:
             for letter in root_letters:
                 for child in self._list_folders(letter["id"]):
                     add_client(child)
+                    # also clean any leftover comms silently
+                    self._remove_legacy_communications(child["id"])
         else:
             # Case 2: categories under ROOT -> letters -> clients
             for category in self._list_folders(self.root_folder_id):
@@ -259,9 +314,12 @@ class SimpleGoogleDrive:
                     for letter in letters:
                         for child in self._list_folders(letter["id"]):
                             add_client(child)
+                            self._remove_legacy_communications(child["id"])
                 else:
+                    # category may hold clients directly
                     if self._has_client_markers(category["id"]):
                         add_client(category)
+                        self._remove_legacy_communications(category["id"])
 
         clients.sort(key=lambda c: (c["display_name"] or "").lower())
         return clients
@@ -347,6 +405,15 @@ class SimpleGoogleDrive:
             self._rename_file(task_file_id, f"COMPLETED - {current_name}")
 
         return True
+
+    def delete_task(self, task_file_id: str) -> bool:
+        """Trash a task file (either ongoing or completed)."""
+        try:
+            self._trash_file_or_folder(task_file_id)
+            return True
+        except Exception as e:
+            logger.error(f"Delete task failed: {e}")
+            return False
 
     def _parse_task_filename(self, name: str) -> Dict:
         result = {"due_date": "", "priority": "", "task_type": "", "title": "", "task_id": ""}
@@ -467,13 +534,101 @@ class SimpleGoogleDrive:
         return upcoming
 
     # -----------------------------
-    # Reviews (unchanged behavior)
+    # Products (NEW)
+    # -----------------------------
+    def _get_client_products_folder(self, client_id: str) -> str:
+        return self._ensure_folder(client_id, "Products")
+
+    def _read_json_in_folder(self, folder_id: str, filename: str, default):
+        f = self._find_child_file(folder_id, filename)
+        if not f:
+            return default
+        try:
+            data = self._read_file_bytes(f["id"])
+            return json.loads(data.decode("utf-8")) if data else default
+        except Exception as e:
+            logger.warning(f"Failed to read {filename}: {e}")
+            return default
+
+    def _write_json_in_folder(self, folder_id: str, filename: str, obj) -> str:
+        data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+        return self._create_or_update_file(folder_id, filename, data, "application/json")
+
+    def get_client_products(self, client_id: str) -> List[Dict]:
+        pf = self._get_client_products_folder(client_id)
+        items = self._read_json_in_folder(pf, "products.json", default=[])
+        # sanity cleanup
+        out = []
+        for p in items:
+            out.append(
+                {
+                    "company": p.get("company", "").strip(),
+                    "portfolio": p.get("portfolio", "").strip(),
+                    "value": _float_safe(p.get("value", 0)),
+                    "charge_pct": _float_safe(p.get("charge_pct", 0)),  # % e.g. 1.0
+                }
+            )
+        return out
+
+    def save_client_products(self, client_id: str, products: List[Dict]) -> None:
+        pf = self._get_client_products_folder(client_id)
+        # normalize
+        out = []
+        for p in products:
+            out.append(
+                {
+                    "company": (p.get("company") or "").strip(),
+                    "portfolio": (p.get("portfolio") or "").strip(),
+                    "value": round(_float_safe(p.get("value", 0)), 2),
+                    "charge_pct": _float_safe(p.get("charge_pct", 0)),
+                }
+            )
+        self._write_json_in_folder(pf, "products.json", out)
+
+    def get_products_catalog(self) -> Dict[str, List[str]]:
+        """
+        Shared picklist memory across the CRM.
+        Stored at ROOT as 'Products Catalog.json'
+        """
+        f = self._find_child_file(self.root_folder_id, "Products Catalog.json")
+        if not f:
+            return {"companies": [], "portfolios": []}
+        try:
+            data = self._read_file_bytes(f["id"])
+            return json.loads(data.decode("utf-8")) if data else {"companies": [], "portfolios": []}
+        except Exception:
+            return {"companies": [], "portfolios": []}
+
+    def update_products_catalog(self, companies: List[str], portfolios: List[str]) -> None:
+        cat = self.get_products_catalog()
+        cset = {c.strip() for c in cat.get("companies", []) if c.strip()}
+        pset = {p.strip() for p in cat.get("portfolios", []) if p.strip()}
+        for c in companies:
+            if c and c.strip():
+                cset.add(c.strip())
+        for p in portfolios:
+            if p and p.strip():
+                pset.add(p.strip())
+        obj = {"companies": sorted(cset, key=str.lower), "portfolios": sorted(pset, key=str.lower)}
+        data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+        self._create_or_update_file(self.root_folder_id, "Products Catalog.json", data, "application/json")
+
+    def get_total_assets(self) -> float:
+        """Sum of all product values across all clients."""
+        total = 0.0
+        for c in self.get_clients_enhanced():
+            for p in self.get_client_products(c["client_id"]):
+                total += _float_safe(p.get("value", 0))
+        return round(total, 2)
+
+    # -----------------------------
+    # Review Pack (kept, unchanged look)
     # -----------------------------
     def _uk_date_str(self, dt: datetime) -> str:
         try:
-            return dt.strftime("%-d %B %Y")
+            return dt.strftime("%-d %B %Y")  # Linux (no leading zero)
         except ValueError:
-            return dt.strftime("%d %B %Y")
+            return dt.strftime("%d %B %Y")   # Fallback
 
     def create_review_pack_for_client(self, client: Dict) -> Dict[str, str]:
         """Build Review <YEAR> structure and create two Word docs in 'Agenda & Valuation'."""
@@ -503,7 +658,7 @@ class SimpleGoogleDrive:
         agenda_val = created["Agenda & Valuation"]
         today_str = self._uk_date_str(datetime.today())
 
-        # Agenda doc (basic styled)
+        # Agenda doc
         agenda_doc = self._build_agenda_doc(display_name, today_str)
         self._upload_docx(
             agenda_val,
@@ -511,7 +666,7 @@ class SimpleGoogleDrive:
             agenda_doc,
         )
 
-        # Valuation doc (basic styled)
+        # Valuation doc (styled similarly)
         val_doc = self._build_valuation_doc(display_name, today_str)
         self._upload_docx(
             agenda_val,
@@ -533,7 +688,9 @@ class SimpleGoogleDrive:
         meta = {"name": filename, "parents": [parent_id]}
         self.drive.files().create(body=meta, media_body=media, fields="id,name").execute()
 
-    # Word doc builders (kept simple & consistent)
+    # -----------------------------
+    # Word document builders (matching look)
+    # -----------------------------
     def _build_agenda_doc(self, client_display_name: str, date_str: str) -> Document:
         doc = Document()
         p = doc.add_paragraph()
@@ -544,16 +701,16 @@ class SimpleGoogleDrive:
         doc.add_paragraph(f"Date: {date_str}")
         doc.add_paragraph("")
         items = [
-            "1. Welcome & objectives",
-            "2. Personal & financial updates",
-            "3. Investment performance & valuation",
-            "4. Risk profile (ATR) & capacity",
-            "5. Charges & costs",
-            "6. Portfolio changes / recommendations",
-            "7. Action points & next steps",
+            "Welcome & objectives",
+            "Personal & financial updates",
+            "Investment performance & valuation",
+            "Risk profile (ATR) & capacity",
+            "Charges & costs",
+            "Portfolio changes / recommendations",
+            "Action points & next steps",
         ]
-        for it in items:
-            doc.add_paragraph(it)
+        for i, it in enumerate(items, 1):
+            doc.add_paragraph(f"{i}. {it}")
         return doc
 
     def _build_valuation_doc(self, client_display_name: str, date_str: str) -> Document:
@@ -567,9 +724,10 @@ class SimpleGoogleDrive:
         doc.add_paragraph("")
         table = doc.add_table(rows=1, cols=3)
         hdr = table.rows[0].cells
-        hdr[0].text = "Plan / Account"
-        hdr[1].text = "Provider"
+        hdr[0].text = "Plan / Product"
+        hdr[1].text = "Company / Portfolio"
         hdr[2].text = "Value (£)"
+        # starter empty row
         row = table.add_row().cells
         row[0].text = ""
         row[1].text = ""
@@ -577,167 +735,3 @@ class SimpleGoogleDrive:
         doc.add_paragraph("")
         doc.add_paragraph("Total Value: £")
         return doc
-
-    # -----------------------------
-    # Products (NEW)
-    # -----------------------------
-    def _get_client_products_folder(self, client_id: str) -> str:
-        return self._ensure_folder(client_id, "Products")
-
-    def add_product(self, product: Dict, client: Dict) -> bool:
-        """
-        Save a product JSON file in Products/.
-        Fields expected:
-        - company (str)
-        - portfolio (str)
-        - product_name (str)
-        - value (float)
-        - charge_pct (float)  (e.g., 1.0 means 1%)
-        - as_of (YYYY-MM-DD)
-        """
-        client_id = client.get("client_id") or client.get("folder_id")
-        if not client_id:
-            raise ValueError("client client_id/folder_id missing")
-
-        folder_id = self._get_client_products_folder(client_id)
-
-        pid = product.get("product_id", f"PRD{datetime.now().strftime('%Y%m%d%H%M%S')}")
-        company = (product.get("company") or "").strip()
-        portfolio = (product.get("portfolio") or "").strip()
-        name = (product.get("product_name") or "").strip()
-        value = _to_float(product.get("value"))
-        charge_pct = _to_float(product.get("charge_pct"))
-        as_of = (product.get("as_of") or datetime.now().strftime("%Y-%m-%d")).strip()
-
-        # Filename: YYYY-MM-DD - Company - Portfolio - Product [PRDxxxxxxxx].json
-        filename = f"{as_of} - {company} - {portfolio} - {name} [{pid}].json"
-
-        payload = {
-            "product_id": pid,
-            "company": company,
-            "portfolio": portfolio,
-            "product_name": name,
-            "value": value,
-            "charge_pct": charge_pct,
-            "as_of": as_of,
-            "client_id": client_id,
-        }
-        data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        self._upload_bytes(folder_id, filename, data, "application/json")
-        return True
-
-    def update_product(self, file_id: str, product: Dict) -> bool:
-        """Replace JSON content of an existing product file."""
-        payload = {
-            "product_id": product.get("product_id", ""),
-            "company": (product.get("company") or "").strip(),
-            "portfolio": (product.get("portfolio") or "").strip(),
-            "product_name": (product.get("product_name") or "").strip(),
-            "value": _to_float(product.get("value")),
-            "charge_pct": _to_float(product.get("charge_pct")),
-            "as_of": (product.get("as_of") or datetime.now().strftime("%Y-%m-%d")).strip(),
-            "client_id": product.get("client_id", ""),
-        }
-        data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        self._update_file_bytes(file_id, data, "application/json")
-        return True
-
-    def _parse_product_file(self, file_id: str, name: str) -> Optional[Dict]:
-        """Read JSON product file and return dict with computed annual_fee."""
-        try:
-            txt = self._download_text(file_id)
-            obj = json.loads(txt)
-        except Exception as e:
-            logger.error(f"Failed to parse product file {file_id}: {e}")
-            return None
-
-        value = _to_float(obj.get("value"))
-        pct = _to_float(obj.get("charge_pct"))
-        annual_fee = value * (pct / 100.0)
-
-        return {
-            "file_id": file_id,
-            "product_id": obj.get("product_id", ""),
-            "company": obj.get("company", ""),
-            "portfolio": obj.get("portfolio", ""),
-            "product_name": obj.get("product_name", ""),
-            "value": value,
-            "charge_pct": pct,
-            "annual_fee": annual_fee,
-            "as_of": obj.get("as_of", ""),
-            "client_id": obj.get("client_id", ""),
-            "file_name": name,
-        }
-
-    def get_client_products(self, client_id: str) -> List[Dict]:
-        folder_id = self._get_client_products_folder(client_id)
-        out: List[Dict] = []
-        page = None
-        while True:
-            resp = self.drive.files().list(
-                q=(
-                    f"'{folder_id}' in parents and "
-                    "mimeType!='application/vnd.google-apps.folder' and trashed=false"
-                ),
-                fields="nextPageToken, files(id,name,createdTime,modifiedTime,mimeType)",
-                pageToken=page,
-                orderBy="name_natural desc",
-            ).execute()
-            for f in resp.get("files", []):
-                if not f.get("name", "").lower().endswith(".json"):
-                    continue
-                parsed = self._parse_product_file(f["id"], f.get("name", ""))
-                if parsed:
-                    out.append(parsed)
-            page = resp.get("nextPageToken")
-            if not page:
-                break
-        # newest first by as_of (encoded at start of filename) already handled by orderBy
-        return out
-
-    def _sum_products_for_client(self, client_id: str) -> float:
-        prods = self.get_client_products(client_id)
-        return float(sum(p.get("value", 0.0) for p in prods))
-
-    def get_global_product_options(self) -> Tuple[List[str], List[str]]:
-        """Return (companies, portfolios) unique lists across all clients."""
-        companies = set()
-        portfolios = set()
-
-        # Iterate all clients, then their Products
-        clients = []
-        # Find all client folders similar to get_clients_enhanced but lighter
-        root_letters = self._get_letter_folders(self.root_folder_id)
-        if root_letters:
-            for letter in root_letters:
-                for child in self._list_folders(letter["id"]):
-                    clients.append(child["id"])
-        else:
-            for category in self._list_folders(self.root_folder_id):
-                letters = self._get_letter_folders(category["id"])
-                if letters:
-                    for letter in letters:
-                        for child in self._list_folders(letter["id"]):
-                            clients.append(child["id"])
-                else:
-                    if self._has_client_markers(category["id"]):
-                        clients.append(category["id"])
-
-        for cid in clients:
-            for p in self.get_client_products(cid):
-                c = (p.get("company") or "").strip()
-                pf = (p.get("portfolio") or "").strip()
-                if c:
-                    companies.add(c)
-                if pf:
-                    portfolios.add(pf)
-
-        return (sorted(companies), sorted(portfolios))
-
-    def get_total_assets_from_products(self) -> float:
-        """Sum of all product values across all clients."""
-        total = 0.0
-        # reuse get_clients_enhanced which now sets portfolio_value per client
-        for c in self.get_clients_enhanced():
-            total += float(c.get("portfolio_value") or 0.0)
-        return float(total)

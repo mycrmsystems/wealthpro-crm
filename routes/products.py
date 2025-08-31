@@ -1,13 +1,6 @@
-"""
-WealthPro CRM - Products (Portfolio) Routes
-- Per-client Products list with add/edit
-- Persists each product as a JSON file under Google Drive: Client/Products/
-- Remembers Companies and Portfolios by scanning existing product files (global options)
-- Shows per-client totals (Value, Annual Fees)
-"""
+# routes/products.py
 
 import logging
-from datetime import datetime
 from flask import Blueprint, render_template_string, request, redirect, url_for, session
 from google.oauth2.credentials import Credentials
 from models.google_drive import SimpleGoogleDrive
@@ -15,40 +8,81 @@ from models.google_drive import SimpleGoogleDrive
 logger = logging.getLogger(__name__)
 products_bp = Blueprint("products", __name__)
 
+
+def _require_creds():
+    if "credentials" not in session:
+        return None
+    return Credentials(**session["credentials"])
+
+
 @products_bp.route("/clients/<client_id>/products", methods=["GET", "POST"])
 def client_products(client_id):
-    if "credentials" not in session:
+    """Add/list/edit client's products; remember companies/portfolios globally."""
+    creds = _require_creds()
+    if not creds:
         return redirect(url_for("auth.authorize"))
-    try:
-        creds = Credentials(**session["credentials"])
-        drive = SimpleGoogleDrive(creds)
 
+    try:
+        drive = SimpleGoogleDrive(creds)
+        # Find client for display name
         clients = drive.get_clients_enhanced()
         client = next((c for c in clients if c["client_id"] == client_id), None)
         if not client:
             return "Client not found", 404
 
-        # Add product
+        # Load products + catalog
+        products = drive.get_client_products(client_id)
+        catalog = drive.get_products_catalog()
+        companies = catalog.get("companies", [])
+        portfolios = catalog.get("portfolios", [])
+
         if request.method == "POST":
-            product = {
-                "product_id": f"PRD{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                "company": request.form.get("company", ""),
-                "portfolio": request.form.get("portfolio", ""),
-                "product_name": request.form.get("product_name", ""),
-                "value": request.form.get("value", "0"),
-                "charge_pct": request.form.get("charge_pct", "0"),
-                "as_of": request.form.get("as_of", datetime.now().strftime("%Y-%m-%d")),
+            # Add or edit a product
+            mode = (request.form.get("mode") or "add").lower()
+            idx = request.form.get("index", "")
+            company = (request.form.get("company") or "").strip()
+            portfolio = (request.form.get("portfolio") or "").strip()
+            value = request.form.get("value") or "0"
+            charge_pct = request.form.get("charge_pct") or "0"
+
+            try:
+                value_f = float(value)
+            except Exception:
+                value_f = 0.0
+            try:
+                charge_f = float(charge_pct)
+            except Exception:
+                charge_f = 0.0
+
+            entry = {
+                "company": company,
+                "portfolio": portfolio,
+                "value": value_f,
+                "charge_pct": charge_f,
             }
-            drive.add_product(product, client)
+
+            if mode == "edit" and idx.isdigit():
+                i = int(idx)
+                if 0 <= i < len(products):
+                    products[i] = entry
+            else:
+                products.append(entry)
+
+            # Update picklists
+            drive.update_products_catalog(
+                companies=[company] if company else [],
+                portfolios=[portfolio] if portfolio else [],
+            )
+            # Save
+            drive.save_client_products(client_id, products)
             return redirect(url_for("products.client_products", client_id=client_id))
 
-        # Load list + global options
-        products = drive.get_client_products(client_id)
-        total_value = sum(p.get("value", 0.0) for p in products)
-        total_fees = sum(p.get("annual_fee", 0.0) for p in products)
-        companies, portfolios = drive.get_global_product_options()
+        # Totals
+        total_value = round(sum(p.get("value", 0) for p in products), 2)
+        total_fee = round(sum((p.get("value", 0) * p.get("charge_pct", 0) / 100.0) for p in products), 2)
 
-        return render_template_string("""
+        return render_template_string(
+            """
 <!DOCTYPE html>
 <html>
 <head>
@@ -57,7 +91,10 @@ def client_products(client_id):
     <style>
         body { font-family: "Inter", sans-serif; }
         .gradient-wealth { background: linear-gradient(135deg, #1a365d 0%, #2563eb 100%); }
-        td, th { white-space: nowrap; }
+        .card { @apply bg-white rounded-lg shadow; }
+        .label { @apply block text-sm font-medium text-gray-700 mb-1; }
+        .input { @apply w-full px-3 py-2 border border-gray-300 rounded-md; }
+        .select { @apply w-full px-3 py-2 border border-gray-300 rounded-md; }
     </style>
 </head>
 <body class="bg-gray-50">
@@ -69,7 +106,6 @@ def client_products(client_id):
                     <a href="/" class="hover:text-blue-200">Dashboard</a>
                     <a href="/clients" class="hover:text-blue-200">Clients</a>
                     <a href="/tasks" class="hover:text-blue-200">Tasks</a>
-                    <a href="#" class="text-white font-semibold">Products</a>
                 </div>
             </div>
         </div>
@@ -78,252 +114,159 @@ def client_products(client_id):
     <main class="max-w-7xl mx-auto px-6 py-8">
         <div class="mb-8">
             <h1 class="text-3xl font-bold">Products: {{ client.display_name }}</h1>
-            <p class="text-gray-600 mt-2">Manage client products. Saved to Google Drive → Products/</p>
+            <p class="text-gray-600 mt-2">Record and track investments & pensions. Saved to Google Drive → Products/products.json</p>
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <!-- Add Product Form -->
+            <!-- Add / Edit Product Form (styled like Communications) -->
             <div class="lg:col-span-1">
-                <div class="bg-white rounded-lg shadow p-6">
-                    <h3 class="text-lg font-semibold mb-4">Add Product</h3>
+                <div class="card p-6">
+                    <h3 class="text-lg font-semibold mb-4">Add / Edit Product</h3>
                     <form method="POST" class="space-y-4">
-                        <div class="grid grid-cols-2 gap-4">
-                            <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">As of</label>
-                                <input type="date" name="as_of" value="{{ datetime.now().strftime('%Y-%m-%d') }}" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                            </div>
-                            <div></div>
-                        </div>
+                        <input type="hidden" name="mode" id="modeField" value="add">
+                        <input type="hidden" name="index" id="indexField" value="">
 
                         <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Company</label>
-                            <input name="company" list="companies" placeholder="Type or select..." class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            <label class="label">Company *</label>
+                            <input list="companies" name="company" class="input" required placeholder="e.g., Aviva, Fidelity">
                             <datalist id="companies">
-                                {% for c in companies %}<option value="{{ c }}"></option>{% endfor %}
+                                {% for c in companies %}
+                                <option value="{{ c }}"></option>
+                                {% endfor %}
                             </datalist>
                         </div>
 
                         <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Portfolio</label>
-                            <input name="portfolio" list="portfolios" placeholder="Type or select..." class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            <label class="label">Portfolio *</label>
+                            <input list="portfolios" name="portfolio" class="input" required placeholder="e.g., Balanced, Growth">
                             <datalist id="portfolios">
-                                {% for p in portfolios %}<option value="{{ p }}"></option>{% endfor %}
+                                {% for p in portfolios %}
+                                <option value="{{ p }}"></option>
+                                {% endfor %}
                             </datalist>
-                        </div>
-
-                        <div>
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Product Name</label>
-                            <input type="text" name="product_name" placeholder="e.g., SIPP / ISA / GIA / Bond..." class="w-full px-3 py-2 border border-gray-300 rounded-md">
                         </div>
 
                         <div class="grid grid-cols-2 gap-4">
                             <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Value (£)</label>
-                                <input type="number" step="0.01" name="value" required class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                <label class="label">Value (£) *</label>
+                                <input type="number" step="0.01" name="value" class="input" required>
                             </div>
                             <div>
-                                <label class="block text-sm font-medium text-gray-700 mb-1">Annual Charge %</label>
-                                <input type="number" step="0.001" name="charge_pct" value="1.0" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                                <label class="label">Charge (%)</label>
+                                <input type="number" step="0.01" name="charge_pct" class="input" placeholder="e.g., 1.00">
                             </div>
                         </div>
 
-                        <div class="bg-blue-50 p-3 rounded">
-                            <p class="text-xs text-blue-700">💾 Saves to Google Drive: {{ client.display_name }} / Products</p>
-                        </div>
-
-                        <button type="submit" class="w-full bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
-                            Add Product
+                        <button class="w-full bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
+                            Save Product
                         </button>
                     </form>
                 </div>
             </div>
 
-            <!-- Products table -->
+            <!-- Products List -->
             <div class="lg:col-span-2">
-                <div class="bg-white rounded-lg shadow overflow-hidden">
-                    <div class="p-6 border-b flex items-center justify-between">
-                        <h3 class="text-lg font-semibold">Products</h3>
-                        <div class="text-sm text-gray-600">Total: {{ products|length }}</div>
+                <div class="card">
+                    <div class="p-6 border-b">
+                        <h3 class="text-lg font-semibold">Current Products</h3>
                     </div>
-                    <div class="p-6 overflow-auto">
+                    <div class="p-6">
                         {% if products %}
-                        <table class="min-w-full text-sm">
-                            <thead class="bg-gray-50">
-                                <tr>
-                                    <th class="px-4 py-2 text-left">As of</th>
-                                    <th class="px-4 py-2 text-left">Company</th>
-                                    <th class="px-4 py-2 text-left">Portfolio</th>
-                                    <th class="px-4 py-2 text-left">Product</th>
-                                    <th class="px-4 py-2 text-right">Value (£)</th>
-                                    <th class="px-4 py-2 text-right">Charge %</th>
-                                    <th class="px-4 py-2 text-right">Annual Fee (£)</th>
-                                    <th class="px-4 py-2 text-right">Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody class="divide-y">
-                                {% for p in products %}
-                                <tr>
-                                    <td class="px-4 py-2">{{ p.as_of }}</td>
-                                    <td class="px-4 py-2">{{ p.company }}</td>
-                                    <td class="px-4 py-2">{{ p.portfolio }}</td>
-                                    <td class="px-4 py-2">{{ p.product_name }}</td>
-                                    <td class="px-4 py-2 text-right">£{{ "{:,.2f}".format(p.value or 0) }}</td>
-                                    <td class="px-4 py-2 text-right">{{ "{:.3f}".format(p.charge_pct or 0) }}%</td>
-                                    <td class="px-4 py-2 text-right">£{{ "{:,.2f}".format(p.annual_fee or 0) }}</td>
-                                    <td class="px-4 py-2 text-right">
-                                        <a href="/clients/{{ client.client_id }}/products/{{ p.file_id }}/edit" class="text-indigo-700 hover:text-indigo-900 text-xs">Edit</a>
-                                    </td>
-                                </tr>
-                                {% endfor %}
-                                <!-- Totals row -->
-                                <tr class="bg-gray-50 font-semibold">
-                                    <td colspan="4" class="px-4 py-3 text-right">Totals:</td>
-                                    <td class="px-4 py-3 text-right">£{{ "{:,.2f}".format(total_value) }}</td>
-                                    <td class="px-4 py-3"></td>
-                                    <td class="px-4 py-3 text-right">£{{ "{:,.2f}".format(total_fees) }}</td>
-                                    <td class="px-4 py-3"></td>
-                                </tr>
-                            </tbody>
-                        </table>
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full">
+                                <thead>
+                                    <tr class="bg-gray-50 text-left text-xs font-medium text-gray-500 uppercase">
+                                        <th class="px-4 py-2">Company</th>
+                                        <th class="px-4 py-2">Portfolio</th>
+                                        <th class="px-4 py-2">Value (£)</th>
+                                        <th class="px-4 py-2">Charge (%)</th>
+                                        <th class="px-4 py-2">Annual Revenue (£)</th>
+                                        <th class="px-4 py-2">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-200 bg-white">
+                                    {% for p in products %}
+                                    <tr>
+                                        <td class="px-4 py-2">{{ p.company }}</td>
+                                        <td class="px-4 py-2">{{ p.portfolio }}</td>
+                                        <td class="px-4 py-2">£{{ "{:,.2f}".format(p.value or 0) }}</td>
+                                        <td class="px-4 py-2">{{ "{:.2f}".format(p.charge_pct or 0) }}%</td>
+                                        <td class="px-4 py-2">
+                                            £{{ "{:,.2f}".format((p.value or 0) * (p.charge_pct or 0) / 100.0) }}
+                                        </td>
+                                        <td class="px-4 py-2 space-x-2">
+                                            <button onclick="editItem({{ loop.index0 }}, '{{ p.company|e }}', '{{ p.portfolio|e }}', '{{ p.value }}', '{{ p.charge_pct }}')" class="text-indigo-700 hover:text-indigo-900 text-sm">Edit</button>
+                                            <a href="/clients/{{ client.client_id }}/products/{{ loop.index0 }}/delete" class="text-red-700 hover:text-red-900 text-sm">Delete</a>
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                                <tfoot class="bg-gray-50">
+                                    <tr>
+                                        <td class="px-4 py-3 font-semibold" colspan="2">Totals</td>
+                                        <td class="px-4 py-3 font-semibold">£{{ "{:,.2f}".format(total_value) }}</td>
+                                        <td class="px-4 py-3"></td>
+                                        <td class="px-4 py-3 font-semibold">£{{ "{:,.2f}".format(total_fee) }}</td>
+                                        <td class="px-4 py-3"></td>
+                                    </tr>
+                                </tfoot>
+                            </table>
+                        </div>
                         {% else %}
-                        <div class="text-center py-10 text-gray-500">No products recorded yet.</div>
+                        <p class="text-gray-500">No products recorded yet.</p>
                         {% endif %}
                     </div>
                 </div>
-
-                <div class="mt-8">
-                    <a href="/clients" class="bg-gray-600 text-white px-6 py-3 rounded-lg hover:bg-gray-700">Back to Clients</a>
-                </div>
             </div>
         </div>
+
+        <div class="mt-8">
+            <a href="/clients" class="bg-gray-600 text-white px-6 py-3 rounded-lg hover:bg-gray-700">
+                Back to Clients
+            </a>
+        </div>
     </main>
+
+    <script>
+    function editItem(index, company, portfolio, value, charge) {
+        document.getElementById('modeField').value = 'edit';
+        document.getElementById('indexField').value = index;
+        const form = document.forms[0];
+        form.company.value = company;
+        form.portfolio.value = portfolio;
+        form.value.value = value;
+        form.charge_pct.value = charge;
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    </script>
 </body>
 </html>
-        """, client=client, products=products, total_value=total_value, total_fees=total_fees,
-           companies=companies, portfolios=portfolios, datetime=datetime)
+            """,
+            client=client,
+            products=products,
+            companies=companies,
+            portfolios=portfolios,
+            total_value=total_value,
+            total_fee=total_fee,
+        )
 
     except Exception as e:
         logger.exception("Products error")
         return f"Error: {e}", 500
 
 
-@products_bp.route("/clients/<client_id>/products/<file_id>/edit", methods=["GET", "POST"])
-def edit_product(client_id, file_id):
-    if "credentials" not in session:
+@products_bp.route("/clients/<client_id>/products/<int:index>/delete")
+def delete_product(client_id, index: int):
+    creds = _require_creds()
+    if not creds:
         return redirect(url_for("auth.authorize"))
     try:
-        creds = Credentials(**session["credentials"])
         drive = SimpleGoogleDrive(creds)
-
-        # find client
-        clients = drive.get_clients_enhanced()
-        client = next((c for c in clients if c["client_id"] == client_id), None)
-        if not client:
-            return "Client not found", 404
-
-        # load the product details
-        prods = drive.get_client_products(client_id)
-        prod = next((p for p in prods if p["file_id"] == file_id), None)
-        if not prod:
-            return "Product not found", 404
-
-        if request.method == "POST":
-            updated = {
-                "product_id": prod.get("product_id", ""),
-                "company": request.form.get("company", ""),
-                "portfolio": request.form.get("portfolio", ""),
-                "product_name": request.form.get("product_name", ""),
-                "value": request.form.get("value", "0"),
-                "charge_pct": request.form.get("charge_pct", "0"),
-                "as_of": request.form.get("as_of", prod.get("as_of") or datetime.now().strftime("%Y-%m-%d")),
-                "client_id": client_id,
-            }
-            drive.update_product(file_id, updated)
-            return redirect(url_for("products.client_products", client_id=client_id))
-
-        companies, portfolios = drive.get_global_product_options()
-
-        return render_template_string("""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Edit Product</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-50">
-    <main class="max-w-2xl mx-auto px-6 py-8">
-        <h1 class="text-2xl font-bold mb-6">Edit Product — {{ client.display_name }}</h1>
-        <form method="POST" class="bg-white shadow rounded p-6 space-y-4">
-            <div class="grid grid-cols-2 gap-4">
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">As of</label>
-                    <input type="date" name="as_of" value="{{ prod.as_of }}" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                </div>
-                <div></div>
-            </div>
-
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Company</label>
-                <input name="company" value="{{ prod.company }}" list="companies" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                <datalist id="companies">
-                    {% for c in companies %}<option value="{{ c }}"></option>{% endfor %}
-                </datalist>
-            </div>
-
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Portfolio</label>
-                <input name="portfolio" value="{{ prod.portfolio }}" list="portfolios" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                <datalist id="portfolios">
-                    {% for p in portfolios %}<option value="{{ p }}"></option>{% endfor %}
-                </datalist>
-            </div>
-
-            <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Product Name</label>
-                <input type="text" name="product_name" value="{{ prod.product_name }}" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-            </div>
-
-            <div class="grid grid-cols-2 gap-4">
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Value (£)</label>
-                    <input type="number" step="0.01" name="value" value="{{ prod.value }}" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1">Annual Charge %</label>
-                    <input type="number" step="0.001" name="charge_pct" value="{{ prod.charge_pct }}" class="w-full px-3 py-2 border border-gray-300 rounded-md">
-                </div>
-            </div>
-
-            <div class="flex justify-between pt-2">
-                <a href="/clients/{{ client.client_id }}/products" class="px-6 py-2 border rounded text-gray-700 hover:bg-gray-50">Cancel</a>
-                <button class="px-6 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Save Changes</button>
-            </div>
-        </form>
-    </main>
-</body>
-</html>
-        """, client=client, prod=prod, companies=companies, portfolios=portfolios)
-
+        products = drive.get_client_products(client_id)
+        if 0 <= index < len(products):
+            products.pop(index)
+            drive.save_client_products(client_id, products)
+        return redirect(url_for("products.client_products", client_id=client_id))
     except Exception as e:
-        logger.exception("Edit product error")
+        logger.exception("Delete product error")
         return f"Error: {e}", 500
-
-
-@products_bp.route("/products/options")
-def products_options():
-    """Small helper view to inspect global company/portfolio options."""
-    if "credentials" not in session:
-        return redirect(url_for("auth.authorize"))
-    try:
-        creds = Credentials(**session["credentials"])
-        drive = SimpleGoogleDrive(creds)
-        companies, portfolios = drive.get_global_product_options()
-        return {
-            "companies": companies,
-            "portfolios": portfolios,
-            "count_companies": len(companies),
-            "count_portfolios": len(portfolios),
-        }
-    except Exception as e:
-        logger.exception("Options error")
-        return {"error": str(e)}, 500

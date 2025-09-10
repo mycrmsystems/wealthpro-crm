@@ -1,108 +1,102 @@
-"""
-WealthPro CRM - Clients Routes
-FULL FILE — drop in as routes/clients.py
+# routes/clients.py
+from flask import Blueprint, render_template, request
 
-This version keeps the clients list and simply adds:
-- “Details” link next to each client → /clients/<client_id>/details
-- “Portfolio” link → /clients/<client_id>/portfolio
-- “Folder” link opens the Google Drive client folder in a new tab
-"""
+clients_bp = Blueprint("clients", __name__, url_prefix="/clients")
 
-import logging
-from flask import Blueprint, render_template_string, redirect, url_for, session
-from google.oauth2.credentials import Credentials
+# In-memory sample data
+_CLIENTS = [
+    {"id": 1, "name": "Alice Brown", "email": "alice@example.com", "phone": "07123 456789", "archived": False},
+    {"id": 2, "name": "Bob Smith", "email": "bob@example.com", "phone": "07111 222333", "archived": False},
+    {"id": 3, "name": "Carol Jones", "email": "carol@example.com", "phone": "07000 999888", "archived": True},
+]
 
-from models.google_drive import SimpleGoogleDrive
+def _find(cid):
+    return next((c for c in _CLIENTS if c["id"] == cid), None)
 
-logger = logging.getLogger(__name__)
-clients_bp = Blueprint("clients", __name__)
+@clients_bp.route("", methods=["GET"])
+def list_clients():
+    q = request.args.get("q", "").strip().lower()
+    data = _CLIENTS
+    if q:
+        data = [c for c in _CLIENTS if q in c["name"].lower()]
+    return render_template("simple_page.html",
+                           title="Clients",
+                           subtitle="List of clients",
+                           items=[f'{c["id"]}: {c["name"]} ({"" if not c["archived"] else "Archived"})' for c in data])
 
-@clients_bp.route("/clients")
-def clients():
-    if "credentials" not in session:
-        return redirect(url_for("auth.authorize"))
+@clients_bp.route("/new", methods=["GET"])
+def new_client():
+    return render_template("simple_page.html",
+                           title="New Client",
+                           subtitle="(Form goes here)",
+                           items=[])
 
-    try:
-        creds = Credentials(**session["credentials"])
-        drive = SimpleGoogleDrive(creds)
-        clients = drive.get_clients_enhanced()
+@clients_bp.route("/archived", methods=["GET"])
+def archived():
+    data = [c for c in _CLIENTS if c["archived"]]
+    return render_template("simple_page.html",
+                           title="Archived Clients",
+                           subtitle="Restore when needed",
+                           items=[f'{c["id"]}: {c["name"]}' for c in data])
 
-        return render_template_string(
-            """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>WealthPro CRM - Clients</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-50">
-    <nav class="bg-gradient-to-r from-slate-800 to-blue-600 text-white shadow">
-        <div class="max-w-7xl mx-auto px-6">
-            <div class="h-16 flex items-center justify-between">
-                <h1 class="text-lg font-bold">WealthPro CRM</h1>
-                <div class="flex gap-6">
-                    <a href="/" class="hover:text-blue-200">Dashboard</a>
-                    <a href="/clients" class="hover:text-blue-200 font-semibold">Clients</a>
-                    <a href="/tasks" class="hover:text-blue-200">Tasks</a>
-                </div>
-            </div>
-        </div>
-    </nav>
+@clients_bp.route("/<int:client_id>/details", methods=["GET"])
+def details(client_id):
+    c = _find(client_id)
+    return render_template("simple_page.html",
+                           title=f"Client Details — {c['name'] if c else 'Unknown'}",
+                           subtitle="Basic profile and summary",
+                           items=[str(c)] if c else ["Client not found"])
 
-    <main class="max-w-7xl mx-auto px-6 py-8">
-        <div class="flex items-center justify-between mb-6">
-            <h2 class="text-2xl font-bold">Clients</h2>
-            <div class="flex gap-3">
-                <a href="/clients/create" class="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700">Add Client</a>
-            </div>
-        </div>
+@clients_bp.route("/<int:client_id>/products", methods=["GET"])
+def products_link(client_id):
+    # This links through to Products view but we render a simple page for now.
+    return render_template("simple_page.html",
+                           title=f"Products for Client #{client_id}",
+                           subtitle="Per-client products view",
+                           items=["(Products table will render here)"])
 
-        <div class="bg-white shadow rounded-lg overflow-hidden">
-            <div class="px-6 py-4 border-b">
-                <h3 class="font-semibold">Active Clients</h3>
-            </div>
-            <div class="p-6">
-                {% if clients %}
-                <div class="overflow-x-auto">
-                    <table class="min-w-full text-sm">
-                        <thead class="bg-gray-50">
-                            <tr>
-                                <th class="px-3 py-2 text-left font-medium text-gray-600">Client</th>
-                                <th class="px-3 py-2 text-left font-medium text-gray-600">Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody class="divide-y">
-                            {% for c in clients %}
-                            <tr>
-                                <td class="px-3 py-2">
-                                    <div class="font-medium">{{ c.display_name }}</div>
-                                </td>
-                                <td class="px-3 py-2">
-                                    <div class="flex flex-wrap gap-2">
-                                        <a class="px-2 py-1 rounded bg-blue-100 text-blue-800 hover:bg-blue-200" href="/clients/{{ c.client_id }}/details">Details</a>
-                                        <a class="px-2 py-1 rounded bg-purple-100 text-purple-800 hover:bg-purple-200" href="/clients/{{ c.client_id }}/portfolio">Portfolio</a>
-                                        <a class="px-2 py-1 rounded bg-slate-100 text-slate-800 hover:bg-slate-200" href="https://drive.google.com/drive/folders/{{ c.client_id }}" target="_blank">Folder</a>
-                                        <a class="px-2 py-1 rounded bg-gray-100 text-gray-800 hover:bg-gray-200" href="/clients/{{ c.client_id }}/tasks">Tasks</a>
-                                        <a class="px-2 py-1 rounded bg-amber-100 text-amber-800 hover:bg-amber-200" href="/clients/{{ c.client_id }}/communications">Comms</a>
-                                        <a class="px-2 py-1 rounded bg-green-100 text-green-800 hover:bg-green-200" href="/reviews/{{ c.client_id }}">Reviews</a>
-                                    </div>
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-                {% else %}
-                    <p class="text-gray-500">No clients found.</p>
-                {% endif %}
-            </div>
-        </div>
-    </main>
-</body>
-</html>
-            """,
-            clients=clients,
-        )
-    except Exception as e:
-        logger.error(f"Clients list error: {e}")
-        return f"Error: {e}", 500
+@clients_bp.route("/<int:client_id>/tasks", methods=["GET"])
+def tasks_link(client_id):
+    return render_template("simple_page.html",
+                           title=f"Tasks for Client #{client_id}",
+                           subtitle="Open/complete tasks shown here",
+                           items=["(Tasks list will render here)"])
+
+@clients_bp.route("/<int:client_id>/reviews", methods=["GET"])
+def reviews_link(client_id):
+    return render_template("simple_page.html",
+                           title=f"Reviews for Client #{client_id}",
+                           subtitle="Annual/periodic review pack",
+                           items=["(Review documents and dates go here)"])
+
+@clients_bp.route("/<int:client_id>/folders", methods=["GET"])
+def folders_link(client_id):
+    return render_template("simple_page.html",
+                           title=f"Google Drive Folders — Client #{client_id}",
+                           subtitle="Link to client’s Drive folder",
+                           items=["(Drive folder link/status appears here)"])
+
+@clients_bp.route("/<int:client_id>/archive", methods=["GET"])
+def archive(client_id):
+    c = _find(client_id)
+    if c: c["archived"] = True
+    return render_template("simple_page.html",
+                           title="Client Archived",
+                           subtitle=f"Client #{client_id}",
+                           items=[str(c)] if c else ["Client not found"])
+
+@clients_bp.route("/<int:client_id>/restore", methods=["GET"])
+def restore(client_id):
+    c = _find(client_id)
+    if c: c["archived"] = False
+    return render_template("simple_page.html",
+                           title="Client Restored",
+                           subtitle=f"Client #{client_id}",
+                           items=[str(c)] if c else ["Client not found"])
+
+@clients_bp.route("/<int:client_id>/delete-soft", methods=["GET"])
+def delete_soft(client_id):
+    return render_template("simple_page.html",
+                           title="Soft Delete (CRM only)",
+                           subtitle=f"Client #{client_id}",
+                           items=["(Implement soft delete in DB/Drive sync as needed)"])

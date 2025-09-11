@@ -9,3 +9,4 @@ def client_reviews(client_id):
                            title=f"Client Reviews — #{client_id}",
                            subtitle="Annual review pack area",
                            items=["(Generate agenda/valuation docs here)"])
+routes/reviews.py → must export reviews_bp

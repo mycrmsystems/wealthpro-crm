@@ -1,37 +1,30 @@
+<!-- templates/simple_page.html -->
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>{{ title or 'Page' }} — WealthPro CRM</title>
+  <title>{{ title or "WealthPro CRM" }}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <style>
-    body{margin:0;background:#0f172a;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,Inter,Roboto,Arial,sans-serif}
-    .wrap{max-width:900px;margin:0 auto;padding:24px}
-    a{color:#93c5fd;text-decoration:none}
-    .card{background:#0b1220;border:1px solid #243045;border-radius:14px;padding:16px;box-shadow:0 6px 18px rgba(0,0,0,.35)}
-    h1{margin:0 0 6px 0;font-size:22px}
-    .muted{color:#94a3b8;margin:0 0 16px 0}
-    ul{margin:0;padding-left:18px}
-    li{padding:6px 0;border-bottom:1px solid #1e293b}
-    .back{display:inline-block;margin-bottom:14px}
+    body { font-family: system-ui, Arial, sans-serif; margin: 0; background: #f8f9fb; color: #222; }
+    header { padding: 16px 24px; background: #0f172a; color: #fff; }
+    main { padding: 24px; max-width: 1000px; margin: 0 auto; }
+    .card { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <a class="back" href="/">← Back to Dashboard</a>
+  <header>
+    <h1>{{ title or "WealthPro CRM" }}</h1>
+  </header>
+  <main>
     <div class="card">
-      <h1>{{ title or 'Page' }}</h1>
-      <p class="muted">{{ subtitle or '' }}</p>
-      {% if items and items|length > 0 %}
-      <ul>
-        {% for it in items %}
-          <li>{{ it }}</li>
-        {% endfor %}
-      </ul>
+      {% if content %}
+        {{ content|safe }}
       {% else %}
-      <p class="muted">No content yet.</p>
+        <p>This page is ready. Wire up your data/views here.</p>
       {% endif %}
     </div>
-  </div>
+  </main>
 </body>
 </html>

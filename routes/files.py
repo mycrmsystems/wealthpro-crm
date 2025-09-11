@@ -20,3 +20,4 @@ def drive_check():
         subtitle="Connection / folders status",
         items=["(Connection OK / missing scopes / etc.)"],
     )
+routes/files.py → must export files_bp

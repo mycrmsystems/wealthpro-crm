@@ -49,52 +49,75 @@ app.jinja_env.filters["datefmt"] = _fmt_date
 
 # -----------------------------
 # Blueprints
-# -----------------------------
 # NOTE:
 # - We import and register *only*; routes remain defined in their own files.
-# - Do not change any route paths here—this preserves existing behavior.
+# - Do not change route paths here—this preserves existing behavior.
+# - Imports are resilient: if a module exports `bp`, we alias it to the expected name.
+# -----------------------------
 
 # Auth / Dashboard
-from routes.auth import auth_bp
+try:
+    # preferred: explicit name
+    from routes.auth import auth_bp
+except Exception:
+    # fallback: generic `bp` inside routes/auth.py
+    from routes.auth import bp as auth_bp
 app.register_blueprint(auth_bp)
 
-# Clients (profile, folders link, archive/restore, details, etc.)
+# Clients
 try:
     from routes.clients import clients_bp
+except Exception:
+    try:
+        from routes.clients import bp as clients_bp
+    except Exception as e:
+        logger.warning(f"clients blueprint not loaded: {e}")
+else:
     app.register_blueprint(clients_bp)
-except Exception as e:
-    logger.warning(f"clients blueprint not loaded: {e}")
 
-# Tasks (ongoing/completed, CRUD)
+# Tasks
 try:
     from routes.tasks import tasks_bp
+except Exception:
+    try:
+        from routes.tasks import bp as tasks_bp
+    except Exception as e:
+        logger.warning(f"tasks blueprint not loaded: {e}")
+else:
     app.register_blueprint(tasks_bp)
-except Exception as e:
-    logger.warning(f"tasks blueprint not loaded: {e}")
 
-# Products (formerly Portfolio) – per-client products, totals, AUM sync
+# Products (formerly Portfolio)
 try:
     from routes.products import products_bp
+except Exception:
+    try:
+        from routes.products import bp as products_bp
+    except Exception as e:
+        logger.warning(f"products blueprint not loaded: {e}")
+else:
     app.register_blueprint(products_bp)
-except Exception as e:
-    logger.warning(f"products blueprint not loaded: {e}")
 
-# Reviews (annual review creation, agenda/valuation docs)
+# Reviews
 try:
     from routes.reviews import reviews_bp
+except Exception:
+    try:
+        from routes.reviews import bp as reviews_bp
+    except Exception as e:
+        logger.warning(f"reviews blueprint not loaded: {e}")
+else:
     app.register_blueprint(reviews_bp)
-except Exception as e:
-    logger.warning(f"reviews blueprint not loaded: {e}")
 
-# Files / Drive helpers (optional)
+# Files / Drive helpers
 try:
     from routes.files import files_bp
+except Exception:
+    try:
+        from routes.files import bp as files_bp
+    except Exception as e:
+        logger.warning(f"files blueprint not loaded: {e}")
+else:
     app.register_blueprint(files_bp)
-except Exception as e:
-    logger.warning(f"files blueprint not loaded: {e}")
-
-# (If you had a communications blueprint before and fully removed it,
-# do NOT import/register it here. This keeps it deleted across the app.)
 
 # -----------------------------
 # Health check

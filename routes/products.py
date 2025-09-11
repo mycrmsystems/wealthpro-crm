@@ -30,3 +30,4 @@ def products_for_client(client_id):
                            title=f"Products — Client #{client_id}",
                            subtitle="Shows product list, fees %, and per-product annual £",
                            items=["(Per-client product table with totals goes here)"])
+routes/products.py → must export products_bp

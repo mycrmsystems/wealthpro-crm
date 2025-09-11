@@ -100,3 +100,4 @@ def delete_soft(client_id):
                            title="Soft Delete (CRM only)",
                            subtitle=f"Client #{client_id}",
                            items=["(Implement soft delete in DB/Drive sync as needed)"])
+routes/clients.py → must export clients_bp

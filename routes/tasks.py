@@ -47,3 +47,4 @@ def delete_task(task_id):
                            title=f"Task #{task_id} deleted",
                            subtitle="Removed from list",
                            items=["(Implement deletion in DB)"])
+routes/tasks.py → must export tasks_bp

@@ -1,23 +1,18 @@
 # routes/files.py
-from flask import Blueprint, render_template
+from flask import Blueprint, render_template, url_for
 
-files_bp = Blueprint("files", __name__)
+bp = Blueprint("files", __name__, url_prefix="/files")
 
-@files_bp.route("/drive/connect", methods=["GET"])
-def drive_connect():
+@bp.route("/client/<int:client_id>", methods=["GET"])
+def client_files(client_id):
+    # Placeholder — wire to Google Drive later
     return render_template(
         "simple_page.html",
-        title="Google Drive",
-        subtitle="Connect your Drive account",
-        items=["(OAuth flow goes here)"],
+        title="Files",
+        heading=f"Client #{client_id} — Files",
+        description="Google Drive client folder integration (placeholder).",
+        back_url=url_for("clients.client_details", client_id=client_id),
     )
 
-@files_bp.route("/drive/check", methods=["GET"])
-def drive_check():
-    return render_template(
-        "simple_page.html",
-        title="Drive Status",
-        subtitle="Connection / folders status",
-        items=["(Connection OK / missing scopes / etc.)"],
-    )
-routes/files.py → must export files_bp
+# === Alias expected by app.py ===
+files_bp = bp

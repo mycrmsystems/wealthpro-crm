@@ -1,27 +1,34 @@
 # routes/auth.py
 import os
-from flask import Blueprint, render_template, redirect, url_for
+from flask import Blueprint, render_template, redirect, url_for, session, request, flash
 
-bp = Blueprint("auth", __name__)  # generic export
-auth_bp = bp                      # explicit name expected by app.py (alias)
+bp = Blueprint("auth", __name__)
 
 @bp.route("/", methods=["GET"])
 def dashboard():
-    """
-    Root route -> Dashboard.
-    Uses templates/dashboard.html. If you have brand CSS in static/style.css,
-    that will still apply (we don't touch your styles here).
-    """
+    # Renders your main dashboard template
     return render_template("dashboard.html")
 
-# --- Optional convenience routes (do not remove features) ---
-
-@bp.route("/login")
+@bp.route("/login", methods=["GET", "POST"])
 def login():
-    # If you have OAuth, integrate here. For now, just go to dashboard.
-    return redirect(url_for("auth.dashboard"))
+    if request.method == "POST":
+        # Dummy login to keep app working; replace with your logic anytime
+        session["user"] = request.form.get("username") or "advisor"
+        flash("Logged in.", "success")
+        return redirect(url_for("auth.dashboard"))
+    return render_template(
+        "simple_page.html",
+        title="Login",
+        heading="Login",
+        description="Enter your credentials (placeholder).",
+        back_url=url_for("auth.dashboard"),
+    )
 
 @bp.route("/logout")
 def logout():
-    # Clear session if you use it. Keep simple redirect.
+    session.clear()
+    flash("Logged out.", "info")
     return redirect(url_for("auth.dashboard"))
+
+# === Alias expected by app.py ===
+auth_bp = bp

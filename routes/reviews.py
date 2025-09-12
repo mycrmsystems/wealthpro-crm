@@ -1,12 +1,27 @@
 # routes/reviews.py
-from flask import Blueprint, render_template
+from flask import Blueprint, render_template, url_for
 
-reviews_bp = Blueprint("reviews", __name__)
+bp = Blueprint("reviews", __name__, url_prefix="/reviews")
 
-@reviews_bp.route("/clients/<int:client_id>/reviews", methods=["GET"])
-def client_reviews(client_id):
-    return render_template("simple_page.html",
-                           title=f"Client Reviews — #{client_id}",
-                           subtitle="Annual review pack area",
-                           items=["(Generate agenda/valuation docs here)"])
-routes/reviews.py → must export reviews_bp
+@bp.route("/", methods=["GET"])
+def index():
+    return render_template(
+        "simple_page.html",
+        title="Reviews",
+        heading="Reviews",
+        description="Annual reviews overview (placeholder).",
+        back_url=url_for("auth.dashboard"),
+    )
+
+@bp.route("/client/<int:client_id>", methods=["GET"])
+def list_reviews(client_id):
+    return render_template(
+        "simple_page.html",
+        title="Client Reviews",
+        heading=f"Client #{client_id} — Reviews",
+        description="Client-specific reviews (placeholder).",
+        back_url=url_for("clients.client_details", client_id=client_id),
+    )
+
+# === Alias expected by app.py ===
+reviews_bp = bp

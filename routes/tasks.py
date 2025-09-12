@@ -1,50 +1,46 @@
 # routes/tasks.py
-from datetime import datetime, timedelta
-from flask import Blueprint, render_template
+from datetime import date, timedelta
+from flask import Blueprint, render_template, url_for, request
 
-tasks_bp = Blueprint("tasks", __name__, url_prefix="/tasks")
+bp = Blueprint("tasks", __name__, url_prefix="/tasks")
 
-# Dummy tasks
-_TASKS = [
-    {"id": 101, "client_id": 1, "client_name": "Alice Brown", "title": "ISA top-up", "due_date": (datetime.utcnow()+timedelta(days=3)).date().isoformat(), "status": "ongoing"},
-    {"id": 102, "client_id": 2, "client_name": "Bob Smith", "title": "Pension review", "due_date": (datetime.utcnow()+timedelta(days=10)).date().isoformat(), "status": "ongoing"},
-]
+def _sample_tasks(client_id=None):
+    base = date.today()
+    tasks = [
+        {"id": 101, "title": "Prepare suitability report", "due": base + timedelta(days=3), "status": "ongoing"},
+        {"id": 102, "title": "Chase provider forms", "due": base + timedelta(days=10), "status": "ongoing"},
+        {"id": 103, "title": "Close review case", "due": base - timedelta(days=2), "status": "overdue"},
+    ]
+    if client_id:
+        for t in tasks:
+            t["client_id"] = client_id
+    return tasks
 
-@tasks_bp.route("", methods=["GET"])
-def list_tasks():
-    return render_template("simple_page.html",
-                           title="Tasks",
-                           subtitle="Ongoing & completed (next 30 days remain visible until completed)",
-                           items=[f'#{t["id"]} • {t["title"]} • {t["client_name"]} • due {t["due_date"]} • {t["status"]}' for t in _TASKS])
+@bp.route("/", methods=["GET"])
+@bp.route("/client/<int:client_id>", methods=["GET"])
+def list_tasks(client_id=None):
+    # Shows the next 30 days (placeholder dataset)
+    tasks = _sample_tasks(client_id)
+    return render_template(
+        "simple_page.html",
+        title="Tasks",
+        heading="Tasks (next 30 days)",
+        description="Tasks list (placeholder). Styling matches your ‘communications’ layout request.",
+        back_url=url_for("auth.dashboard") if not client_id else url_for("clients.client_details", client_id=client_id),
+        extra={"tasks": tasks, "client_id": client_id},
+    )
 
-@tasks_bp.route("/new", methods=["GET"])
-def new_task():
-    return render_template("simple_page.html",
-                           title="New Task",
-                           subtitle="(Form matches Communications styling per your request)",
-                           items=["(Task creation form here)"])
+@bp.route("/new", methods=["GET", "POST"])
+@bp.route("/client/<int:client_id>/new", methods=["GET", "POST"])
+def new_task(client_id=None):
+    # Simple form placeholder; hook to Drive + status folders later
+    return render_template(
+        "simple_page.html",
+        title="New Task",
+        heading="Create a new task",
+        description="This is the ‘create task’ screen (placeholder).",
+        back_url=url_for("tasks.list_tasks", client_id=client_id) if client_id else url_for("tasks.list_tasks"),
+    )
 
-@tasks_bp.route("/<int:task_id>", methods=["GET"])
-def open_task(task_id):
-    t = next((x for x in _TASKS if x["id"] == task_id), None)
-    return render_template("simple_page.html",
-                           title=f"Task #{task_id}",
-                           subtitle="Open task",
-                           items=[str(t)] if t else ["Task not found"])
-
-@tasks_bp.route("/<int:task_id>/complete", methods=["GET"])
-def complete_task(task_id):
-    t = next((x for x in _TASKS if x["id"] == task_id), None)
-    if t: t["status"] = "completed"
-    return render_template("simple_page.html",
-                           title=f"Task #{task_id} completed",
-                           subtitle="Marked as completed",
-                           items=[str(t)] if t else ["Task not found"])
-
-@tasks_bp.route("/<int:task_id>/delete", methods=["GET"])
-def delete_task(task_id):
-    return render_template("simple_page.html",
-                           title=f"Task #{task_id} deleted",
-                           subtitle="Removed from list",
-                           items=["(Implement deletion in DB)"])
-routes/tasks.py → must export tasks_bp
+# === Alias expected by app.py ===
+tasks_bp = bp
